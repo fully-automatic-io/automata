@@ -1,0 +1,31 @@
+[package]
+name = "llm-client"
+version.workspace = true
+edition.workspace = true
+authors = ["Automata Contributors"]
+description = "LLM client library supporting multiple providers"
+license = "MIT"
+repository = "https://github.com/yourusername/automata"
+keywords = ["ai", "llm", "openai", "anthropic", "client"]
+categories = ["api-bindings"]
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+tracing = "0.1"
+bytes = "1"
+pin-project = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1"
+
+[[example]]
+name = "deepseek_agent"
+path = "../../examples/deepseek_agent.rs"

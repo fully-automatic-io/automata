@@ -1,0 +1,30 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+authors = ["Automata Contributors"]
+description = "Core agent framework for building AI agents"
+license = "MIT"
+repository = "https://github.com/yourusername/automata"
+keywords = ["ai", "agent", "llm", "framework"]
+categories = ["development-tools"]
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[example]]
+name = "basic_agent"
+path = "../../examples/basic_agent.rs"

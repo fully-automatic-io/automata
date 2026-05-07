@@ -1,0 +1,57 @@
+[package]
+name = "coding-agent"
+version.workspace = true
+edition.workspace = true
+authors = ["Automata Contributors"]
+description = "Coding agent implementation with file operations and bash execution"
+license = "MIT"
+repository = "https://github.com/yourusername/automata"
+keywords = ["ai", "agent", "coding", "automation"]
+categories = ["development-tools"]
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+llm-client = { path = "../llm-client" }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt", "codec"] }
+tracing = "0.1"
+similar = "2"
+regex = "1"
+walkdir = "2"
+ignore = "0.4"
+globset = "0.4"
+fs2 = "0.4"
+tempfile = "3"
+tarpc = { version = "0.34", features = ["full"] }
+tokio-serde = { version = "0.9", features = ["bincode"] }
+lazy_static = "1.5"
+dirs-next = "2"
+image = "0.25"
+mime_guess = "2.0"
+base64 = "0.22"
+extism = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[example]]
+name = "coding_agent"
+path = "../../examples/coding_agent.rs"
+
+[[example]]
+name = "deepseek_coding_agent"
+path = "../../examples/deepseek_coding_agent.rs"
+
+[[example]]
+name = "multi_turn_chat"
+path = "../../examples/multi_turn_chat.rs"
