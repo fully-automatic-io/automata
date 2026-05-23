@@ -1,12 +1,29 @@
-// Coding agent example — demonstrates session management and file tools
+// Coding agent example — demonstrates session management and file tools.
 
-use coding_agent::{
-    session::{AgentSession, SessionManager},
-    tools::{EditTool, EditToolOptions, ReadTool, ReadToolOptions, WriteTool, WriteToolOptions},
-};
+use agent_core::harness::session::{InMemorySessionStorage, JsonlSessionRepo, Session};
 use agent_core::tool::AgentTool;
-use std::path::Path;
+use agent_core::types::{AgentMessage, ContentBlock, MessageContent, StopReason, Usage};
+use coding_agent::tools::{EditTool, EditToolOptions, ReadTool, ReadToolOptions, WriteTool, WriteToolOptions};
 use tempfile::TempDir;
+
+fn user(text: &str) -> AgentMessage {
+    AgentMessage::User {
+        content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]),
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+        metadata: None,
+    }
+}
+
+fn assistant(text: &str, api: agent_core::types::Api, provider: &str, model: &str) -> AgentMessage {
+    AgentMessage::Assistant {
+        content: vec![ContentBlock::Text { text: text.into() }],
+        api, provider: provider.into(), model: model.into(),
+        usage: Usage { input: 10, output: 20, total_tokens: 30, ..Default::default() },
+        stop_reason: StopReason::EndTurn,
+        error_message: None,
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -25,98 +42,79 @@ async fn main() {
 
     let file_path = dir.path().join("hello.rs").to_string_lossy().to_string();
 
-    // Write
     write.execute("w1".into(), serde_json::json!({
         "path": &file_path,
         "content": "fn main() {\n    println!(\"hello\");\n}\n"
     }), None, None).await.unwrap();
     println!("  ✓ Wrote hello.rs");
 
-    // Read
     let result = read.execute("r1".into(), serde_json::json!({"path": &file_path}), None, None).await.unwrap();
-    if let agent_core::types::ContentBlock::Text { text } = &result.content[0] {
+    if let ContentBlock::Text { text } = &result.content[0] {
         println!("  ✓ Read {} bytes", text.len());
     }
 
-    // Edit
     edit.execute("e1".into(), serde_json::json!({
         "path": &file_path,
         "edits": [{"oldText": "hello", "newText": "world"}]
     }), None, None).await.unwrap();
     println!("  ✓ Edited hello → world");
 
-    // Verify
     let result = read.execute("r2".into(), serde_json::json!({"path": &file_path}), None, None).await.unwrap();
-    if let agent_core::types::ContentBlock::Text { text } = &result.content[0] {
+    if let ContentBlock::Text { text } = &result.content[0] {
         assert!(text.contains("world"), "edit should have replaced hello with world");
         println!("  ✓ Verified edit");
     }
 
-    // ── 2. Session management demo ────────────────────────────────────────────
+    // ── 2. Session management (in-memory) ─────────────────────────────────────
     println!("\n2. Session Management Demo");
     println!("--------------------------");
 
-    let mut session = AgentSession::new(dir.path());
+    let mut session = Session::new(Box::new(InMemorySessionStorage::new(None)));
 
-    let id1 = session.append_user_message("What is Rust?");
-    println!("  ✓ Appended user message (id={})", &id1[..8]);
+    let id1 = session.append_message(user("What is Rust?")).await.unwrap();
+    println!("  ✓ Appended user message (id={})", &id1[..id1.len().min(8)]);
 
-    // Simulate assistant response
-    session.append_assistant_message(serde_json::json!({
-        "role": "assistant",
-        "content": [{"type": "text", "text": "Rust is a systems programming language."}],
-        "api": "anthropic", "provider": "anthropic", "model": "claude-opus-4-7",
-        "usage": {"input": 10, "output": 20, "cacheRead": 0, "cacheWrite": 0,
-                  "totalTokens": 30, "cost": {"input": 0, "output": 0,
-                  "cacheRead": 0, "cacheWrite": 0, "total": 0}},
-        "stopReason": "end_turn",
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    }));
+    session.append_message(assistant(
+        "Rust is a systems programming language.",
+        agent_core::types::Api::Anthropic, "anthropic", "claude-opus-4-7",
+    )).await.unwrap();
     println!("  ✓ Appended assistant message");
 
-    let ctx = session.build_context();
+    let ctx = session.build_context().await.unwrap();
     println!("  ✓ Context: {} messages, model={:?}",
         ctx.messages.len(),
         ctx.model.as_ref().map(|m| m.model_id.as_str())
     );
 
-    // Branch
-    session.fork(&id1);
-    let id3 = session.append_user_message("What is Go?");
-    println!("  ✓ Branched and added alternative question (id={})", &id3[..8]);
+    session.move_to(Some(&id1), None).await.unwrap();
+    let id3 = session.append_message(user("What is Go?")).await.unwrap();
+    println!("  ✓ Branched and added alternative question (id={})", &id3[..id3.len().min(8)]);
 
-    let ctx2 = session.build_context();
+    let ctx2 = session.build_context().await.unwrap();
     println!("  ✓ Branch context: {} messages", ctx2.messages.len());
 
-    // ── 3. Session persistence demo ───────────────────────────────────────────
+    // ── 3. Session persistence (JSONL on disk) ───────────────────────────────
     println!("\n3. Session Persistence Demo");
     println!("---------------------------");
 
-    let session_dir = dir.path().join("sessions").to_string_lossy().to_string();
-    let mut mgr = SessionManager::create(dir.path().to_str().unwrap(), Some(&session_dir));
+    let sessions_root = dir.path().join("sessions");
+    let repo = JsonlSessionRepo::new(&sessions_root);
+    let mut mgr = repo.create(dir.path().to_str().unwrap(), None, None).await.unwrap();
 
-    mgr.append_message(serde_json::json!({
-        "role": "user", "content": "hello", "timestamp": 1000
-    }));
-    mgr.append_message(serde_json::json!({
-        "role": "assistant", "content": "hi",
-        "api": "t", "provider": "t", "model": "m",
-        "usage": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,
-                  "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
-        "stopReason": "stop", "timestamp": 2000
-    }));
+    mgr.append_message(user("hello")).await.unwrap();
+    mgr.append_message(assistant("hi", agent_core::types::Api::Anthropic, "t", "m")).await.unwrap();
 
-    if let Some(path) = mgr.session_file() {
-        println!("  ✓ Session persisted to: {}", path.file_name().unwrap().to_string_lossy());
+    let id = mgr.get_metadata().await.id;
+    drop(mgr);
 
-        // Reload
-        let reloaded = SessionManager::open(&path.to_string_lossy(), Some(&session_dir), None);
-        let ctx = reloaded.build_context();
-        println!("  ✓ Reloaded: {} messages", ctx.messages.len());
-        assert_eq!(ctx.messages.len(), 2);
-    } else {
-        println!("  ℹ Session not yet persisted (no assistant message written)");
-    }
+    let listed = repo.list(Some(dir.path().to_str().unwrap())).await.unwrap();
+    let entry = listed.iter().find(|m| m.id == id).expect("session listed");
+    println!("  ✓ Session persisted to: {}", entry.path);
+
+    let reloaded = repo.open_by_path(&entry.path).await.unwrap();
+    let ctx = reloaded.build_context().await.unwrap();
+    println!("  ✓ Reloaded: {} messages", ctx.messages.len());
+    assert_eq!(ctx.messages.len(), 2);
 
     println!("\n✅ All demos completed successfully!");
 }

@@ -2,12 +2,23 @@
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-// Constants matching TypeScript implementation
+// Output limits
 const DEFAULT_MAX_ENTRIES: usize = 500;
 const DEFAULT_MAX_BYTES: usize = 50_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LsToolDetails {
+    pub truncated: bool,
+    pub total_entries: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed_entries: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entries: Option<usize>,
+}
 
 // ============================================================================
 // Ls Tool
@@ -88,10 +99,7 @@ impl AgentTool for LsTool {
                 content: vec![ContentBlock::Text {
                     text: format!("Path does not exist: {}", path),
                 }],
-                details: serde_json::json!({
-                    "truncated": false,
-                    "total_entries": 0
-                }),
+                details: serde_json::to_value(LsToolDetails::default()).unwrap_or_default(),
                 terminate: false,
             });
         }
@@ -102,10 +110,7 @@ impl AgentTool for LsTool {
                 content: vec![ContentBlock::Text {
                     text: format!("Not a directory: {}", path),
                 }],
-                details: serde_json::json!({
-                    "truncated": false,
-                    "total_entries": 0
-                }),
+                details: serde_json::to_value(LsToolDetails::default()).unwrap_or_default(),
                 terminate: false,
             });
         }
@@ -185,12 +190,12 @@ impl AgentTool for LsTool {
 
         Ok(AgentToolResult {
             content: vec![ContentBlock::Text { text: result_text }],
-            details: serde_json::json!({
-                "truncated": truncated,
-                "total_entries": entries.len(),
-                "displayed_entries": result_lines.len(),
-                "max_entries": limit
-            }),
+            details: serde_json::to_value(LsToolDetails {
+                truncated,
+                total_entries: entries.len(),
+                displayed_entries: Some(result_lines.len()),
+                max_entries: Some(limit),
+            }).unwrap_or_default(),
             terminate: false,
         })
     }
@@ -203,6 +208,21 @@ impl AgentTool for LsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ls_tool_details_wire_shape() {
+        let d = LsToolDetails {
+            truncated: true,
+            total_entries: 600,
+            displayed_entries: Some(500),
+            max_entries: Some(500),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total_entries"], 600);
+        assert_eq!(v["displayed_entries"], 500);
+        assert_eq!(v["max_entries"], 500);
+    }
 
     #[test]
     fn test_ls_tool_name() {

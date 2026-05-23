@@ -3,9 +3,21 @@ use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteToolDetails {
+    pub bytes: usize,
+    #[serde(rename = "fileExists")]
+    pub file_exists: bool,
+    #[serde(rename = "emojisFiltered")]
+    pub emojis_filtered: bool,
+    #[serde(rename = "isDocumentation")]
+    pub is_documentation: bool,
+}
 
 // ============================================================================
 // WriteOperations trait — pluggable file I/O
@@ -255,12 +267,12 @@ impl AgentTool for WriteTool {
 
         Ok(AgentToolResult {
             content: vec![ContentBlock::Text { text: message }],
-            details: serde_json::json!({
-                "bytes": final_content.len(),
-                "fileExists": file_exists,
-                "emojisFiltered": content != final_content,
-                "isDocumentation": is_documentation_file(path)
-            }),
+            details: serde_json::to_value(WriteToolDetails {
+                bytes: final_content.len(),
+                file_exists,
+                emojis_filtered: content != final_content,
+                is_documentation: is_documentation_file(path),
+            }).unwrap_or_default(),
             terminate: false,
         })
     }
@@ -273,6 +285,21 @@ impl AgentTool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_write_tool_details_wire_shape() {
+        let d = WriteToolDetails {
+            bytes: 42,
+            file_exists: true,
+            emojis_filtered: false,
+            is_documentation: true,
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["bytes"], 42);
+        assert_eq!(v["fileExists"], true);
+        assert_eq!(v["emojisFiltered"], false);
+        assert_eq!(v["isDocumentation"], true);
+    }
 
     #[test]
     fn test_write_tool_name() {

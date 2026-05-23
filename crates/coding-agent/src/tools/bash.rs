@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 // Constants
 // ============================================================================
 
-pub const DEFAULT_MAX_BYTES: usize = 100_000;
-pub const DEFAULT_MAX_LINES: usize = 1000;
+pub const DEFAULT_MAX_BYTES: usize = 50 * 1024; // 50KB
+pub const DEFAULT_MAX_LINES: usize = 2000;
 
 // ============================================================================
 // Bash Tool Details
@@ -54,7 +54,8 @@ pub struct TruncationResult {
 
 /// Truncate output from the tail, respecting byte and line limits.
 pub fn truncate_tail(full_output: &str) -> TruncationResult {
-    let lines: Vec<&str> = full_output.split('\n').collect();
+    use agent_core::harness::utils::split_lines_for_counting;
+    let lines: Vec<&str> = split_lines_for_counting(full_output);
     let total_lines = lines.len();
 
     let mut output_lines: Vec<&str> = vec![];
@@ -156,13 +157,14 @@ impl BashOperations for LocalBashOperations {
         options: BashExecOptions,
     ) -> Result<BashExecResult, Box<dyn std::error::Error + Send + Sync>> {
         let shell = self.shell_path.as_deref().unwrap_or("/bin/bash");
-        let mut child = Command::new(shell)
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
+        let mut cmd = Command::new(shell);
+        cmd.arg("-c").arg(command).current_dir(cwd)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .stderr(std::process::Stdio::piped());
+        if let Some(ref env) = options.env {
+            cmd.envs(env);
+        }
+        let mut child = cmd.spawn()?;
 
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -200,7 +202,21 @@ impl BashOperations for LocalBashOperations {
             })
         };
 
-        let status = child.wait().await?;
+        let status = if let Some(timeout_secs) = options.timeout {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                child.wait(),
+            ).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err("Command timed out".into());
+                }
+            }
+        } else {
+            child.wait().await?
+        };
         let _ = stdout_handle.await;
         let _ = stderr_handle.await;
 
@@ -411,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_truncate_tail_long_output() {
-        let lines: Vec<String> = (0..2000).map(|i| format!("line {}", i)).collect();
+        let lines: Vec<String> = (0..2001).map(|i| format!("line {}", i)).collect();
         let input = lines.join("\n");
         let result = truncate_tail(&input);
         assert!(result.truncated);

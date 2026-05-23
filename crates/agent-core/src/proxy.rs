@@ -2,8 +2,8 @@
 // Proxy stream function for apps that route LLM calls through a server.
 // The server manages auth and proxies requests to LLM providers.
 
-use crate::event::AssistantMessageEvent;
-use crate::types::{AgentMessage, ThinkingBudgets, Transport};
+use crate::event::{AssistantMessageEvent, PartialAssistantMessage, PartialContentBlock};
+use crate::types::{ContentBlock, StopReason, ThinkingBudgets, ThinkingLevel, Transport};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -48,12 +48,12 @@ pub enum ProxyAssistantMessageEvent {
     ToolCallEnd { content_index: usize },
     #[serde(rename = "done")]
     Done {
-        reason: String,
+        reason: StopReason,
         usage: crate::types::Usage,
     },
     #[serde(rename = "error")]
     Error {
-        reason: String,
+        reason: StopReason,
         #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
         error_message: Option<String>,
         usage: crate::types::Usage,
@@ -68,7 +68,7 @@ pub enum ProxyAssistantMessageEvent {
 pub struct ProxyStreamOptions {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
-    pub reasoning: Option<String>,
+    pub reasoning: Option<ThinkingLevel>,
     pub session_id: Option<String>,
     pub headers: Option<std::collections::HashMap<String, String>>,
     pub transport: Transport,
@@ -83,49 +83,32 @@ pub struct ProxyStreamOptions {
 // Proxy stream function
 // ============================================================================
 
-/// Reconstruct an AssistantMessageEvent from a proxy event and partial message.
+/// Reconstruct an AssistantMessageEvent from a proxy event and the typed
+/// streaming `PartialAssistantMessage`.
 pub fn process_proxy_event(
     proxy_event: ProxyAssistantMessageEvent,
-    partial: &mut AgentMessage,
+    partial: &mut PartialAssistantMessage,
 ) -> Option<AssistantMessageEvent> {
     match proxy_event {
         ProxyAssistantMessageEvent::Start => {
-            Some(AssistantMessageEvent::Start {
-                partial: partial.clone(),
-            })
+            Some(AssistantMessageEvent::Start { partial: partial.clone() })
         }
         ProxyAssistantMessageEvent::TextStart { content_index } => {
-            let content = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut());
-            if let Some(arr) = content {
-                while arr.len() <= content_index {
-                    arr.push(serde_json::json!({}));
-                }
-                arr[content_index] = serde_json::json!({"type": "text", "text": ""});
-            }
+            partial.ensure_block_at(content_index);
+            partial.content[content_index] = PartialContentBlock::Text {
+                text: String::new(),
+                text_signature: None,
+            };
             Some(AssistantMessageEvent::TextStart {
                 content_index,
                 partial: partial.clone(),
             })
         }
-        ProxyAssistantMessageEvent::TextDelta {
-            content_index,
-            delta,
-        } => {
-            if let Some(content) = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut())
-                .and_then(|arr| arr.get_mut(content_index))
+        ProxyAssistantMessageEvent::TextDelta { content_index, delta } => {
+            if let Some(PartialContentBlock::Text { text, .. }) =
+                partial.content.get_mut(content_index)
             {
-                if content.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    let current = content
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    let new_text = format!("{}{}", current, delta);
-                    content["text"] = serde_json::json!(new_text);
-                }
+                text.push_str(&delta);
             }
             Some(AssistantMessageEvent::TextDelta {
                 content_index,
@@ -133,65 +116,38 @@ pub fn process_proxy_event(
                 partial: partial.clone(),
             })
         }
-        ProxyAssistantMessageEvent::TextEnd {
-            content_index,
-            content_signature,
-        } => {
-            let text = partial
-                .get("content")
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.get(content_index))
-                .and_then(|b| b.get("text"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            if let Some(content) = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut())
-                .and_then(|arr| arr.get_mut(content_index))
+        ProxyAssistantMessageEvent::TextEnd { content_index, content_signature } => {
+            let mut text_out = String::new();
+            if let Some(PartialContentBlock::Text { text, text_signature }) =
+                partial.content.get_mut(content_index)
             {
-                if let Some(sig) = content_signature {
-                    content["textSignature"] = serde_json::json!(sig);
+                text_out = text.clone();
+                if content_signature.is_some() {
+                    *text_signature = content_signature;
                 }
             }
             Some(AssistantMessageEvent::TextEnd {
                 content_index,
-                content: text,
+                content: text_out,
                 partial: partial.clone(),
             })
         }
         ProxyAssistantMessageEvent::ThinkingStart { content_index } => {
-            let content = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut());
-            if let Some(arr) = content {
-                while arr.len() <= content_index {
-                    arr.push(serde_json::json!({}));
-                }
-                arr[content_index] =
-                    serde_json::json!({"type": "thinking", "thinking": ""});
-            }
+            partial.ensure_block_at(content_index);
+            partial.content[content_index] = PartialContentBlock::Thinking {
+                thinking: String::new(),
+                thinking_signature: None,
+            };
             Some(AssistantMessageEvent::ThinkingStart {
                 content_index,
                 partial: partial.clone(),
             })
         }
-        ProxyAssistantMessageEvent::ThinkingDelta {
-            content_index,
-            delta,
-        } => {
-            if let Some(content) = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut())
-                .and_then(|arr| arr.get_mut(content_index))
+        ProxyAssistantMessageEvent::ThinkingDelta { content_index, delta } => {
+            if let Some(PartialContentBlock::Thinking { thinking, .. }) =
+                partial.content.get_mut(content_index)
             {
-                if content.get("type").and_then(|t| t.as_str()) == Some("thinking") {
-                    let current = content
-                        .get("thinking")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    content["thinking"] = serde_json::json!(format!("{}{}", current, delta));
-                }
+                thinking.push_str(&delta);
             }
             Some(AssistantMessageEvent::ThinkingDelta {
                 content_index,
@@ -199,77 +155,43 @@ pub fn process_proxy_event(
                 partial: partial.clone(),
             })
         }
-        ProxyAssistantMessageEvent::ThinkingEnd {
-            content_index,
-            content_signature,
-        } => {
-            let thinking = partial
-                .get("content")
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.get(content_index))
-                .and_then(|b| b.get("thinking"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            if let Some(content) = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut())
-                .and_then(|arr| arr.get_mut(content_index))
+        ProxyAssistantMessageEvent::ThinkingEnd { content_index, content_signature } => {
+            let mut text_out = String::new();
+            if let Some(PartialContentBlock::Thinking { thinking, thinking_signature }) =
+                partial.content.get_mut(content_index)
             {
-                if let Some(sig) = content_signature {
-                    content["thinkingSignature"] = serde_json::json!(sig);
+                text_out = thinking.clone();
+                if content_signature.is_some() {
+                    *thinking_signature = content_signature;
                 }
             }
             Some(AssistantMessageEvent::ThinkingEnd {
                 content_index,
-                content: thinking,
+                content: text_out,
                 partial: partial.clone(),
             })
         }
-        ProxyAssistantMessageEvent::ToolCallStart {
-            content_index,
-            id,
-            tool_name,
-        } => {
-            let content = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut());
-            if let Some(arr) = content {
-                while arr.len() <= content_index {
-                    arr.push(serde_json::json!({}));
-                }
-                arr[content_index] = serde_json::json!({
-                    "type": "toolCall",
-                    "id": id,
-                    "name": tool_name,
-                    "arguments": {}
-                });
-            }
+        ProxyAssistantMessageEvent::ToolCallStart { content_index, id, tool_name } => {
+            partial.ensure_block_at(content_index);
+            partial.content[content_index] = PartialContentBlock::ToolCall {
+                id,
+                name: tool_name,
+                arguments: serde_json::json!({}),
+                partial_json: None,
+            };
             Some(AssistantMessageEvent::ToolCallStart {
                 content_index,
                 partial: partial.clone(),
             })
         }
-        ProxyAssistantMessageEvent::ToolCallDelta {
-            content_index,
-            delta,
-        } => {
-            if let Some(content) = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut())
-                .and_then(|arr| arr.get_mut(content_index))
+        ProxyAssistantMessageEvent::ToolCallDelta { content_index, delta } => {
+            if let Some(PartialContentBlock::ToolCall { arguments, partial_json, .. }) =
+                partial.content.get_mut(content_index)
             {
-                if content.get("type").and_then(|t| t.as_str()) == Some("toolCall") {
-                    let current = content
-                        .get("partialJson")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    let new_json = format!("{}{}", current, delta);
-                    content["partialJson"] = serde_json::json!(new_json);
-                    // Try to parse incremental JSON
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&new_json) {
-                        content["arguments"] = parsed;
-                    }
+                let buf = partial_json.get_or_insert_with(String::new);
+                buf.push_str(&delta);
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(buf) {
+                    *arguments = parsed;
                 }
             }
             Some(AssistantMessageEvent::ToolCallDelta {
@@ -279,19 +201,18 @@ pub fn process_proxy_event(
             })
         }
         ProxyAssistantMessageEvent::ToolCallEnd { content_index } => {
-            let tool_call = partial
-                .get("content")
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.get(content_index))
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            if let Some(content) = partial
-                .get_mut("content")
-                .and_then(|c| c.as_array_mut())
-                .and_then(|arr| arr.get_mut(content_index))
+            // Drop in-flight `partialJson` and snapshot the finalized block.
+            if let Some(PartialContentBlock::ToolCall { partial_json, .. }) =
+                partial.content.get_mut(content_index)
             {
-                content.as_object_mut().map(|o| o.remove("partialJson"));
+                *partial_json = None;
             }
+            let tool_call: ContentBlock = partial
+                .content
+                .get(content_index)
+                .cloned()
+                .map(PartialContentBlock::into_block)
+                .unwrap_or(ContentBlock::Text { text: String::new() });
             Some(AssistantMessageEvent::ToolCallEnd {
                 content_index,
                 tool_call,
@@ -299,25 +220,16 @@ pub fn process_proxy_event(
             })
         }
         ProxyAssistantMessageEvent::Done { reason, usage } => {
-            if let Some(obj) = partial.as_object_mut() {
-                obj.insert("stopReason".to_string(), serde_json::json!(reason));
-                obj.insert("usage".to_string(), serde_json::to_value(usage).unwrap_or_default());
-            }
-            Some(AssistantMessageEvent::Done {
-                reason,
-                message: partial.clone(),
-            })
+            partial.stop_reason = reason;
+            partial.usage = usage;
+            let final_msg = partial.clone().into_finalized();
+            Some(AssistantMessageEvent::Done { reason, message: final_msg })
         }
-        ProxyAssistantMessageEvent::Error {
-            reason,
-            error_message,
-            usage: _,
-        } => {
-            if let Some(obj) = partial.as_object_mut() {
-                obj.insert("stopReason".to_string(), serde_json::json!(reason));
-                if let Some(msg) = error_message {
-                    obj.insert("errorMessage".to_string(), serde_json::json!(msg));
-                }
+        ProxyAssistantMessageEvent::Error { reason, error_message, usage } => {
+            partial.stop_reason = reason;
+            partial.usage = usage;
+            if let Some(msg) = error_message {
+                partial.error_message = Some(msg);
             }
             Some(AssistantMessageEvent::Error {
                 reason,
@@ -337,25 +249,17 @@ mod tests {
 
     #[test]
     fn test_process_proxy_event_start() {
-        let mut partial = serde_json::json!({
-            "role": "assistant",
-            "content": [],
-            "stopReason": "stop"
-        });
+        let mut partial = PartialAssistantMessage::new(crate::types::Api::Anthropic, "p", "m");
         let event = process_proxy_event(ProxyAssistantMessageEvent::Start, &mut partial);
-        assert!(event.is_some());
-        match event.unwrap() {
-            AssistantMessageEvent::Start { .. } => {}
-            _ => panic!("Expected Start event"),
-        }
+        assert!(matches!(event, Some(AssistantMessageEvent::Start { .. })));
     }
 
     #[test]
     fn test_process_proxy_text_delta() {
-        let mut partial = serde_json::json!({
-            "role": "assistant",
-            "content": [{"type": "text", "text": "Hello"}],
-            "stopReason": "stop"
+        let mut partial = PartialAssistantMessage::new(crate::types::Api::Anthropic, "p", "m");
+        partial.content.push(PartialContentBlock::Text {
+            text: "Hello".to_string(),
+            text_signature: None,
         });
         let event = process_proxy_event(
             ProxyAssistantMessageEvent::TextDelta {
@@ -365,29 +269,31 @@ mod tests {
             &mut partial,
         );
         assert!(event.is_some());
-        assert_eq!(
-            partial["content"][0]["text"].as_str().unwrap(),
-            "Hello world"
-        );
+        match &partial.content[0] {
+            PartialContentBlock::Text { text, .. } => assert_eq!(text, "Hello world"),
+            _ => panic!("expected Text block"),
+        }
     }
 
     #[test]
     fn test_process_proxy_done() {
-        let mut partial = serde_json::json!({
-            "role": "assistant",
-            "content": [{"type": "text", "text": "Done"}],
-            "stopReason": "stop"
+        let mut partial = PartialAssistantMessage::new(crate::types::Api::Anthropic, "p", "m");
+        partial.content.push(PartialContentBlock::Text {
+            text: "Done".to_string(),
+            text_signature: None,
         });
         let event = process_proxy_event(
             ProxyAssistantMessageEvent::Done {
-                reason: "stop".to_string(),
+                reason: StopReason::EndTurn,
                 usage: crate::types::Usage::default(),
             },
             &mut partial,
         );
-        assert!(event.is_some());
         match event.unwrap() {
-            AssistantMessageEvent::Done { reason, .. } => assert_eq!(reason, "stop"),
+            AssistantMessageEvent::Done { reason, message, .. } => {
+                assert_eq!(reason, StopReason::EndTurn);
+                assert_eq!(message.role(), "assistant");
+            }
             _ => panic!("Expected Done event"),
         }
     }

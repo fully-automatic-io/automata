@@ -2,12 +2,45 @@
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-pub const DEFAULT_MAX_BYTES: usize = 100_000;
-pub const DEFAULT_MAX_LINES: usize = 2000; // Match TypeScript: 2000 lines
+pub const DEFAULT_MAX_BYTES: usize = 50 * 1024; // 50KB
+pub const DEFAULT_MAX_LINES: usize = 2000;
+
+// ============================================================================
+// Read Tool Details — three shapes depending on read kind.
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageDimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReadToolDetails {
+    Image {
+        #[serde(rename = "originalDimensions")] original_dimensions: ImageDimensions,
+        #[serde(rename = "finalDimensions")] final_dimensions: ImageDimensions,
+        resized: bool,
+        #[serde(rename = "mimeType")] mime_type: String,
+    },
+    FirstLineTooLong {
+        #[serde(rename = "firstLineExceedsLimit")] first_line_exceeds_limit: bool,
+        #[serde(rename = "firstLineBytes")] first_line_bytes: usize,
+    },
+    Text {
+        truncated: bool,
+        #[serde(rename = "totalLines")] total_lines: usize,
+        #[serde(rename = "outputLines")] output_lines: usize,
+        #[serde(rename = "startLine")] start_line: usize,
+        #[serde(rename = "endLine")] end_line: usize,
+    },
+}
 
 // Image formats supported
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp"];
@@ -37,7 +70,8 @@ pub struct TruncationResult {
 
 /// Truncate from the head (keep first N lines/bytes)
 pub fn truncate_head(full_output: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
-    let lines: Vec<&str> = full_output.split('\n').collect();
+    use agent_core::harness::utils::split_lines_for_counting;
+    let lines: Vec<&str> = split_lines_for_counting(full_output);
     let total_lines = lines.len();
 
     // Check if first line exceeds byte limit
@@ -70,7 +104,7 @@ pub fn truncate_head(full_output: &str, max_lines: usize, max_bytes: usize) -> T
         output_bytes += line_bytes;
     }
 
-    let content = lines[..output_lines].join("\n");
+    let content = lines[..output_lines.min(lines.len())].join("\n");
     let truncated = output_lines < total_lines;
 
     TruncationResult {
@@ -226,12 +260,12 @@ impl ReadTool {
 
         Ok(AgentToolResult {
             content,
-            details: serde_json::json!({
-                "originalDimensions": { "width": orig_width, "height": orig_height },
-                "finalDimensions": { "width": final_width, "height": final_height },
-                "resized": resized,
-                "mimeType": mime_type
-            }),
+            details: serde_json::to_value(ReadToolDetails::Image {
+                original_dimensions: ImageDimensions { width: orig_width, height: orig_height },
+                final_dimensions: ImageDimensions { width: final_width, height: final_height },
+                resized,
+                mime_type: mime_type.to_string(),
+            }).unwrap_or_default(),
             terminate: false,
         })
     }
@@ -242,7 +276,7 @@ impl ReadTool {
             .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<_>)?;
 
         let text = String::from_utf8_lossy(&buffer).to_string();
-        let all_lines: Vec<&str> = text.split('\n').collect();
+        let all_lines: Vec<&str> = agent_core::harness::utils::split_lines_for_counting(&text);
         let total_lines = all_lines.len();
 
         // Calculate range
@@ -271,10 +305,10 @@ impl ReadTool {
 
             return Ok(AgentToolResult {
                 content: vec![ContentBlock::Text { text: suggestion }],
-                details: serde_json::json!({
-                    "firstLineExceedsLimit": true,
-                    "firstLineBytes": all_lines[start].len()
-                }),
+                details: serde_json::to_value(ReadToolDetails::FirstLineTooLong {
+                    first_line_exceeds_limit: true,
+                    first_line_bytes: all_lines[start].len(),
+                }).unwrap_or_default(),
                 terminate: false,
             });
         }
@@ -297,13 +331,13 @@ impl ReadTool {
 
         Ok(AgentToolResult {
             content: vec![ContentBlock::Text { text: output }],
-            details: serde_json::json!({
-                "truncated": truncation.truncated,
-                "totalLines": total_lines,
-                "outputLines": truncation.output_lines,
-                "startLine": start + 1,
-                "endLine": start + truncation.output_lines
-            }),
+            details: serde_json::to_value(ReadToolDetails::Text {
+                truncated: truncation.truncated,
+                total_lines,
+                output_lines: truncation.output_lines,
+                start_line: start + 1,
+                end_line: start + truncation.output_lines,
+            }).unwrap_or_default(),
             terminate: false,
         })
     }
@@ -390,6 +424,38 @@ impl AgentTool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_tool_details_text_wire_shape() {
+        let d = ReadToolDetails::Text {
+            truncated: true,
+            total_lines: 100,
+            output_lines: 50,
+            start_line: 1,
+            end_line: 50,
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["totalLines"], 100);
+        assert_eq!(v["outputLines"], 50);
+        assert_eq!(v["startLine"], 1);
+        assert_eq!(v["endLine"], 50);
+    }
+
+    #[test]
+    fn test_read_tool_details_image_wire_shape() {
+        let d = ReadToolDetails::Image {
+            original_dimensions: ImageDimensions { width: 1920, height: 1080 },
+            final_dimensions: ImageDimensions { width: 800, height: 600 },
+            resized: true,
+            mime_type: "image/png".into(),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["originalDimensions"]["width"], 1920);
+        assert_eq!(v["finalDimensions"]["height"], 600);
+        assert_eq!(v["resized"], true);
+        assert_eq!(v["mimeType"], "image/png");
+    }
 
     #[test]
     fn test_truncate_head_short() {

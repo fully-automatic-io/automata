@@ -32,7 +32,7 @@ impl OpenAIProvider {
 
     fn build_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
         let messages: Vec<serde_json::Value> = request.messages.iter()
-            .map(convert_message)
+            .filter_map(convert_message)
             .collect();
 
         let tools: Vec<serde_json::Value> = request.tools.iter()
@@ -53,7 +53,10 @@ impl OpenAIProvider {
         });
 
         if let Some(max_tokens) = request.max_tokens {
+            // GPT-5 / o-series use `max_completion_tokens`; legacy chat uses `max_tokens`.
+            // We forward both to keep older endpoints happy.
             body["max_tokens"] = json!(max_tokens);
+            body["max_completion_tokens"] = json!(max_tokens);
         }
         if let Some(temp) = request.temperature {
             body["temperature"] = json!(temp);
@@ -64,15 +67,30 @@ impl OpenAIProvider {
         if !request.stop_sequences.is_empty() {
             body["stop"] = json!(request.stop_sequences);
         }
+        // Stream usage chunks in SSE responses.
+        if stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+
+        // `reasoning_effort` is forwarded as a typed field on LlmRequest (set by callers
+        // based on the user's thinking level). The retry/option layer ensures it's a valid level.
+        if let Some(eff) = &request.reasoning_effort {
+            body["reasoning_effort"] = json!(eff);
+        }
 
         body
     }
 
     async fn send_with_retry(&self, body: serde_json::Value) -> Result<reqwest::Response, LlmError> {
-        let mut last_err = None;
+        use crate::retry::{format_http_error, retry_delay, should_retry};
+        let mut last_err: Option<LlmError> = None;
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt - 1))).await;
+                let after = match &last_err {
+                    Some(LlmError::RateLimit { retry_after_secs }) => Some(*retry_after_secs),
+                    _ => None,
+                };
+                tokio::time::sleep(retry_delay(attempt - 1, 500, Some(30_000), after)).await;
             }
             let resp = self.client
                 .post(self.base_url())
@@ -90,36 +108,50 @@ impl OpenAIProvider {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(5);
                         last_err = Some(LlmError::RateLimit { retry_after_secs: secs });
-                        tokio::time::sleep(Duration::from_secs(secs)).await;
                         continue;
                     }
                     if status == 401 { return Err(LlmError::AuthError); }
-                    let msg = r.text().await.unwrap_or_default();
-                    last_err = Some(LlmError::Http { status, message: msg });
-                    if status >= 500 { continue; }
-                    break;
+                    let body = r.text().await.unwrap_or_default();
+                    // Prefix status onto message body so the retry layer (and callers) can match (52e13870).
+                    let err = LlmError::Http { status, message: format_http_error(status, &body) };
+                    if should_retry(&err) {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
                 }
-                Err(e) => { last_err = Some(LlmError::Reqwest(e)); }
+                Err(e) => {
+                    let err = LlmError::Reqwest(e);
+                    if should_retry(&err) {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
-        Err(last_err.unwrap())
+        Err(last_err.unwrap_or(LlmError::Other("retry exhausted".into())))
     }
 }
 
-fn convert_message(msg: &LlmMessage) -> serde_json::Value {
+fn convert_message(msg: &LlmMessage) -> Option<serde_json::Value> {
     match msg {
         LlmMessage::User { content, .. } => {
             let text = extract_text(content);
-            json!({"role": "user", "content": text})
+            Some(json!({"role": "user", "content": text}))
         }
         LlmMessage::Assistant { content, .. } => {
+            // Reasoning replay normalization: Chat Completions has no first-class
+            // place for prior `thinking` blocks. We drop them on replay. If the
+            // remaining content is empty (model produced thinking-only), skip the
+            // message entirely so the endpoint doesn't reject it.
             let text: String = content.iter()
                 .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None })
                 .collect::<Vec<_>>()
                 .join("");
             let tool_calls: Vec<serde_json::Value> = content.iter()
                 .filter_map(|p| {
-                    if let ContentPart::ToolUse { id, name, arguments } = p {
+                    if let ContentPart::ToolCall { id, name, arguments } = p {
                         Some(json!({
                             "id": id,
                             "type": "function",
@@ -128,10 +160,13 @@ fn convert_message(msg: &LlmMessage) -> serde_json::Value {
                     } else { None }
                 })
                 .collect();
+            if text.is_empty() && tool_calls.is_empty() {
+                return None;
+            }
             if tool_calls.is_empty() {
-                json!({"role": "assistant", "content": text})
+                Some(json!({"role": "assistant", "content": text}))
             } else {
-                json!({"role": "assistant", "content": text, "tool_calls": tool_calls})
+                Some(json!({"role": "assistant", "content": text, "tool_calls": tool_calls}))
             }
         }
         LlmMessage::ToolResult { tool_call_id, content, is_error: _, .. } => {
@@ -139,8 +174,10 @@ fn convert_message(msg: &LlmMessage) -> serde_json::Value {
                 .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None })
                 .collect::<Vec<_>>()
                 .join("");
-            json!({"role": "tool", "tool_call_id": tool_call_id, "content": text})
+            Some(json!({"role": "tool", "tool_call_id": tool_call_id, "content": text}))
         }
+        // Custom roles are collapsed before reaching the provider.
+        _ => None,
     }
 }
 
@@ -209,7 +246,7 @@ impl LlmProvider for OpenAIProvider {
             for tc in tool_calls {
                 let input = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::Value::Null);
-                content.push(ContentPart::ToolUse {
+                content.push(ContentPart::ToolCall {
                     id: tc.id,
                     name: tc.function.name,
                     arguments: input,

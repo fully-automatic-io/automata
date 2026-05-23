@@ -19,11 +19,15 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_yaml = "0.9"
+regex = "1"
+
+tempfile = "3"
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
 
 [[example]]
 name = "basic_agent"

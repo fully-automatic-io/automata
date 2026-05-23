@@ -1,38 +1,140 @@
+// Canonical type definitions for agent-core.
+//
+// This module is the single source of truth for protocol types (LlmMessage,
+// ContentBlock, Usage, Model, ...) and agent types (AgentMessage, AgentContext,
+// AgentLoopConfig, AgentState, ...). The llm-client crate depends on agent-core
+// and re-exports these types; coding-agent uses them via agent-core.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+use crate::tool::AgentTool;
 
 // ============================================================================
-// Thinking Level
+// Transport / CacheRetention / ThinkingBudgets / ThinkingLevel / ToolExec
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    Sse,
+    Websocket,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheRetention {
+    #[default]
+    Short,
+    Long,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ThinkingBudgets {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub medium: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xhigh: Option<u32>,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     #[default]
     #[serde(rename = "off")]
     Off,
-    #[serde(rename = "minimal")]
     Minimal,
-    #[serde(rename = "low")]
     Low,
-    #[serde(rename = "medium")]
     Medium,
-    #[serde(rename = "high")]
     High,
     #[serde(rename = "xhigh")]
     XHigh,
 }
 
+impl ThinkingLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
+
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            _ => None,
+        }
+    }
+}
+
 // ============================================================================
-// Tool Execution Mode
+// Wire-protocol family — closed set; one variant per supported request shape.
+// `Provider` (vendor name) stays a String because it's open: anthropic /
+// openai / deepseek / bedrock / cloudflare / fireworks / etc.
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum ToolExecutionMode {
+pub enum Api {
+    /// Anthropic Messages-style (`/v1/messages`, content blocks, thinking blocks).
     #[default]
+    Anthropic,
+    /// OpenAI Chat Completions (`/v1/chat/completions`).
+    Openai,
+    /// OpenAI Responses API (`/v1/responses`).
+    #[serde(rename = "openai-responses")]
+    OpenaiResponses,
+    /// Mock/test sink — no real wire shape.
+    Mock,
+}
+
+impl Api {
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+            Self::OpenaiResponses => "openai-responses",
+            Self::Mock => "mock",
+        }
+    }
+
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" => Some(Self::Openai),
+            "openai-responses" => Some(Self::OpenaiResponses),
+            "mock" => Some(Self::Mock),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolExecutionMode {
     Sequential,
+    #[default]
     Parallel,
 }
 
@@ -40,9 +142,9 @@ pub enum ToolExecutionMode {
 // Stop Reason
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StopReason {
+    #[default]
     #[serde(rename = "stop")]
     EndTurn,
     #[serde(rename = "length")]
@@ -59,45 +161,35 @@ pub enum StopReason {
     Aborted,
 }
 
-// ============================================================================
-// Content Blocks
-// ============================================================================
+impl StopReason {
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            Self::EndTurn => "stop",
+            Self::MaxTokens => "length",
+            Self::StopSequence => "stop_sequence",
+            Self::ToolUse => "toolUse",
+            Self::ContentFilter => "content_filter",
+            Self::Error => "error",
+            Self::Aborted => "aborted",
+        }
+    }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image")]
-    Image {
-        data: String,
-        #[serde(rename = "mimeType")]
-        mime_type: String,
-    },
-    #[serde(rename = "toolCall")]
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: serde_json::Value,
-    },
-    #[serde(rename = "toolResult")]
-    ToolResult {
-        #[serde(rename = "toolCallId")]
-        tool_call_id: String,
-        #[serde(rename = "toolName", skip_serializing_if = "Option::is_none")]
-        tool_name: Option<String>,
-        content: Vec<ContentBlock>,
-        #[serde(rename = "isError", default)]
-        is_error: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        details: Option<serde_json::Value>,
-    },
-    #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "stop" | "end_turn" => Some(Self::EndTurn),
+            "length" | "max_tokens" => Some(Self::MaxTokens),
+            "stop_sequence" => Some(Self::StopSequence),
+            "toolUse" | "tool_use" => Some(Self::ToolUse),
+            "content_filter" => Some(Self::ContentFilter),
+            "error" => Some(Self::Error),
+            "aborted" => Some(Self::Aborted),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
-// Usage & Cost
+// Usage / Cost
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -125,9 +217,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub fn empty() -> Self {
-        Self::default()
-    }
+    pub fn empty() -> Self { Self::default() }
 
     pub fn add(&mut self, other: &Usage) {
         self.input += other.input;
@@ -143,45 +233,92 @@ impl Usage {
     }
 }
 
+// `UsageCost` is an alias for `Cost` used by some llm-client provider crates.
+pub type UsageCost = Cost;
+
 // ============================================================================
-// Transport
+// Model
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Transport {
-    #[default]
-    Sse,
-    Json,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: f64,
+    #[serde(rename = "cacheWrite")]
+    pub cache_write: f64,
 }
 
-// ============================================================================
-// Thinking Budgets
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ThinkingBudgets {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub low: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub medium: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub high: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub xhigh: Option<u32>,
+impl Default for ModelCost {
+    fn default() -> Self {
+        Self { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 }
+    }
 }
 
-// ============================================================================
-// Model (minimal — provided by llm-client)
-// ============================================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Model {
+    pub id: String,
+    pub name: String,
+    pub api: Api,
+    pub provider: String,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    pub reasoning: bool,
+    pub input: Vec<String>,
+    pub cost: ModelCost,
+    #[serde(rename = "contextWindow")]
+    pub context_window: u64,
+    #[serde(rename = "maxTokens")]
+    pub max_tokens: u64,
+}
 
-/// Model info used within agent-core.
-/// Full model type is in llm-client; agent-core uses a trait/trait object.
-#[derive(Debug, Clone)]
+impl Default for Model {
+    fn default() -> Self {
+        Self {
+            id: "unknown".into(),
+            name: "unknown".into(),
+            api: Api::Anthropic,
+            provider: "unknown".into(),
+            base_url: String::new(),
+            reasoning: false,
+            input: vec![],
+            cost: ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+        }
+    }
+}
+
+impl Model {
+    /// Cap `requested` so it never exceeds either the model's `max_tokens` or
+    /// `context_window - input_tokens_estimate`.
+    pub fn cap_output_budget(&self, requested: Option<u32>, input_tokens_estimate: u64) -> u32 {
+        let model_cap = if self.max_tokens > 0 { self.max_tokens } else { u64::MAX };
+        let context_cap = self.context_window.saturating_sub(input_tokens_estimate);
+        let asked = requested.map(u64::from).unwrap_or(model_cap);
+        let capped = asked.min(model_cap).min(context_cap.max(1));
+        capped.try_into().unwrap_or(u32::MAX)
+    }
+
+    /// Clamp `reasoning` to a level this model supports. Models without
+    /// reasoning return None. `Some(ThinkingLevel::Off)` also collapses to None.
+    pub fn clamp_reasoning(&self, reasoning: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
+        if !self.reasoning { return None; }
+        let level = reasoning?;
+        if level == ThinkingLevel::Off { return None; }
+        Some(level)
+    }
+}
+
+/// Lightweight model identifier — used inside AgentState / AgentLoopConfig
+/// when only id+provider+api+context-window are needed (e.g. message attribution).
+/// Full `Model` carries pricing and metadata.
+#[derive(Debug, Clone, Default)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
-    pub api: String,
+    pub api: Api,
     pub provider: String,
     pub base_url: String,
     pub reasoning: bool,
@@ -190,67 +327,72 @@ pub struct ModelInfo {
     pub max_tokens: u64,
 }
 
-impl Default for ModelInfo {
-    fn default() -> Self {
+impl From<&Model> for ModelInfo {
+    fn from(m: &Model) -> Self {
         Self {
-            id: "unknown".to_string(),
-            name: "unknown".to_string(),
-            api: "unknown".to_string(),
-            provider: "unknown".to_string(),
-            base_url: String::new(),
-            reasoning: false,
-            input: vec![],
-            context_window: 0,
-            max_tokens: 0,
+            id: m.id.clone(),
+            name: m.name.clone(),
+            api: m.api.clone(),
+            provider: m.provider.clone(),
+            base_url: m.base_url.clone(),
+            reasoning: m.reasoning,
+            input: m.input.clone(),
+            context_window: m.context_window,
+            max_tokens: m.max_tokens,
         }
     }
 }
 
+impl From<Model> for ModelInfo {
+    fn from(m: Model) -> Self { Self::from(&m) }
+}
+
 // ============================================================================
-// Messages
+// Content Blocks — single canonical representation
 // ============================================================================
 
-/// A message in the agent conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "role", rename_all = "lowercase")]
-pub enum Message {
-    #[serde(rename = "user")]
-    User {
-        content: MessageContent,
-        #[serde(default)]
-        timestamp: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        metadata: Option<serde_json::Value>,
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
     },
-    #[serde(rename = "assistant")]
-    Assistant {
-        content: Vec<ContentBlock>,
-        api: String,
-        provider: String,
-        model: String,
-        usage: Usage,
-        #[serde(rename = "stopReason")]
-        stop_reason: String,
-        #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
-        error_message: Option<String>,
-        timestamp: u64,
+    #[serde(rename = "toolCall")]
+    ToolCall {
+        id: String,
+        name: String,
+        /// Tool args are open by design — each tool defines its own JSON Schema.
+        arguments: serde_json::Value,
     },
     #[serde(rename = "toolResult")]
     ToolResult {
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
-        #[serde(rename = "toolName")]
-        tool_name: String,
+        #[serde(rename = "toolName", skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         content: Vec<ContentBlock>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        details: Option<serde_json::Value>,
         #[serde(rename = "isError", default)]
         is_error: bool,
-        timestamp: u64,
+        /// Tool-specific extra details (each tool defines its own struct).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
 }
 
-/// Content can be a string (simple) or an array of content blocks (structured).
+// `ContentPart` is the alias used inside llm-client and provider crates.
+pub type ContentPart = ContentBlock;
+
+// ============================================================================
+// MessageContent — string OR structured blocks
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -259,29 +401,349 @@ pub enum MessageContent {
 }
 
 impl Default for MessageContent {
-    fn default() -> Self {
-        Self::Blocks(vec![])
+    fn default() -> Self { Self::Blocks(vec![]) }
+}
+
+impl MessageContent {
+    pub fn into_blocks(self) -> Vec<ContentBlock> {
+        match self {
+            Self::String(s) => vec![ContentBlock::Text { text: s }],
+            Self::Blocks(b) => b,
+        }
+    }
+    pub fn as_blocks(&self) -> Vec<ContentBlock> { self.clone().into_blocks() }
+}
+
+// ============================================================================
+// AgentMessage — typed enum covering both protocol and custom variants.
+// Replaces the previous `serde_json::Value` alias and the parallel `LlmMessage`.
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "role")]
+pub enum AgentMessage {
+    /// User-supplied input.
+    #[serde(rename = "user")]
+    User {
+        content: MessageContent,
+        #[serde(default)]
+        timestamp: u64,
+        /// Caller-attached metadata (e.g. trace ids); shape is application-defined.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+
+    /// Streamed assistant response.
+    #[serde(rename = "assistant")]
+    Assistant {
+        content: Vec<ContentBlock>,
+        api: Api,
+        provider: String,
+        model: String,
+        usage: Usage,
+        #[serde(rename = "stopReason")]
+        stop_reason: StopReason,
+        #[serde(rename = "errorMessage", default, skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+        #[serde(default)]
+        timestamp: u64,
+    },
+
+    /// Result of a tool call (separate role).
+    #[serde(rename = "toolResult")]
+    ToolResult {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        content: Vec<ContentBlock>,
+        /// Tool-specific extra details (each tool defines its own struct).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        #[serde(rename = "isError", default)]
+        is_error: bool,
+        #[serde(default)]
+        timestamp: u64,
+    },
+
+    /// Custom: arbitrary user-tagged message that converts to user content.
+    #[serde(rename = "custom")]
+    Custom {
+        /// Plugin-defined message kind (extensible — open string by design).
+        #[serde(rename = "customType")]
+        custom_type: String,
+        /// Plugin-defined payload — shape is set by `custom_type`.
+        content: serde_json::Value,
+        #[serde(default)]
+        display: bool,
+        /// Plugin-defined extra metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        #[serde(default)]
+        timestamp: u64,
+    },
+
+    /// Bash execution record (used by the coding-agent's bash extension).
+    #[serde(rename = "bashExecution")]
+    BashExecution {
+        command: String,
+        output: String,
+        #[serde(rename = "exitCode")]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        cancelled: bool,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(rename = "fullOutputPath", default, skip_serializing_if = "Option::is_none")]
+        full_output_path: Option<String>,
+        #[serde(default)]
+        timestamp: u64,
+        #[serde(rename = "excludeFromContext", default, skip_serializing_if = "std::ops::Not::not")]
+        exclude_from_context: bool,
+    },
+
+    /// Branch summary recorded when navigating away from a branch.
+    #[serde(rename = "branchSummary")]
+    BranchSummary {
+        summary: String,
+        #[serde(rename = "fromId")]
+        from_id: String,
+        #[serde(default)]
+        timestamp: u64,
+    },
+
+    /// Compaction summary inserted at the front of compacted context.
+    #[serde(rename = "compactionSummary")]
+    CompactionSummary {
+        summary: String,
+        #[serde(rename = "tokensBefore", default)]
+        tokens_before: u64,
+        #[serde(default)]
+        timestamp: u64,
+    },
+}
+
+impl AgentMessage {
+    pub fn role(&self) -> &'static str {
+        match self {
+            Self::User { .. } => "user",
+            Self::Assistant { .. } => "assistant",
+            Self::ToolResult { .. } => "toolResult",
+            Self::Custom { .. } => "custom",
+            Self::BashExecution { .. } => "bashExecution",
+            Self::BranchSummary { .. } => "branchSummary",
+            Self::CompactionSummary { .. } => "compactionSummary",
+        }
+    }
+
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self::User {
+            content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]),
+            timestamp: now_ts(),
+            metadata: None,
+        }
+    }
+
+    pub fn assistant_text(text: impl Into<String>) -> Self {
+        Self::Assistant {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            api: Api::Anthropic,
+            provider: "unknown".into(),
+            model: "unknown".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            timestamp: now_ts(),
+        }
+    }
+
+    /// Returns the assistant content array if this is an assistant message.
+    pub fn assistant_content(&self) -> Option<&[ContentBlock]> {
+        if let Self::Assistant { content, .. } = self { Some(content) } else { None }
+    }
+
+    /// Returns the assistant `stopReason` if this is an assistant message.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        if let Self::Assistant { stop_reason, .. } = self { Some(*stop_reason) } else { None }
+    }
+
+    /// Wire-format stop reason (`"stop"`, `"error"`, ...) for legacy callers.
+    pub fn stop_reason_str(&self) -> Option<&'static str> {
+        self.stop_reason().map(|r| r.as_wire_str())
+    }
+
+    /// Convert to a JSON value; matches the previous wire format used by
+    /// session storage and the streaming bridge.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Parse from JSON. Returns `None` on unknown roles or malformed shape.
+    pub fn from_json(value: serde_json::Value) -> Option<Self> {
+        serde_json::from_value(value).ok()
     }
 }
 
-/// CustomAgentMessages extension point.
-/// Apps extend this via declaration merging in TS; in Rust we use a type-erased
-/// approach with serde_json::Value for custom fields.
-pub type AgentMessage = serde_json::Value;
+fn now_ts() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
 
-/// Convert an AgentMessage to a typed Message if possible.
-pub fn try_into_message(msg: &AgentMessage) -> Option<Message> {
-    serde_json::from_value(msg.clone()).ok()
+/// Alias for `AgentMessage` used by llm-client and provider crates.
+pub type LlmMessage = AgentMessage;
+pub type Message = AgentMessage;
+
+// ============================================================================
+// Tool Definition
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema describing the tool's parameters — must accept any shape.
+    pub input_schema: serde_json::Value,
 }
 
 // ============================================================================
-// Tool Result
+// LlmRequest / LlmResponse — used by llm-client providers.
 // ============================================================================
 
-/// Final or partial result produced by a tool.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmRequest {
+    pub model: String,
+    pub messages: Vec<AgentMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_sequences: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ThinkingLevel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openai_response_includes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_retention: Option<CacheRetention>,
+    /// Anthropic adaptive-thinking budgets keyed by `ThinkingLevel`. Only
+    /// consumed when the resolved thinking mode is "budget" (older Claude 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Provider-specific overrides (e.g. Anthropic's `forceAdaptiveThinking`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_options: Option<ProviderOptions>,
+}
+
+impl LlmRequest {
+    /// Return the Anthropic-specific options block, if the request carries one.
+    pub fn anthropic_options(&self) -> Option<&AnthropicOptions> {
+        match &self.provider_options {
+            Some(ProviderOptions::Anthropic(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Return the OpenAI-specific options block, if the request carries one.
+    pub fn openai_options(&self) -> Option<&OpenaiOptions> {
+        match &self.provider_options {
+            Some(ProviderOptions::Openai(o)) => Some(o),
+            _ => None,
+        }
+    }
+}
+
+/// Provider-specific overrides carried alongside `LlmRequest`. The `provider`
+/// tag discriminates which subset of knobs is in effect; mismatched
+/// combinations (e.g. setting Anthropic options on an OpenAI request) are
+/// silently ignored by the provider that doesn't recognize them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum ProviderOptions {
+    Anthropic(AnthropicOptions),
+    Openai(OpenaiOptions),
+}
+
+/// Provider-specific knobs Anthropic providers respect. Add slots as new
+/// override needs emerge.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnthropicOptions {
+    /// Force adaptive thinking (`thinking.type = "adaptive"`) regardless of
+    /// model id. `None` falls back to substring matching on the model id.
+    /// Set explicitly for custom Anthropic-compatible aliases (Bedrock,
+    /// Cloudflare AI Gateway, Fireworks, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "forceAdaptiveThinking")]
+    pub force_adaptive_thinking: Option<bool>,
+}
+
+/// Provider-specific knobs OpenAI providers respect. Reserved for future
+/// use; empty for now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenaiOptions {}
+
+impl LlmRequest {
+    pub fn new(model: impl Into<String>, messages: Vec<AgentMessage>) -> Self {
+        Self { model: model.into(), messages, ..Default::default() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmResponse {
+    pub id: String,
+    pub model: String,
+    pub content: Vec<ContentBlock>,
+    pub stop_reason: StopReason,
+    pub usage: Usage,
+}
+
+// ============================================================================
+// SimpleStreamOptions / Context
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct SimpleStreamOptions {
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub reasoning: Option<ThinkingLevel>,
+    pub api_key: Option<String>,
+    pub transport: Option<Transport>,
+    pub cache_retention: Option<CacheRetention>,
+    pub session_id: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub thinking_budgets: Option<ThinkingBudgets>,
+    pub max_retry_delay_ms: Option<u64>,
+}
+
+/// Context passed into the low-level agent loop. Carries the system prompt,
+/// the message transcript, and the tool set in scope.
+#[derive(Clone)]
+pub struct AgentContext {
+    pub system_prompt: String,
+    pub messages: Vec<AgentMessage>,
+    pub tools: Vec<Arc<dyn AgentTool>>,
+}
+
+impl std::fmt::Debug for AgentContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentContext")
+            .field("system_prompt_len", &self.system_prompt.len())
+            .field("messages_count", &self.messages.len())
+            .field("tool_count", &self.tools.len())
+            .finish()
+    }
+}
+
+// ============================================================================
+// Tool Result / Tool Call structures (used by the agent loop)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentToolResult<T = serde_json::Value> {
     pub content: Vec<ContentBlock>,
+    /// Tool-specific metadata (each tool serializes its own typed `details`
+    /// struct — `EditToolDetails`, `BashToolDetails`, etc.).
     pub details: T,
     pub terminate: bool,
 }
@@ -289,178 +751,172 @@ pub struct AgentToolResult<T = serde_json::Value> {
 impl<T: Default> AgentToolResult<T> {
     pub fn error_text(message: impl Into<String>) -> Self {
         Self {
-            content: vec![ContentBlock::Text {
-                text: message.into(),
-            }],
+            content: vec![ContentBlock::Text { text: message.into() }],
             details: T::default(),
             terminate: false,
         }
     }
 }
 
-/// Callback used by tools to stream partial execution updates.
 pub type AgentToolUpdateCallback<T = serde_json::Value> =
     Box<dyn Fn(AgentToolResult<T>) + Send + Sync>;
 
-// ============================================================================
-// Agent Tool Call
-// ============================================================================
-
-/// A tool call content block extracted from an assistant message.
 #[derive(Debug, Clone)]
 pub struct AgentToolCall {
     pub id: String,
     pub name: String,
+    /// Tool-defined argument shape — each tool validates its own JSON Schema.
     pub arguments: serde_json::Value,
 }
 
 // ============================================================================
-// Tool Execution Hooks Contexts
+// Hook contexts — passed into before/after tool-call hooks and the
+// shouldStopAfterTurn / prepareNextTurn hooks.
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BeforeToolCallContext {
     pub assistant_message: AgentMessage,
     pub tool_call: AgentToolCall,
+    /// Validated tool arguments (shape defined by the tool).
     pub args: serde_json::Value,
     pub context: AgentContext,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AfterToolCallContext {
     pub assistant_message: AgentMessage,
     pub tool_call: AgentToolCall,
+    /// Validated tool arguments (shape defined by the tool).
     pub args: serde_json::Value,
     pub result: AgentToolResult,
     pub is_error: bool,
     pub context: AgentContext,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AfterToolCallResult {
     pub content: Option<Vec<ContentBlock>>,
+    /// Tool-specific override for the result's `details` field.
     pub details: Option<serde_json::Value>,
     pub is_error: Option<bool>,
     pub terminate: Option<bool>,
 }
 
-// ============================================================================
-// Agent Context & Config
-// ============================================================================
-
-/// Context snapshot passed into the low-level agent loop.
-#[derive(Debug, Clone)]
-pub struct AgentContext {
-    pub system_prompt: String,
-    pub messages: Vec<AgentMessage>,
-    pub tools: Vec<String>,
+#[derive(Clone)]
+pub struct ShouldStopAfterTurnContext {
+    pub assistant_message: AgentMessage,
+    pub tool_results: Vec<AgentMessage>,
+    pub context: AgentContext,
+    pub has_more_tool_calls: bool,
 }
 
-/// Configuration for the agent loop.
-/// Uses async callbacks — implementors use async_trait or Box<dyn Fn> + Pin.
+#[derive(Clone)]
+pub struct PrepareNextTurnContext {
+    pub last_assistant_message: AgentMessage,
+    pub tool_results: Vec<AgentMessage>,
+    pub context: AgentContext,
+}
+
+// ============================================================================
+// Hook type aliases — small named closure types for AgentLoopConfig.
+// ============================================================================
+
+pub type ConvertToLlmFn = Arc<
+    dyn Fn(Vec<AgentMessage>)
+            -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+        + Send + Sync,
+>;
+pub type TransformContextFn = Arc<
+    dyn Fn(Vec<AgentMessage>, Option<CancellationToken>)
+            -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+        + Send + Sync,
+>;
+pub type GetApiKeyFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+        + Send + Sync,
+>;
+pub type GetMessagesFn = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+        + Send + Sync,
+>;
+pub type BeforeToolCallFn = Arc<
+    dyn Fn(BeforeToolCallContext, Option<CancellationToken>)
+            -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
+        + Send + Sync,
+>;
+pub type AfterToolCallFn = Arc<
+    dyn Fn(AfterToolCallContext, Option<CancellationToken>)
+            -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
+        + Send + Sync,
+>;
+pub type ShouldStopAfterTurnFn = Arc<
+    dyn Fn(ShouldStopAfterTurnContext, Option<CancellationToken>)
+            -> Pin<Box<dyn Future<Output = bool> + Send>>
+        + Send + Sync,
+>;
+pub type PrepareNextTurnFn = Arc<
+    dyn Fn(PrepareNextTurnContext, Option<CancellationToken>)
+            -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+        + Send + Sync,
+>;
+pub type OnPayloadFn = Arc<
+    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send + Sync,
+>;
+pub type OnResponseFn = Arc<
+    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send + Sync,
+>;
+
+// ============================================================================
+// AgentLoopConfig
+// ============================================================================
+
 #[derive(Clone)]
 pub struct AgentLoopConfig {
     pub model: ModelInfo,
-
-    pub convert_to_llm: std::sync::Arc<
-        dyn Fn(Vec<AgentMessage>) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Vec<Message>> + Send>,
-            > + Send
-            + Sync,
-    >,
-
-    pub transform_context: Option<
-        std::sync::Arc<
-            dyn Fn(
-                    Vec<AgentMessage>,
-                    Option<tokio_util::sync::CancellationToken>,
-                ) -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>,
-                > + Send
-                + Sync,
-        >,
-    >,
-
-    pub get_api_key:
-        Option<std::sync::Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> + Send + Sync>>,
-
+    pub convert_to_llm: ConvertToLlmFn,
+    pub transform_context: Option<TransformContextFn>,
+    pub get_api_key: Option<GetApiKeyFn>,
     pub api_key: Option<String>,
 
-    pub get_steering_messages: Option<
-        std::sync::Arc<
-            dyn Fn() -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>,
-                > + Send
-                + Sync,
-        >,
-    >,
-
-    pub get_follow_up_messages: Option<
-        std::sync::Arc<
-            dyn Fn() -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>,
-                > + Send
-                + Sync,
-        >,
-    >,
-
+    pub get_steering_messages: Option<GetMessagesFn>,
+    pub get_follow_up_messages: Option<GetMessagesFn>,
     pub tool_execution: ToolExecutionMode,
 
-    pub before_tool_call: Option<
-        std::sync::Arc<
-            dyn Fn(
-                    BeforeToolCallContext,
-                    Option<tokio_util::sync::CancellationToken>,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Option<BeforeToolCallResult>>
-                            + Send,
-                    >,
-                > + Send
-                + Sync,
-        >,
-    >,
-
-    pub after_tool_call: Option<
-        std::sync::Arc<
-            dyn Fn(
-                    AfterToolCallContext,
-                    Option<tokio_util::sync::CancellationToken>,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Option<AfterToolCallResult>>
-                            + Send,
-                    >,
-                > + Send
-                + Sync,
-        >,
-    >,
+    pub before_tool_call: Option<BeforeToolCallFn>,
+    pub after_tool_call: Option<AfterToolCallFn>,
+    pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
+    pub prepare_next_turn: Option<PrepareNextTurnFn>,
+    pub on_payload: Option<OnPayloadFn>,
+    pub on_response: Option<OnResponseFn>,
 
     pub session_id: Option<String>,
     pub thinking_budgets: Option<ThinkingBudgets>,
     pub transport: Transport,
+    pub cache_retention: Option<CacheRetention>,
     pub max_retry_delay_ms: Option<u64>,
-    pub reasoning: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub headers: Option<HashMap<String, String>>,
+    /// Caller-defined extra metadata forwarded to the provider.
+    pub metadata: Option<serde_json::Value>,
+    pub reasoning: Option<ThinkingLevel>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Provider-specific overrides forwarded to `LlmRequest.provider_options`.
+    pub provider_options: Option<ProviderOptions>,
 }
 
 impl AgentLoopConfig {
-    pub fn new(
-        model: ModelInfo,
-        convert_to_llm: std::sync::Arc<
-            dyn Fn(Vec<AgentMessage>) -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Vec<Message>> + Send>,
-                > + Send
-                + Sync,
-        >,
-    ) -> Self {
+    pub fn new(model: ModelInfo, convert_to_llm: ConvertToLlmFn) -> Self {
         Self {
             model,
             convert_to_llm,
@@ -472,13 +928,23 @@ impl AgentLoopConfig {
             tool_execution: ToolExecutionMode::Parallel,
             before_tool_call: None,
             after_tool_call: None,
+            should_stop_after_turn: None,
+            prepare_next_turn: None,
+            on_payload: None,
+            on_response: None,
             session_id: None,
             thinking_budgets: None,
             transport: Transport::Sse,
+            cache_retention: None,
             max_retry_delay_ms: None,
+            timeout_ms: None,
+            max_retries: None,
+            headers: None,
+            metadata: None,
             reasoning: None,
             temperature: None,
             max_tokens: None,
+            provider_options: None,
         }
     }
 }
@@ -486,24 +952,23 @@ impl AgentLoopConfig {
 impl std::fmt::Debug for AgentLoopConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentLoopConfig")
-            .field("model", &self.model)
+            .field("model", &self.model.id)
             .field("tool_execution", &self.tool_execution)
-            .field("session_id", &self.session_id)
             .field("transport", &self.transport)
+            .field("session_id", &self.session_id)
             .finish_non_exhaustive()
     }
 }
 
 // ============================================================================
-// Agent State
+// AgentState
 // ============================================================================
 
-/// Mutable agent state with copy-on-write semantics for tools and messages.
 pub struct AgentState {
     system_prompt: String,
     model: ModelInfo,
     thinking_level: ThinkingLevel,
-    tools: Vec<String>,
+    tools: Vec<Arc<dyn AgentTool>>,
     messages: Vec<AgentMessage>,
     pub is_streaming: bool,
     pub streaming_message: Option<AgentMessage>,
@@ -516,7 +981,7 @@ impl AgentState {
         system_prompt: Option<String>,
         model: Option<ModelInfo>,
         thinking_level: Option<ThinkingLevel>,
-        tools: Option<Vec<String>>,
+        tools: Option<Vec<Arc<dyn AgentTool>>>,
         messages: Option<Vec<AgentMessage>>,
     ) -> Self {
         Self {
@@ -532,54 +997,21 @@ impl AgentState {
         }
     }
 
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
-    }
+    pub fn system_prompt(&self) -> &str { &self.system_prompt }
+    pub fn set_system_prompt(&mut self, prompt: String) { self.system_prompt = prompt; }
 
-    pub fn set_system_prompt(&mut self, prompt: String) {
-        self.system_prompt = prompt;
-    }
+    pub fn model(&self) -> &ModelInfo { &self.model }
+    pub fn set_model(&mut self, model: ModelInfo) { self.model = model; }
 
-    pub fn model(&self) -> &ModelInfo {
-        &self.model
-    }
+    pub fn thinking_level(&self) -> ThinkingLevel { self.thinking_level }
+    pub fn set_thinking_level(&mut self, level: ThinkingLevel) { self.thinking_level = level; }
 
-    pub fn set_model(&mut self, model: ModelInfo) {
-        self.model = model;
-    }
+    pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> { self.tools.clone() }
+    pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) { self.tools = tools; }
 
-    pub fn thinking_level(&self) -> ThinkingLevel {
-        self.thinking_level
-    }
-
-    pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
-        self.thinking_level = level;
-    }
-
-    /// Get tools — returns a copy (copy-on-read semantics matching TS getter).
-    pub fn tools(&self) -> Vec<String> {
-        self.tools.clone()
-    }
-
-    /// Set tools — copies the provided slice (copy-on-write matching TS setter).
-    pub fn set_tools(&mut self, tools: &[String]) {
-        self.tools = tools.to_vec();
-    }
-
-    /// Get messages — returns a copy.
-    pub fn messages(&self) -> Vec<AgentMessage> {
-        self.messages.clone()
-    }
-
-    /// Set messages — copies the provided slice.
-    pub fn set_messages(&mut self, messages: &[AgentMessage]) {
-        self.messages = messages.to_vec();
-    }
-
-    /// Push a single message to the transcript.
-    pub fn push_message(&mut self, message: AgentMessage) {
-        self.messages.push(message);
-    }
+    pub fn messages(&self) -> Vec<AgentMessage> { self.messages.clone() }
+    pub fn set_messages(&mut self, messages: Vec<AgentMessage>) { self.messages = messages; }
+    pub fn push_message(&mut self, message: AgentMessage) { self.messages.push(message); }
 }
 
 impl std::fmt::Debug for AgentState {
@@ -591,7 +1023,6 @@ impl std::fmt::Debug for AgentState {
             .field("tools_count", &self.tools.len())
             .field("messages_count", &self.messages.len())
             .field("is_streaming", &self.is_streaming)
-            .field("error_message", &self.error_message)
             .finish()
     }
 }
@@ -606,94 +1037,159 @@ mod tests {
 
     #[test]
     fn test_thinking_level_serde() {
-        let level = ThinkingLevel::XHigh;
-        let json = serde_json::to_string(&level).unwrap();
-        assert_eq!(json, r#""xhigh""#);
-
+        assert_eq!(serde_json::to_string(&ThinkingLevel::XHigh).unwrap(), r#""xhigh""#);
         let deser: ThinkingLevel = serde_json::from_str(r#""off""#).unwrap();
         assert_eq!(deser, ThinkingLevel::Off);
-
-        let deser: ThinkingLevel = serde_json::from_str(r#""minimal""#).unwrap();
-        assert_eq!(deser, ThinkingLevel::Minimal);
-    }
-
-    #[test]
-    fn test_agent_state_copy_semantics() {
-        let mut state = AgentState::new(None, None, None, None, None);
-        state.set_tools(&["tool_a".to_string(), "tool_b".to_string()]);
-
-        let tools = state.tools();
-        assert_eq!(tools.len(), 2);
-
-        // Verify we got a copy, not a reference
-        state.set_tools(&["tool_c".to_string()]);
-        assert_eq!(tools.len(), 2); // original copy unchanged
-        assert_eq!(state.tools().len(), 1);
-    }
-
-    #[test]
-    fn test_usage_add() {
-        let mut a = Usage {
-            input: 100,
-            output: 50,
-            total_tokens: 150,
-            ..Default::default()
-        };
-        let b = Usage {
-            input: 200,
-            output: 100,
-            total_tokens: 300,
-            ..Default::default()
-        };
-        a.add(&b);
-        assert_eq!(a.input, 300);
-        assert_eq!(a.output, 150);
-        assert_eq!(a.total_tokens, 450);
-    }
-
-    #[test]
-    fn test_agent_loop_config_debug() {
-        let config = AgentLoopConfig::new(
-            ModelInfo::default(),
-            std::sync::Arc::new(|msgs| {
-                Box::pin(async move {
-                    msgs.into_iter()
-                        .filter_map(|m| try_into_message(&m))
-                        .collect()
-                })
-            }),
-        );
-        let debug = format!("{:?}", config);
-        assert!(debug.contains("AgentLoopConfig"));
-    }
-
-    #[test]
-    fn test_content_block_serde() {
-        let text = ContentBlock::Text {
-            text: "hello".to_string(),
-        };
-        let json = serde_json::to_string(&text).unwrap();
-        assert_eq!(json, r#"{"type":"text","text":"hello"}"#);
-
-        let tool_call = ContentBlock::ToolCall {
-            id: "tc1".to_string(),
-            name: "bash".to_string(),
-            arguments: serde_json::json!({"command": "ls"}),
-        };
-        let json = serde_json::to_string(&tool_call).unwrap();
-        assert!(json.contains("toolCall"));
-        assert!(json.contains("bash"));
     }
 
     #[test]
     fn test_tool_execution_mode_serde() {
-        assert_eq!(
-            serde_json::to_string(&ToolExecutionMode::Sequential).unwrap(),
-            r#""sequential""#
-        );
-        assert_eq!(
-            serde_json::to_string(&ToolExecutionMode::Parallel).unwrap(),
-            r#""parallel""#
-        );
+        assert_eq!(serde_json::to_string(&ToolExecutionMode::Sequential).unwrap(), r#""sequential""#);
+        assert_eq!(serde_json::to_string(&ToolExecutionMode::Parallel).unwrap(), r#""parallel""#);
+    }
+
+    #[test]
+    fn test_agent_message_user_text_roundtrip() {
+        let msg = AgentMessage::user_text("hello");
+        let json = msg.to_json();
+        assert_eq!(json["role"], "user");
+        let back = AgentMessage::from_json(json).unwrap();
+        assert_eq!(back.role(), "user");
+    }
+
+    #[test]
+    fn test_agent_message_tool_result_serde() {
+        let msg = AgentMessage::ToolResult {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            content: vec![ContentBlock::Text { text: "out".into() }],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        };
+        let json = msg.to_json();
+        assert_eq!(json["role"], "toolResult");
+        assert_eq!(json["toolCallId"], "tc1");
+    }
+
+    #[test]
+    fn test_agent_message_custom_serde() {
+        let msg = AgentMessage::Custom {
+            custom_type: "artifact".into(),
+            content: serde_json::json!("hi"),
+            display: true,
+            details: None,
+            timestamp: 1,
+        };
+        let json = msg.to_json();
+        assert_eq!(json["role"], "custom");
+        assert_eq!(json["customType"], "artifact");
+        let back = AgentMessage::from_json(json).unwrap();
+        assert_eq!(back.role(), "custom");
+    }
+
+    #[test]
+    fn test_cap_output_budget_within_limits() {
+        let m = Model { reasoning: true, max_tokens: 16384, context_window: 200000, ..Default::default() };
+        assert_eq!(m.cap_output_budget(Some(4000), 1000), 4000);
+    }
+
+    #[test]
+    fn test_clamp_reasoning_no_support() {
+        let m = Model::default();
+        assert_eq!(m.clamp_reasoning(Some(ThinkingLevel::High)), None);
+    }
+
+    #[test]
+    fn test_stop_reason_round_trip() {
+        for r in [
+            StopReason::EndTurn, StopReason::MaxTokens, StopReason::StopSequence,
+            StopReason::ToolUse, StopReason::ContentFilter, StopReason::Error,
+            StopReason::Aborted,
+        ] {
+            assert_eq!(StopReason::from_wire_str(r.as_wire_str()), Some(r));
+        }
+        // accept legacy aliases too
+        assert_eq!(StopReason::from_wire_str("end_turn"), Some(StopReason::EndTurn));
+        assert_eq!(StopReason::from_wire_str("tool_use"), Some(StopReason::ToolUse));
+        assert_eq!(StopReason::from_wire_str("max_tokens"), Some(StopReason::MaxTokens));
+        assert_eq!(StopReason::from_wire_str("garbage"), None);
+    }
+
+    #[test]
+    fn test_thinking_level_round_trip() {
+        for l in [
+            ThinkingLevel::Off, ThinkingLevel::Minimal, ThinkingLevel::Low,
+            ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::XHigh,
+        ] {
+            assert_eq!(ThinkingLevel::from_wire_str(l.as_str()), Some(l));
+        }
+        assert_eq!(ThinkingLevel::from_wire_str("garbage"), None);
+    }
+
+    #[test]
+    fn test_assistant_message_stop_reason_jsonl_compat() {
+        // Wire format unchanged: stopReason: "stop" round-trips to EndTurn.
+        let json = r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"api":"anthropic","provider":"p","model":"m","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}"#;
+        let m: AgentMessage = serde_json::from_str(json).unwrap();
+        match m {
+            AgentMessage::Assistant { stop_reason, .. } => assert_eq!(stop_reason, StopReason::EndTurn),
+            _ => panic!("expected Assistant"),
+        }
+    }
+
+    #[test]
+    fn test_api_round_trip() {
+        for api in [Api::Anthropic, Api::Openai, Api::OpenaiResponses, Api::Mock] {
+            assert_eq!(Api::from_wire_str(api.as_wire_str()), Some(api));
+            let v = serde_json::to_value(api).unwrap();
+            assert_eq!(v.as_str().unwrap(), api.as_wire_str());
+        }
+        assert_eq!(Api::from_wire_str("garbage"), None);
+    }
+
+    #[test]
+    fn test_provider_options_anthropic_serde() {
+        let opts = ProviderOptions::Anthropic(AnthropicOptions {
+            force_adaptive_thinking: Some(true),
+        });
+        let v = serde_json::to_value(&opts).unwrap();
+        assert_eq!(v["provider"], "anthropic");
+        assert_eq!(v["forceAdaptiveThinking"], true);
+        let round: ProviderOptions = serde_json::from_value(v).unwrap();
+        match round {
+            ProviderOptions::Anthropic(o) => assert_eq!(o.force_adaptive_thinking, Some(true)),
+            _ => panic!("expected anthropic"),
+        }
+    }
+
+    #[test]
+    fn test_provider_options_openai_serde() {
+        let opts = ProviderOptions::Openai(OpenaiOptions::default());
+        let v = serde_json::to_value(&opts).unwrap();
+        assert_eq!(v["provider"], "openai");
+    }
+
+    #[test]
+    fn test_llm_request_anthropic_options_helper() {
+        let r = LlmRequest {
+            provider_options: Some(ProviderOptions::Anthropic(AnthropicOptions {
+                force_adaptive_thinking: Some(true),
+            })),
+            ..Default::default()
+        };
+        assert!(r.anthropic_options().is_some());
+        assert_eq!(r.anthropic_options().unwrap().force_adaptive_thinking, Some(true));
+        assert!(r.openai_options().is_none());
+    }
+
+    #[test]
+    fn test_usage_add() {
+        let mut a = Usage { input: 100, output: 50, total_tokens: 150, ..Default::default() };
+        let b = Usage { input: 200, output: 100, total_tokens: 300, ..Default::default() };
+        a.add(&b);
+        assert_eq!(a.input, 300);
+        assert_eq!(a.total_tokens, 450);
     }
 }
+

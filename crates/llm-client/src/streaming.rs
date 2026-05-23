@@ -1,34 +1,24 @@
+// Low-level provider streaming events. The high-level `AssistantMessageEvent`
+// and the buffered stream live in agent-core.
+
 use crate::types::{ContentPart, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
-/// Events emitted during LLM streaming
+pub use agent_core::event::AssistantMessageEvent;
+pub use agent_core::types::AgentMessage as LlmMessage;
+
+/// Low-level provider streaming events (Anthropic-shaped).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LlmEvent {
-    MessageStart {
-        id: String,
-        model: String,
-    },
-    ContentBlockStart {
-        index: usize,
-        content_block: ContentPart,
-    },
-    ContentBlockDelta {
-        index: usize,
-        delta: Delta,
-    },
-    ContentBlockStop {
-        index: usize,
-    },
-    MessageDelta {
-        delta: MessageDelta,
-        usage: Option<Usage>,
-    },
+    MessageStart { id: String, model: String },
+    ContentBlockStart { index: usize, content_block: ContentPart },
+    ContentBlockDelta { index: usize, delta: Delta },
+    ContentBlockStop { index: usize },
+    MessageDelta { delta: MessageDelta, usage: Option<Usage> },
     MessageStop,
     Ping,
-    Error {
-        error: StreamError,
-    },
+    Error { error: StreamError },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +42,7 @@ pub struct StreamError {
     pub message: String,
 }
 
-/// Parse a single SSE line into an LlmEvent
+/// Parse a single SSE event line into an LlmEvent.
 pub fn parse_sse_event(event_type: &str, data: &str) -> Option<LlmEvent> {
     if data == "[DONE]" {
         return Some(LlmEvent::MessageStop);
@@ -99,5 +89,31 @@ pub fn parse_sse_event(event_type: &str, data: &str) -> Option<LlmEvent> {
             Some(LlmEvent::Error { error: w.error })
         }
         _ => None,
+    }
+}
+
+// ============================================================================
+// AssistantMessageEventStream — buffered stream with .result() reconstruction.
+// ============================================================================
+
+// The push-based buffered stream lives in agent-core (`agent_core::event::EventStream`)
+// and is exposed to the loop as `agent_core::agent_loop::AssistantMessageEventStream`.
+// Provider crates only emit raw `LlmEvent`s; the stream-bridge in coding-agent
+// reduces them into the canonical event stream.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_sse_message_stop() {
+        let event = parse_sse_event("message_stop", "{}");
+        assert!(matches!(event, Some(LlmEvent::MessageStop)));
+    }
+
+    #[test]
+    fn test_parse_sse_done_marker() {
+        let event = parse_sse_event("data", "[DONE]");
+        assert!(matches!(event, Some(LlmEvent::MessageStop)));
     }
 }

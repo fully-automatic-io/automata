@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-// Constants matching TypeScript implementation
+// Output limits
 const DEFAULT_MAX_MATCHES: usize = 100;
 const DEFAULT_MAX_BYTES: usize = 50_000;
 const MAX_LINE_LENGTH: usize = 500;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GrepToolDetails {
     pub truncated: bool,
     pub total_matches: usize,
@@ -132,11 +132,11 @@ impl AgentTool for GrepTool {
                 content: vec![ContentBlock::Text {
                     text: format!("Path does not exist: {}", search_path),
                 }],
-                details: serde_json::json!({
-                    "truncated": false,
-                    "total_matches": 0,
-                    "max_matches": limit
-                }),
+                details: serde_json::to_value(GrepToolDetails {
+                    truncated: false,
+                    total_matches: 0,
+                    max_matches: limit,
+                }).unwrap_or_default(),
                 terminate: false,
             });
         }
@@ -187,7 +187,7 @@ impl AgentTool for GrepTool {
                         content: vec![ContentBlock::Text {
                             text: "Search cancelled".to_string(),
                         }],
-                        details: serde_json::json!({}),
+                        details: serde_json::to_value(GrepToolDetails::default()).unwrap_or_default(),
                         terminate: false,
                     });
                 }
@@ -284,11 +284,11 @@ impl AgentTool for GrepTool {
 
         Ok(AgentToolResult {
             content: vec![ContentBlock::Text { text: result_text }],
-            details: serde_json::json!({
-                "truncated": truncated,
-                "total_matches": total_matches,
-                "max_matches": limit
-            }),
+            details: serde_json::to_value(GrepToolDetails {
+                truncated,
+                total_matches,
+                max_matches: limit,
+            }).unwrap_or_default(),
             terminate: false,
         })
     }
@@ -301,6 +301,19 @@ impl AgentTool for GrepTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_grep_tool_details_wire_shape() {
+        let d = GrepToolDetails {
+            truncated: false,
+            total_matches: 25,
+            max_matches: 100,
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["total_matches"], 25);
+        assert_eq!(v["max_matches"], 100);
+    }
 
     #[tokio::test]
     async fn test_grep_tool_name() {

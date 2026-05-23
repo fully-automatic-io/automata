@@ -10,6 +10,7 @@ keywords = ["ai", "llm", "openai", "anthropic", "client"]
 categories = ["api-bindings"]
 
 [dependencies]
+agent-core = { path = "../agent-core" }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

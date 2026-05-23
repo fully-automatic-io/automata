@@ -4,12 +4,21 @@ use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-// Constants matching TypeScript implementation
+// Output limits
 const DEFAULT_MAX_RESULTS: usize = 1000;
 const DEFAULT_MAX_BYTES: usize = 50_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FindToolDetails {
+    pub truncated: bool,
+    pub total_results: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
+}
 
 // ============================================================================
 // Find Tool
@@ -112,10 +121,7 @@ impl AgentTool for FindTool {
                 content: vec![ContentBlock::Text {
                     text: format!("Path does not exist: {}", search_path),
                 }],
-                details: serde_json::json!({
-                    "truncated": false,
-                    "total_results": 0
-                }),
+                details: serde_json::to_value(FindToolDetails::default()).unwrap_or_default(),
                 terminate: false,
             });
         }
@@ -149,7 +155,7 @@ impl AgentTool for FindTool {
                     content: vec![ContentBlock::Text {
                         text: "Search cancelled".to_string(),
                     }],
-                    details: serde_json::json!({}),
+                    details: serde_json::to_value(FindToolDetails::default()).unwrap_or_default(),
                     terminate: false,
                 });
             }
@@ -237,11 +243,11 @@ impl AgentTool for FindTool {
 
         Ok(AgentToolResult {
             content: vec![ContentBlock::Text { text: result_text }],
-            details: serde_json::json!({
-                "truncated": truncated,
-                "total_results": results.len(),
-                "max_results": limit
-            }),
+            details: serde_json::to_value(FindToolDetails {
+                truncated,
+                total_results: results.len(),
+                max_results: Some(limit),
+            }).unwrap_or_default(),
             terminate: false,
         })
     }
@@ -254,6 +260,19 @@ impl AgentTool for FindTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_tool_details_wire_shape() {
+        let d = FindToolDetails {
+            truncated: true,
+            total_results: 1500,
+            max_results: Some(1000),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total_results"], 1500);
+        assert_eq!(v["max_results"], 1000);
+    }
 
     #[test]
     fn test_find_tool_name() {

@@ -26,6 +26,7 @@ pub trait AgentTool: Send + Sync {
     fn description(&self) -> &str;
 
     /// JSON Schema for the tool's input parameters.
+    /// Returns `Value` because every tool defines its own schema shape.
     fn parameters(&self) -> serde_json::Value;
 
     /// Optional compatibility shim for raw tool-call arguments before schema validation.
@@ -35,6 +36,8 @@ pub trait AgentTool: Send + Sync {
     }
 
     /// Execute the tool call. Throw on failure instead of encoding errors in `content`.
+    /// `params` is the validated argument value; its concrete shape is defined
+    /// by `parameters()` and is therefore typed as `Value` at the trait boundary.
     async fn execute(
         &self,
         tool_call_id: String,
@@ -61,6 +64,7 @@ pub struct ToolDefinitionWrapper {
     pub name: String,
     pub label: String,
     pub description: String,
+    /// JSON Schema for the tool's input parameters.
     pub parameters_schema: serde_json::Value,
     pub execution_mode_override: Option<ToolExecutionMode>,
     pub prepare_arguments_fn: Option<
@@ -143,6 +147,15 @@ pub fn create_success_tool_result(
         details,
         terminate: false,
     }
+}
+
+/// Downcast a tool result `details` Value into a tool-specific typed struct.
+/// Returns `Err` if the JSON shape doesn't match — typically because the
+/// caller assumed the wrong tool's `*Details` type.
+pub fn downcast_details<T: serde::de::DeserializeOwned>(
+    details: &serde_json::Value,
+) -> Result<T, serde_json::Error> {
+    serde_json::from_value(details.clone())
 }
 
 // ============================================================================
@@ -362,5 +375,23 @@ mod tests {
             ContentBlock::Text { text } => assert_eq!(text, "something went wrong"),
             _ => panic!("Expected text content"),
         }
+    }
+
+    #[test]
+    fn test_downcast_details_round_trip() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct MyDetails { count: u32, ok: bool }
+        let original = MyDetails { count: 42, ok: true };
+        let value = serde_json::to_value(&original).unwrap();
+        let recovered: MyDetails = downcast_details(&value).unwrap();
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_downcast_details_shape_mismatch() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Wanted { #[allow(dead_code)] needed_field: u32 }
+        let value = serde_json::json!({"unrelated": "shape"});
+        assert!(downcast_details::<Wanted>(&value).is_err());
     }
 }

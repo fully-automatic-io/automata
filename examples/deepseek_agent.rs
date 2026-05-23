@@ -1,6 +1,6 @@
 use llm_client::{
     AnthropicProvider, AuthMethod, ContentPart, LlmMessage, LlmProvider, LlmRequest,
-    MessageContent, ProviderConfig,
+    ProviderConfig,
 };
 
 #[tokio::main]
@@ -20,18 +20,12 @@ async fn main() {
 
     let request = LlmRequest {
         model: model.clone(),
-        messages: vec![LlmMessage::User {
-            content: MessageContent::String(
-                "用一句话自我介绍，然后告诉我 2+2 等于几。".to_string(),
-            ),
-            timestamp: 0,
-        }],
+        messages: vec![LlmMessage::user_text("用一句话自我介绍，然后告诉我 2+2 等于几。")],
         tools: vec![],
         system: Some("You are a concise assistant. Reply in Chinese.".into()),
         max_tokens: Some(256),
         temperature: Some(0.2),
-        stop_sequences: vec![],
-        extra: Default::default(),
+        ..Default::default()
     };
 
     println!("=== DeepSeek via Anthropic-compatible endpoint ===");

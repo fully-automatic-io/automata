@@ -1,122 +1,134 @@
-// Integration tests for session management
+// Integration tests for session management — uses agent-core's canonical async Session API.
 
-use coding_agent::session::SessionManager;
+use agent_core::harness::session::{
+    InMemorySessionStorage, JsonlSessionRepo, Session, SessionTreeEntry,
+};
+use agent_core::types::{AgentMessage, ContentBlock, MessageContent, StopReason, Usage};
 
-#[test]
-fn test_session_persist_and_reload() {
+fn user(text: &str, ts: u64) -> AgentMessage {
+    AgentMessage::User {
+        content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]),
+        timestamp: ts,
+        metadata: None,
+    }
+}
+
+fn assistant(text: &str, ts: u64) -> AgentMessage {
+    AgentMessage::Assistant {
+        content: vec![ContentBlock::Text { text: text.into() }],
+        api: agent_core::types::Api::Anthropic, provider: "t".into(), model: "m".into(),
+        usage: Usage::default(), stop_reason: StopReason::EndTurn,
+        error_message: None, timestamp: ts,
+    }
+}
+
+#[tokio::test]
+async fn test_session_persist_and_reload() {
     let dir = tempfile::TempDir::new().unwrap();
-    let session_dir = dir.path().to_string_lossy().to_string();
+    let cwd = "/tmp/test";
 
-    // Create session and add messages
-    let mut mgr = SessionManager::create("/tmp/test", Some(&session_dir));
-    let _id1 = mgr.append_message(serde_json::json!({
-        "role": "user",
-        "content": [{"type": "text", "text": "hello"}],
-        "timestamp": 1000
-    }));
-    let _id2 = mgr.append_message(serde_json::json!({
-        "role": "assistant",
-        "content": [{"type": "text", "text": "hi there"}],
-        "api": "anthropic", "provider": "anthropic", "model": "claude-opus-4-7",
-        "usage": {"input": 5, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10,
-                  "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
-        "stopReason": "end_turn",
-        "timestamp": 2000
-    }));
+    let repo = JsonlSessionRepo::new(dir.path());
+    let mut session = repo.create(cwd, None, None).await.unwrap();
 
-    let session_file = mgr.session_file().map(|p| p.to_path_buf());
-    // File is only written after first assistant message
-    if session_file.is_none() { return; }
+    session.append_message(user("hello", 1000)).await.unwrap();
+    session.append_message(AgentMessage::Assistant {
+        content: vec![ContentBlock::Text { text: "hi there".into() }],
+        api: agent_core::types::Api::Anthropic, provider: "anthropic".into(), model: "claude-opus-4-7".into(),
+        usage: Usage { input: 5, output: 5, total_tokens: 10, ..Default::default() },
+        stop_reason: StopReason::EndTurn,
+        error_message: None,
+        timestamp: 2000,
+    }).await.unwrap();
 
-    // Reload session
-    let path = session_file.unwrap();
-    let reloaded = SessionManager::open(&path.to_string_lossy(), Some(&session_dir), None);
-    let ctx = reloaded.build_context();
+    let path = session.get_metadata().await.id;
+    drop(session);
+
+    let sessions = repo.list(Some(cwd)).await.unwrap();
+    assert!(sessions.iter().any(|m| m.id == path));
+
+    let entry_path = &sessions.iter().find(|m| m.id == path).unwrap().path;
+    let reloaded = repo.open_by_path(entry_path).await.unwrap();
+    let ctx = reloaded.build_context().await.unwrap();
     assert_eq!(ctx.messages.len(), 2);
     assert!(ctx.model.is_some());
 }
 
-#[test]
-fn test_session_branching_and_context() {
-    let mut mgr = SessionManager::in_memory("/tmp/test");
+#[tokio::test]
+async fn test_session_branching_and_context() {
+    let mut session = Session::new(Box::new(InMemorySessionStorage::new(None)));
 
-    let id1 = mgr.append_message(serde_json::json!({"role": "user", "content": "q1", "timestamp": 1}));
-    let _id2 = mgr.append_message(serde_json::json!({
-        "role": "assistant", "content": "a1", "api": "t", "provider": "t", "model": "m",
-        "usage": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
-        "stopReason": "stop", "timestamp": 2
-    }));
+    let id1 = session.append_message(user("q1", 1)).await.unwrap();
+    let _id2 = session.append_message(assistant("a1", 2)).await.unwrap();
 
-    // Branch back and add alternative
-    mgr.branch(&id1);
-    let _id3 = mgr.append_message(serde_json::json!({
-        "role": "assistant", "content": "alt answer", "api": "t", "provider": "t", "model": "m",
-        "usage": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
-        "stopReason": "stop", "timestamp": 3
-    }));
+    session.move_to(Some(&id1), None).await.unwrap();
+    let _id3 = session.append_message(assistant("alt answer", 3)).await.unwrap();
 
-    let ctx = mgr.build_context();
-    // Should follow the branch: user + alt answer
+    let ctx = session.build_context().await.unwrap();
     assert_eq!(ctx.messages.len(), 2);
-    let alt = ctx.messages[1].get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let alt = match &ctx.messages[1] {
+        AgentMessage::Assistant { content, .. } => match &content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
     assert_eq!(alt, "alt answer");
 }
 
-#[test]
-fn test_session_compaction_context() {
-    let mut mgr = SessionManager::in_memory("/tmp/test");
+#[tokio::test]
+async fn test_session_compaction_context() {
+    let mut session = Session::new(Box::new(InMemorySessionStorage::new(None)));
 
-    let _u1 = mgr.append_message(serde_json::json!({"role": "user", "content": "old q", "timestamp": 1}));
-    let a1 = mgr.append_message(serde_json::json!({
-        "role": "assistant", "content": "old a", "api": "t", "provider": "t", "model": "m",
-        "usage": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
-        "stopReason": "stop", "timestamp": 2
-    }));
+    let _u1 = session.append_message(user("old q", 1)).await.unwrap();
+    let a1 = session.append_message(assistant("old a", 2)).await.unwrap();
 
-    // Compact: keep from a1 onward
-    mgr.append_compaction("Summary of old conversation", &a1, 1000, None, None);
+    session.append_compaction("Summary of old conversation", &a1, 1000, None, None).await.unwrap();
+    let _u2 = session.append_message(user("new q", 3)).await.unwrap();
 
-    let _u2 = mgr.append_message(serde_json::json!({"role": "user", "content": "new q", "timestamp": 3}));
-
-    let ctx = mgr.build_context();
-    // Should have: compaction summary + a1 + new q
+    let ctx = session.build_context().await.unwrap();
     assert!(ctx.messages.len() >= 2);
-    // First message should be the compaction summary
-    let first_role = ctx.messages[0].get("role").and_then(|r| r.as_str()).unwrap_or("");
-    assert!(first_role.contains("compaction") || first_role == "user");
+    assert!(matches!(ctx.messages[0], AgentMessage::CompactionSummary { .. } | AgentMessage::User { .. }));
 }
 
-#[test]
-fn test_session_tree_structure() {
-    let mut mgr = SessionManager::in_memory("/tmp/test");
+#[tokio::test]
+async fn test_session_tree_records_branch() {
+    let mut session = Session::new(Box::new(InMemorySessionStorage::new(None)));
 
-    let id1 = mgr.append_message(serde_json::json!({"role": "user", "content": "root", "timestamp": 1}));
-    let _id2 = mgr.append_message(serde_json::json!({
-        "role": "assistant", "content": "branch a", "api": "t", "provider": "t", "model": "m",
-        "usage": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
-        "stopReason": "stop", "timestamp": 2
-    }));
+    let id1 = session.append_message(user("root", 1)).await.unwrap();
+    let _id2 = session.append_message(assistant("branch a", 2)).await.unwrap();
 
-    mgr.branch(&id1);
-    let _id3 = mgr.append_message(serde_json::json!({
-        "role": "assistant", "content": "branch b", "api": "t", "provider": "t", "model": "m",
-        "usage": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
-        "stopReason": "stop", "timestamp": 3
-    }));
+    session.move_to(Some(&id1), None).await.unwrap();
+    let _id3 = session.append_message(assistant("branch b", 3)).await.unwrap();
 
-    let tree = mgr.tree();
-    // Root node should have 1 child (id1), which has 2 children (id2, id3)
-    assert!(!tree.is_empty());
+    let entries = session.storage().get_entries().await;
+    let messages = entries.iter().filter(|e| matches!(e, SessionTreeEntry::Message { .. })).count();
+    assert_eq!(messages, 3);
 }
 
-#[test]
-fn test_session_labels() {
-    let mut mgr = SessionManager::in_memory("/tmp/test");
-    let id = mgr.append_message(serde_json::json!({"role": "user", "content": "important", "timestamp": 1}));
+#[tokio::test]
+async fn test_session_labels() {
+    let mut session = Session::new(Box::new(InMemorySessionStorage::new(None)));
+    let id = session.append_message(user("important", 1)).await.unwrap();
 
-    mgr.append_label_change(&id, Some("key point"));
-    assert_eq!(mgr.get_label(&id), Some("key point"));
+    let storage = session.storage_mut();
+    let lid = storage.create_entry_id().await;
+    storage.append_entry(SessionTreeEntry::Label {
+        id: lid,
+        parent_id: None,
+        timestamp: agent_core::harness::session::now_iso(),
+        target_id: id.clone(),
+        label: Some("key point".into()),
+    }).await.unwrap();
+    assert_eq!(session.storage().get_label(&id).await.as_deref(), Some("key point"));
 
-    mgr.append_label_change(&id, None);
-    assert_eq!(mgr.get_label(&id), None);
+    let storage = session.storage_mut();
+    let lid2 = storage.create_entry_id().await;
+    storage.append_entry(SessionTreeEntry::Label {
+        id: lid2,
+        parent_id: None,
+        timestamp: agent_core::harness::session::now_iso(),
+        target_id: id.clone(),
+        label: None,
+    }).await.unwrap();
+    assert_eq!(session.storage().get_label(&id).await, None);
 }

@@ -1,18 +1,24 @@
-// Stream bridge — converts llm-client SSE streams to agent-core AssistantMessageEvent streams
-// Lives in coding-agent since it depends on both llm-client and agent-core.
+// Stream bridge — converts llm-client SSE streams into agent-core's
+// `AssistantMessageEvent` stream. Lives in coding-agent because it depends on
+// both crates.
+//
+// Maintains a typed `PartialAssistantMessage` reducer over `LlmEvent` deltas;
+// the event stream the loop consumes carries the same typed snapshot.
 
 use agent_core::agent_loop::{StreamFn, StreamFnInput};
-use agent_core::event::{AssistantMessageEvent, EventStream};
-use agent_core::types::AgentMessage;
+use agent_core::event::{AssistantMessageEvent, EventStream, PartialAssistantMessage, PartialContentBlock};
+use agent_core::types::{AgentMessage, ContentBlock, LlmRequest, Model, StopReason, ToolDefinition};
 use llm_client::provider::LlmProvider;
-use llm_client::streaming::Delta;
-use llm_client::types::{LlmMessage, LlmRequest, Model, ToolDefinition};
+use llm_client::streaming::{Delta, LlmEvent};
 use std::sync::Arc;
 
-/// Convert an llm-client SSE stream into agent-core's AssistantMessageEvent stream.
+/// Convert an llm-client SSE stream into agent-core's `AssistantMessageEvent`
+/// stream. The reducer maintains a typed `PartialAssistantMessage` and the
+/// final reconstructed `AgentMessage::Assistant` is produced via
+/// `into_finalized()`.
 pub fn convert_sse_stream(
     sse_stream: llm_client::LlmStream,
-    api: String,
+    api: agent_core::types::Api,
     provider: String,
     model_id: String,
 ) -> EventStream<AssistantMessageEvent, AgentMessage> {
@@ -23,49 +29,42 @@ pub fn convert_sse_stream(
         use futures::StreamExt;
         let mut sse = sse_stream;
 
-        let mut partial: AgentMessage = serde_json::json!({
-            "role": "assistant",
-            "stopReason": "stop",
-            "content": [],
-            "api": api,
-            "provider": provider,
-            "model": model_id,
-            "usage": {
-                "input": 0, "output": 0,
-                "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
-            },
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
+        let mut partial = PartialAssistantMessage::new(api, provider, model_id);
 
         stream_clone.push(AssistantMessageEvent::Start { partial: partial.clone() });
 
-        let mut _content_index: usize = 0;
-
         while let Some(event) = sse.next().await {
             match event {
-                Ok(llm_client::streaming::LlmEvent::ContentBlockStart { index, content_block }) => {
-                    _content_index = index;
-                    ensure_content_index(&mut partial, index);
+                Ok(LlmEvent::ContentBlockStart { index, content_block }) => {
+                    partial.ensure_block_at(index);
                     match content_block {
-                        llm_client::types::ContentPart::Text { .. } => {
-                            partial["content"][index] = serde_json::json!({"type": "text", "text": ""});
+                        ContentBlock::Text { .. } => {
+                            partial.content[index] = PartialContentBlock::Text {
+                                text: String::new(),
+                                text_signature: None,
+                            };
                             stream_clone.push(AssistantMessageEvent::TextStart {
                                 content_index: index,
                                 partial: partial.clone(),
                             });
                         }
-                        llm_client::types::ContentPart::Thinking { .. } => {
-                            partial["content"][index] = serde_json::json!({"type": "thinking", "thinking": ""});
+                        ContentBlock::Thinking { .. } => {
+                            partial.content[index] = PartialContentBlock::Thinking {
+                                thinking: String::new(),
+                                thinking_signature: None,
+                            };
                             stream_clone.push(AssistantMessageEvent::ThinkingStart {
                                 content_index: index,
                                 partial: partial.clone(),
                             });
                         }
-                        llm_client::types::ContentPart::ToolUse { id, name, .. } => {
-                            partial["content"][index] = serde_json::json!({
-                                "type": "toolCall", "id": id, "name": name, "arguments": {}
-                            });
+                        ContentBlock::ToolCall { id, name, .. } => {
+                            partial.content[index] = PartialContentBlock::ToolCall {
+                                id,
+                                name,
+                                arguments: serde_json::json!({}),
+                                partial_json: None,
+                            };
                             stream_clone.push(AssistantMessageEvent::ToolCallStart {
                                 content_index: index,
                                 partial: partial.clone(),
@@ -74,36 +73,36 @@ pub fn convert_sse_stream(
                         _ => {}
                     }
                 }
-                Ok(llm_client::streaming::LlmEvent::ContentBlockDelta { index, delta }) => {
-                    _content_index = index;
+                Ok(LlmEvent::ContentBlockDelta { index, delta }) => {
                     match delta {
                         Delta::TextDelta { text } => {
-                            if let Some(c) = partial["content"].get_mut(index) {
-                                let old = c["text"].as_str().unwrap_or("");
-                                c["text"] = serde_json::json!(format!("{}{}", old, text));
+                            if let Some(PartialContentBlock::Text { text: t, .. }) =
+                                partial.content.get_mut(index)
+                            {
+                                t.push_str(&text);
                             }
                             stream_clone.push(AssistantMessageEvent::TextDelta {
                                 content_index: index, delta: text, partial: partial.clone(),
                             });
                         }
                         Delta::ThinkingDelta { thinking } => {
-                            if let Some(c) = partial["content"].get_mut(index) {
-                                let old = c["thinking"].as_str().unwrap_or("");
-                                c["thinking"] = serde_json::json!(format!("{}{}", old, thinking));
+                            if let Some(PartialContentBlock::Thinking { thinking: t, .. }) =
+                                partial.content.get_mut(index)
+                            {
+                                t.push_str(&thinking);
                             }
                             stream_clone.push(AssistantMessageEvent::ThinkingDelta {
                                 content_index: index, delta: thinking, partial: partial.clone(),
                             });
                         }
                         Delta::InputJsonDelta { partial_json } => {
-                            if let Some(c) = partial["content"].get_mut(index) {
-                                if c["type"] == "toolCall" {
-                                    let old = c.get("partialJson").and_then(|v| v.as_str()).unwrap_or("");
-                                    let new_json = format!("{}{}", old, partial_json);
-                                    c["partialJson"] = serde_json::json!(new_json);
-                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&new_json) {
-                                        c["arguments"] = parsed;
-                                    }
+                            if let Some(PartialContentBlock::ToolCall { arguments, partial_json: pj, .. }) =
+                                partial.content.get_mut(index)
+                            {
+                                let buf = pj.get_or_insert_with(String::new);
+                                buf.push_str(&partial_json);
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(buf) {
+                                    *arguments = parsed;
                                 }
                             }
                             stream_clone.push(AssistantMessageEvent::ToolCallDelta {
@@ -113,105 +112,92 @@ pub fn convert_sse_stream(
                         _ => {}
                     }
                 }
-                Ok(llm_client::streaming::LlmEvent::ContentBlockStop { index }) => {
-                    if let Some(c) = partial["content"].get(index) {
-                        match c["type"].as_str() {
-                            Some("text") => {
-                                let text = c["text"].as_str().unwrap_or("").to_string();
-                                stream_clone.push(AssistantMessageEvent::TextEnd {
-                                    content_index: index, content: text, partial: partial.clone(),
-                                });
-                            }
-                            Some("thinking") => {
-                                let thinking = c["thinking"].as_str().unwrap_or("").to_string();
-                                stream_clone.push(AssistantMessageEvent::ThinkingEnd {
-                                    content_index: index, content: thinking, partial: partial.clone(),
-                                });
-                            }
-                            Some("toolCall") => {
-                                if let Some(obj) = partial["content"][index].as_object_mut() {
-                                    obj.remove("partialJson");
-                                }
-                                let tool_call = partial["content"][index].clone();
-                                stream_clone.push(AssistantMessageEvent::ToolCallEnd {
-                                    content_index: index, tool_call, partial: partial.clone(),
-                                });
-                            }
-                            _ => {}
+                Ok(LlmEvent::ContentBlockStop { index }) => {
+                    let Some(block) = partial.content.get(index).cloned() else { continue };
+                    match block {
+                        PartialContentBlock::Text { text, .. } => {
+                            stream_clone.push(AssistantMessageEvent::TextEnd {
+                                content_index: index, content: text, partial: partial.clone(),
+                            });
                         }
+                        PartialContentBlock::Thinking { thinking, .. } => {
+                            stream_clone.push(AssistantMessageEvent::ThinkingEnd {
+                                content_index: index, content: thinking, partial: partial.clone(),
+                            });
+                        }
+                        PartialContentBlock::ToolCall { .. } => {
+                            // Drop in-flight `partialJson` once block is complete.
+                            if let Some(PartialContentBlock::ToolCall { partial_json, .. }) =
+                                partial.content.get_mut(index)
+                            {
+                                *partial_json = None;
+                            }
+                            let tool_call = partial.content[index].clone().into_block();
+                            stream_clone.push(AssistantMessageEvent::ToolCallEnd {
+                                content_index: index,
+                                tool_call,
+                                partial: partial.clone(),
+                            });
+                        }
+                        PartialContentBlock::Image { .. } => {}
                     }
                 }
-                Ok(llm_client::streaming::LlmEvent::MessageDelta { delta, usage }) => {
-                    if let Some(ref reason) = delta.stop_reason {
-                        let reason_str = match reason {
-                            llm_client::types::StopReason::EndTurn => "stop",
-                            llm_client::types::StopReason::MaxTokens => "length",
-                            llm_client::types::StopReason::ToolUse => "toolUse",
-                            llm_client::types::StopReason::Error => "error",
-                            _ => "stop",
-                        };
-                        partial["stopReason"] = serde_json::json!(reason_str);
+                Ok(LlmEvent::MessageDelta { delta, usage }) => {
+                    if let Some(reason) = delta.stop_reason {
+                        partial.stop_reason = reason;
                     }
-                    if let Some(ref u) = usage {
-                        partial["usage"] = serde_json::json!(u);
+                    if let Some(u) = usage {
+                        partial.usage = u;
                     }
                 }
-                Ok(llm_client::streaming::LlmEvent::MessageStop) => {
-                    stream_clone.push(AssistantMessageEvent::Done {
-                        reason: partial["stopReason"].as_str().unwrap_or("stop").to_string(),
-                        message: partial.clone(),
-                    });
-                    stream_clone.end(partial.clone());
+                Ok(LlmEvent::MessageStop) => {
+                    let reason = partial.stop_reason;
+                    let final_msg = partial.into_finalized();
+                    stream_clone.push(AssistantMessageEvent::Done { reason, message: final_msg.clone() });
+                    stream_clone.end(final_msg);
                     return;
                 }
-                Ok(llm_client::streaming::LlmEvent::Error { error }) => {
-                    partial["stopReason"] = serde_json::json!("error");
-                    partial["errorMessage"] = serde_json::json!(error.message);
+                Ok(LlmEvent::Error { error }) => {
+                    partial.stop_reason = StopReason::Error;
+                    partial.error_message = Some(error.message);
+                    let final_msg = partial.clone().into_finalized();
                     stream_clone.push(AssistantMessageEvent::Error {
-                        reason: "error".to_string(),
-                        error: partial.clone(),
+                        reason: StopReason::Error,
+                        error: partial,
                     });
-                    stream_clone.end(partial.clone());
+                    stream_clone.end(final_msg);
                     return;
                 }
                 Err(e) => {
-                    partial["stopReason"] = serde_json::json!("error");
-                    partial["errorMessage"] = serde_json::json!(e.to_string());
+                    partial.stop_reason = StopReason::Error;
+                    partial.error_message = Some(e.to_string());
+                    let final_msg = partial.clone().into_finalized();
                     stream_clone.push(AssistantMessageEvent::Error {
-                        reason: "error".to_string(),
-                        error: partial.clone(),
+                        reason: StopReason::Error,
+                        error: partial,
                     });
-                    stream_clone.end(partial.clone());
+                    stream_clone.end(final_msg);
                     return;
                 }
                 _ => {}
             }
         }
 
-        stream_clone.end(partial.clone());
+        let final_msg = partial.into_finalized();
+        stream_clone.end(final_msg);
     });
 
     stream
 }
 
-fn ensure_content_index(partial: &mut AgentMessage, index: usize) {
-    if let Some(arr) = partial["content"].as_array_mut() {
-        while arr.len() <= index {
-            arr.push(serde_json::json!({}));
-        }
-    }
-}
-
-/// Create a StreamFn compatible with agent-core from an LlmProvider.
+/// Create a `StreamFn` compatible with agent-core from an `LlmProvider`.
+/// Tools, messages, and system prompt are forwarded directly — the loop and
+/// the provider both speak `AgentMessage` now, so no conversion is needed.
 pub fn create_stream_fn(provider: Arc<dyn LlmProvider>, model: Model) -> StreamFn {
     Arc::new(move |input: StreamFnInput| {
         let provider = provider.clone();
         let model = model.clone();
         Box::pin(async move {
-            let llm_messages: Vec<LlmMessage> = input.messages.iter()
-                .filter_map(convert_agent_message_to_llm)
-                .collect();
-
             let tools: Vec<ToolDefinition> = input.tools.iter()
                 .map(|t| ToolDefinition {
                     name: t.name().to_string(),
@@ -222,101 +208,27 @@ pub fn create_stream_fn(provider: Arc<dyn LlmProvider>, model: Model) -> StreamF
 
             let request = LlmRequest {
                 model: model.id.clone(),
-                messages: llm_messages,
+                messages: input.messages,
                 tools,
                 system: Some(input.system_prompt),
                 max_tokens: input.max_tokens,
                 temperature: input.temperature,
-                stop_sequences: vec![],
-                extra: std::collections::HashMap::new(),
+                reasoning_effort: input.reasoning,
+                thinking_budgets: input.thinking_budgets,
+                provider_options: input.provider_options,
+                ..Default::default()
             };
 
             let sse_stream = provider.stream(request).await.map_err(|e| e.to_string())?;
 
-            Ok(convert_sse_stream(sse_stream, model.api.clone(), model.provider.clone(), model.id.clone()))
+            Ok(convert_sse_stream(
+                sse_stream,
+                model.api,
+                model.provider.clone(),
+                model.id.clone(),
+            ))
         })
     })
-}
-
-fn convert_agent_message_to_llm(msg: &agent_core::types::Message) -> Option<LlmMessage> {
-    match msg {
-        agent_core::types::Message::User { content, timestamp, .. } => {
-            let parts = match content {
-                agent_core::types::MessageContent::String(s) => {
-                    vec![llm_client::types::ContentPart::Text { text: s.clone() }]
-                }
-                agent_core::types::MessageContent::Blocks(blocks) => {
-                    blocks.iter().map(convert_block_to_part).collect()
-                }
-            };
-            Some(LlmMessage::User { content: llm_client::types::MessageContent::Blocks(parts), timestamp: *timestamp })
-        }
-        agent_core::types::Message::Assistant { content, api, provider, model, usage, stop_reason, error_message, timestamp } => {
-            let parts: Vec<llm_client::types::ContentPart> = content.iter().map(convert_block_to_part).collect();
-            Some(LlmMessage::Assistant {
-                content: parts,
-                api: api.clone(),
-                provider: provider.clone(),
-                model: model.clone(),
-                usage: llm_client::types::Usage {
-                    input: usage.input,
-                    output: usage.output,
-                    cache_read: usage.cache_read,
-                    cache_write: usage.cache_write,
-                    total_tokens: usage.total_tokens,
-                    cost: llm_client::types::UsageCost {
-                        input: usage.cost.input,
-                        output: usage.cost.output,
-                        cache_read: usage.cost.cache_read,
-                        cache_write: usage.cost.cache_write,
-                        total: usage.cost.total,
-                    },
-                },
-                stop_reason: stop_reason.clone(),
-                error_message: error_message.clone(),
-                timestamp: *timestamp,
-            })
-        }
-        agent_core::types::Message::ToolResult { tool_call_id, tool_name, content, details, is_error, timestamp } => {
-            let parts: Vec<llm_client::types::ContentPart> = content.iter().map(convert_block_to_part).collect();
-            Some(LlmMessage::ToolResult {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: Some(tool_name.clone()),
-                content: parts,
-                details: details.clone(),
-                is_error: *is_error,
-                timestamp: *timestamp,
-            })
-        }
-    }
-}
-
-fn convert_block_to_part(block: &agent_core::types::ContentBlock) -> llm_client::types::ContentPart {
-    match block {
-        agent_core::types::ContentBlock::Text { text } => {
-            llm_client::types::ContentPart::Text { text: text.clone() }
-        }
-        agent_core::types::ContentBlock::Image { data, mime_type } => {
-            llm_client::types::ContentPart::Image { data: data.clone(), mime_type: mime_type.clone() }
-        }
-        agent_core::types::ContentBlock::ToolCall { id, name, arguments } => {
-            llm_client::types::ContentPart::ToolUse { id: id.clone(), name: name.clone(), arguments: arguments.clone() }
-        }
-        agent_core::types::ContentBlock::ToolResult { tool_call_id, content, is_error, .. } => {
-            let text = content.iter()
-                .filter_map(|b| if let agent_core::types::ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
-                .collect::<Vec<_>>()
-                .join("");
-            llm_client::types::ContentPart::ToolResult {
-                tool_use_id: tool_call_id.clone(),
-                content: text,
-                is_error: *is_error,
-            }
-        }
-        agent_core::types::ContentBlock::Thinking { thinking } => {
-            llm_client::types::ContentPart::Thinking { thinking: thinking.clone() }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -324,20 +236,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ensure_content_index() {
-        let mut partial = serde_json::json!({"content": []});
-        ensure_content_index(&mut partial, 2);
-        assert_eq!(partial["content"].as_array().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn test_convert_block_text() {
-        let block = agent_core::types::ContentBlock::Text { text: "hello".into() };
-        let part = convert_block_to_part(&block);
-        match part {
-            llm_client::types::ContentPart::Text { text } => assert_eq!(text, "hello"),
-            _ => panic!("Expected text"),
-        }
+    fn test_partial_ensure_block_at() {
+        let mut p = PartialAssistantMessage::new(agent_core::types::Api::Anthropic, "p", "m");
+        p.ensure_block_at(2);
+        assert_eq!(p.content.len(), 3);
     }
 }
-

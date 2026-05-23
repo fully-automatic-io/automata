@@ -1,3 +1,4 @@
+use agent_core::types::ThinkingLevel;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
@@ -19,7 +20,7 @@ pub struct Settings {
     #[serde(default)]
     pub working_directory: Option<String>,
     #[serde(default)]
-    pub thinking_level: Option<String>,
+    pub thinking_level: Option<ThinkingLevel>,
     #[serde(default)]
     pub transport: Option<String>, // "sse" | "json"
     #[serde(default)]
@@ -30,6 +31,8 @@ pub struct Settings {
     pub shell_path: Option<String>,
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Forward-compatible bucket for unknown settings keys (read by plugins
+    /// or future versions); shape is intentionally open.
     #[serde(default)]
     pub extra: serde_json::Value,
 }
@@ -143,8 +146,8 @@ impl SettingsManager {
     pub fn get(&self) -> &Settings { &self.merged }
     pub fn get_model(&self) -> Option<&str> { self.merged.model.as_deref() }
     pub fn get_api_key(&self) -> Option<&str> { self.merged.api_key.as_deref() }
-    pub fn get_thinking_level(&self) -> &str {
-        self.merged.thinking_level.as_deref().unwrap_or("off")
+    pub fn get_thinking_level(&self) -> ThinkingLevel {
+        self.merged.thinking_level.unwrap_or(ThinkingLevel::Off)
     }
 }
 

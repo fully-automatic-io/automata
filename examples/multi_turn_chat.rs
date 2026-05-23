@@ -10,134 +10,19 @@
 // Type your message and press Enter. Type `/exit` (or Ctrl-D) to quit.
 // Type `/history` to dump the message log, `/reset` to start over.
 
-use agent_core::agent_loop::{
-    AgentEventSink, AssistantMessageEventStream, StreamFn, StreamFnInput, run_agent_loop,
-};
-use agent_core::event::{AgentEvent, AssistantMessageEvent, EventStream};
+use agent_core::agent_loop::{AgentEventSink, AgentLoop};
+use agent_core::event::AgentEvent;
+use agent_core::harness::messages::default_convert_to_llm;
 use agent_core::tool::AgentTool;
 use agent_core::types::{
-    AgentContext, AgentLoopConfig, AgentMessage, Message, ModelInfo, ToolExecutionMode, Transport,
+    AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, Model, ModelInfo, ToolExecutionMode,
+    Transport,
 };
+use coding_agent::stream_bridge::create_stream_fn;
 use coding_agent::tools::{BashTool, BashToolOptions, LsTool};
-use llm_client::{
-    AnthropicProvider, AuthMethod, LlmMessage, LlmProvider, LlmRequest, ProviderConfig,
-    StopReason as LlmStopReason, ToolDefinition,
-};
-use std::pin::Pin;
+use llm_client::{AnthropicProvider, AuthMethod, LlmProvider, ProviderConfig};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-
-fn build_stream_fn(provider: Arc<AnthropicProvider>) -> StreamFn {
-    Arc::new(move |input: StreamFnInput| {
-        let provider = provider.clone();
-        Box::pin(async move {
-            let stream: AssistantMessageEventStream = EventStream::new();
-            let stream2 = stream.clone();
-
-            tokio::spawn(async move {
-                let llm_tools: Vec<ToolDefinition> = input
-                    .tools
-                    .iter()
-                    .map(|t| ToolDefinition {
-                        name: t.name().into(),
-                        description: t.description().into(),
-                        input_schema: t.parameters(),
-                    })
-                    .collect();
-
-                let llm_messages: Vec<LlmMessage> = input
-                    .messages
-                    .iter()
-                    .filter_map(|m| {
-                        let v = serde_json::to_value(m).ok()?;
-                        serde_json::from_value::<LlmMessage>(v).ok()
-                    })
-                    .collect();
-
-                let request = LlmRequest {
-                    model: input.model.id.clone(),
-                    messages: llm_messages,
-                    tools: llm_tools,
-                    system: Some(input.system_prompt),
-                    max_tokens: input.max_tokens.or(Some(4096)),
-                    temperature: input.temperature,
-                    stop_sequences: vec![],
-                    extra: Default::default(),
-                };
-
-                match provider.complete(request).await {
-                    Ok(resp) => {
-                        let content: Vec<serde_json::Value> = resp
-                            .content
-                            .iter()
-                            .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
-                            .collect();
-                        let stop_reason = match resp.stop_reason {
-                            LlmStopReason::ToolUse => "toolUse",
-                            LlmStopReason::MaxTokens => "length",
-                            LlmStopReason::StopSequence => "stop_sequence",
-                            _ => "stop",
-                        };
-                        let msg = serde_json::json!({
-                            "role": "assistant",
-                            "content": content,
-                            "api": input.model.api,
-                            "provider": input.model.provider,
-                            "model": resp.model,
-                            "usage": {
-                                "input": resp.usage.input,
-                                "output": resp.usage.output,
-                                "cacheRead": resp.usage.cache_read,
-                                "cacheWrite": resp.usage.cache_write,
-                                "totalTokens": resp.usage.total_tokens,
-                                "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}
-                            },
-                            "stopReason": stop_reason,
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        stream2.push(AssistantMessageEvent::Start { partial: msg.clone() });
-                        stream2.push(AssistantMessageEvent::Done {
-                            reason: stop_reason.into(),
-                            message: msg.clone(),
-                        });
-                        stream2.end(msg);
-                    }
-                    Err(e) => {
-                        let err_text = format!("LLM request failed: {e}");
-                        let msg = serde_json::json!({
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": err_text.clone()}],
-                            "api": input.model.api,
-                            "provider": input.model.provider,
-                            "model": input.model.id,
-                            "usage": {
-                                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
-                                "totalTokens": 0,
-                                "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}
-                            },
-                            "stopReason": "error",
-                            "errorMessage": err_text,
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        stream2.push(AssistantMessageEvent::Error {
-                            reason: e.to_string(),
-                            error: msg.clone(),
-                        });
-                        stream2.end(msg);
-                    }
-                }
-            });
-
-            Ok(stream)
-        })
-            as Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<AssistantMessageEventStream, String>>
-                        + Send,
-                >,
-            >
-    })
-}
 
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -155,10 +40,10 @@ async fn main() {
     let token = std::env::var("ANTHROPIC_AUTH_TOKEN")
         .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
         .expect("Set ANTHROPIC_AUTH_TOKEN (or DEEPSEEK_API_KEY)");
-    let model_id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into());
+    let model_id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
 
     let endpoint = format!("{}/v1/messages", base.trim_end_matches('/'));
-    let provider = Arc::new(AnthropicProvider::new(
+    let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(
         ProviderConfig::new(token)
             .with_base_url(endpoint.clone())
             .with_auth_method(AuthMethod::Bearer),
@@ -179,33 +64,34 @@ async fn main() {
     let emit: AgentEventSink = Arc::new(|event: AgentEvent| {
         Box::pin(async move {
             match &event {
-                AgentEvent::MessageStart { message } => {
-                    let role = message["role"].as_str().unwrap_or("?");
-                    if role == "assistant" {
-                        if let Some(arr) = message["content"].as_array() {
-                            for c in arr {
-                                match c["type"].as_str() {
-                                    Some("text") => {
-                                        if let Some(t) = c["text"].as_str() {
-                                            if !t.is_empty() {
-                                                println!("[assistant] {}", truncate(t, 800));
-                                            }
-                                        }
-                                    }
-                                    Some("toolCall") => {
-                                        let name = c["name"].as_str().unwrap_or("?");
-                                        let args = serde_json::to_string(&c["arguments"])
-                                            .unwrap_or_default();
-                                        println!("[tool_call] {} {}", name, truncate(&args, 200));
-                                    }
-                                    _ => {}
+                AgentEvent::MessageEnd { message } => {
+                    if let Some(content) = message.assistant_content() {
+                        for c in content {
+                            match c {
+                                ContentBlock::Text { text } if !text.is_empty() => {
+                                    println!("[assistant] {}", truncate(text, 800));
                                 }
+                                ContentBlock::ToolCall { name, arguments, .. } => {
+                                    let args = serde_json::to_string(arguments).unwrap_or_default();
+                                    println!("[tool_call] {} {}", name, truncate(&args, 200));
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
                 AgentEvent::ToolExecutionEnd { tool_name, result, is_error, .. } => {
-                    let summary = result["content"][0]["text"].as_str().unwrap_or("(no text)");
+                    let summary = result
+                        .content
+                        .iter()
+                        .find_map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or("(no text)");
                     let prefix = if *is_error {
                         "[tool_error]"
                     } else {
@@ -218,42 +104,26 @@ async fn main() {
         })
     });
 
-    let model = ModelInfo {
+    let llm_model = Model {
         id: model_id.clone(),
         name: model_id.clone(),
-        api: "anthropic".into(),
+        api: agent_core::types::Api::Anthropic,
         provider: "deepseek".into(),
-        base_url: endpoint,
+        base_url: endpoint.clone(),
         reasoning: false,
         input: vec!["text".into()],
+        cost: Default::default(),
         context_window: 128_000,
         max_tokens: 8192,
     };
+    let model_info = ModelInfo::from(&llm_model);
 
     let config = AgentLoopConfig {
-        model: model.clone(),
-        api_key: None,
-        tool_execution: ToolExecutionMode::Sequential,
-        session_id: None,
-        thinking_budgets: None,
-        transport: Transport::Sse,
-        max_retry_delay_ms: None,
-        reasoning: None,
-        temperature: Some(0.0),
         max_tokens: Some(4096),
-        before_tool_call: None,
-        after_tool_call: None,
-        transform_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        get_api_key: None,
-        convert_to_llm: Arc::new(|msgs| {
-            Box::pin(async move {
-                msgs.into_iter()
-                    .filter_map(|m| serde_json::from_value::<Message>(m).ok())
-                    .collect()
-            })
-        }),
+        temperature: Some(0.0),
+        tool_execution: ToolExecutionMode::Sequential,
+        transport: Transport::Sse,
+        ..AgentLoopConfig::new(model_info, Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs))))
     };
 
     let system_prompt = format!(
@@ -265,11 +135,11 @@ async fn main() {
     let make_context = || AgentContext {
         system_prompt: system_prompt.clone(),
         messages: vec![],
-        tools: vec!["bash".into(), "ls".into()],
+        tools: tools.clone(),
     };
 
     let mut context = make_context();
-    let stream_fn = build_stream_fn(provider);
+    let stream_fn = create_stream_fn(provider, llm_model);
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -277,7 +147,6 @@ async fn main() {
     let mut turn: u32 = 0;
     loop {
         print!("\n> ");
-        // 立即把提示符刷出来
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
 
@@ -311,34 +180,45 @@ async fn main() {
             "/history" => {
                 println!("--- history ({} messages) ---", context.messages.len());
                 for (i, m) in context.messages.iter().enumerate() {
-                    let role = m["role"].as_str().unwrap_or("?");
-                    let preview = match role {
-                        "user" => m["content"][0]["text"].as_str().unwrap_or("").to_string(),
-                        "assistant" => m["content"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|c| match c["type"].as_str() {
-                                        Some("text") => {
-                                            c["text"].as_str().unwrap_or("").to_string()
-                                        }
-                                        Some("toolCall") => {
-                                            format!("<tool {}>", c["name"].as_str().unwrap_or("?"))
-                                        }
-                                        _ => String::new(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
+                    let preview = match m {
+                        AgentMessage::User { content, .. } => content
+                            .as_blocks()
+                            .iter()
+                            .filter_map(|b| {
+                                if let ContentBlock::Text { text } = b {
+                                    Some(text.clone())
+                                } else {
+                                    None
+                                }
                             })
-                            .unwrap_or_default(),
-                        "toolResult" => format!(
-                            "<{}: {}>",
-                            m["toolName"].as_str().unwrap_or("?"),
-                            m["content"][0]["text"].as_str().unwrap_or("")
-                        ),
-                        _ => serde_json::to_string(m).unwrap_or_default(),
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        AgentMessage::Assistant { content, .. } => content
+                            .iter()
+                            .map(|c| match c {
+                                ContentBlock::Text { text } => text.clone(),
+                                ContentBlock::ToolCall { name, .. } => format!("<tool {}>", name),
+                                _ => String::new(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        AgentMessage::ToolResult { tool_name, content, .. } => {
+                            let text = content
+                                .iter()
+                                .filter_map(|b| {
+                                    if let ContentBlock::Text { text } = b {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            format!("<{}: {}>", tool_name, text)
+                        }
+                        _ => serde_json::to_string(&m.to_json()).unwrap_or_default(),
                     };
-                    println!("  [{i}] {role}: {}", truncate(&preview, 200));
+                    println!("  [{i}] {}: {}", m.role(), truncate(&preview, 200));
                 }
                 continue;
             }
@@ -348,18 +228,13 @@ async fn main() {
         turn += 1;
         println!("\n--- turn {turn} ---");
 
-        let prompt: AgentMessage = serde_json::json!({
-            "role": "user",
-            "content": [{"type": "text", "text": user_text}],
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
+        let prompt = AgentMessage::user_text(user_text);
 
-        // run_agent_loop 会把 prompt 拼到 context.messages 后面，跑完返回这一轮新增的所有
-        // 消息（user prompt + assistant turns + tool results）。把它们追加回 context，
-        // 下一轮就拥有完整历史。
-        let new_messages =
-            run_agent_loop(vec![prompt], context.clone(), &config, &tools, &emit, None, &stream_fn)
-                .await;
+        // AgentLoop::run appends the prompt to context.messages and returns the new
+        // messages from this turn (user prompt + assistant turns + tool results).
+        let new_messages = AgentLoop::new(&config, &emit, &stream_fn)
+            .run(vec![prompt], context.clone(), None)
+            .await;
 
         context.messages.extend(new_messages);
     }

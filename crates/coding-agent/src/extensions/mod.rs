@@ -1,13 +1,9 @@
-pub mod loader;
-pub mod runner;
-pub mod service;
-pub mod types;
+mod extensions;
 
-pub use loader::{discover_and_load_extensions, load_extensions};
-pub use runner::ExtensionRunner;
-pub use service::ExtensionService;
-pub use types::{
-    Extension, ExtensionContext, ExtensionEvent, ExtensionFlag, ExtensionManifest,
-    LoadExtensionsResult, RegisteredCommand, RegisteredTool, ToolDefinition,
-    ProviderConfig, ProviderModelConfig, CompactionPreparation, CompactionResult,
+pub use extensions::{
+    discover_and_load_extensions, load_extensions,
+    CompactionPreparation, CompactionResult, Extension, ExtensionContext, ExtensionEvent,
+    ExtensionFlag, ExtensionManifest, ExtensionRunner, ExtensionService, LoadExtensionsResult,
+    RegisteredCommand, RegisteredTool, SessionLifecycleReason, ToolDefinition, ProviderConfig,
+    ProviderModelConfig,
 };

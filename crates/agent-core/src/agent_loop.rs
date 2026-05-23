@@ -1,9 +1,14 @@
+// The low-level agent loop: drives streamed assistant responses, dispatches
+// tool calls (sequential or parallel), and orchestrates steering / follow-up
+// queues.
 
 use crate::event::{AgentEvent, AssistantMessageEvent, EventStream};
-use crate::tool::{AgentTool, validate_tool_arguments};
+use crate::tool::{validate_tool_arguments, AgentTool};
 use crate::types::{
-    AfterToolCallContext, AgentContext, AgentLoopConfig, AgentMessage, AgentToolCall,
-    AgentToolResult, AgentToolUpdateCallback, Message,
+    AfterToolCallContext, AfterToolCallFn, AgentContext, AgentLoopConfig, AgentMessage,
+    AgentToolCall, AgentToolResult, AgentToolUpdateCallback, BeforeToolCallContext, ContentBlock,
+    ModelInfo, PrepareNextTurnContext, ShouldStopAfterTurnContext, StopReason, ThinkingBudgets,
+    ThinkingLevel, ToolDefinition, ToolExecutionMode, Transport, Usage,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -11,42 +16,41 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 // ============================================================================
-// Types
+// Public types
 // ============================================================================
 
 pub type AgentEventSink =
     Arc<dyn Fn(AgentEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-pub type StreamFn = Arc<
-    dyn Fn(
-            StreamFnInput,
-        )
-            -> Pin<Box<dyn Future<Output = Result<AssistantMessageEventStream, String>> + Send>>
-        + Send
-        + Sync,
->;
-
 pub type AssistantMessageEventStream = EventStream<AssistantMessageEvent, AgentMessage>;
+
+pub type StreamFn = Arc<
+    dyn Fn(StreamFnInput)
+            -> Pin<Box<dyn Future<Output = Result<AssistantMessageEventStream, String>> + Send>>
+        + Send + Sync,
+>;
 
 #[derive(Clone)]
 pub struct StreamFnInput {
-    pub model: crate::types::ModelInfo,
+    pub model: ModelInfo,
     pub system_prompt: String,
-    pub messages: Vec<Message>,
+    pub messages: Vec<AgentMessage>,
     pub tools: Vec<Arc<dyn AgentTool>>,
     pub api_key: Option<String>,
     pub signal: Option<CancellationToken>,
     pub session_id: Option<String>,
-    pub thinking_budgets: Option<crate::types::ThinkingBudgets>,
-    pub transport: crate::types::Transport,
+    pub thinking_budgets: Option<ThinkingBudgets>,
+    pub transport: Transport,
     pub max_retry_delay_ms: Option<u64>,
-    pub reasoning: Option<String>,
+    pub reasoning: Option<ThinkingLevel>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Provider-specific overrides (e.g. Anthropic `forceAdaptiveThinking`).
+    pub provider_options: Option<crate::types::ProviderOptions>,
 }
 
 // ============================================================================
-// Preparation types
+// Tool batch execution machinery
 // ============================================================================
 
 enum PreparedToolCall {
@@ -74,373 +78,389 @@ struct ExecutedToolCall {
     is_error: bool,
 }
 
+struct ToolBatch {
+    messages: Vec<AgentMessage>,
+    terminate: bool,
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
 
-pub async fn run_agent_loop(
-    prompts: Vec<AgentMessage>,
-    context: AgentContext,
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    emit: &AgentEventSink,
-    signal: Option<CancellationToken>,
-    stream_fn: &StreamFn,
-) -> Vec<AgentMessage> {
-    let mut new_messages: Vec<AgentMessage> = prompts.clone();
-    let mut current_context = AgentContext {
-        system_prompt: context.system_prompt.clone(),
-        messages: {
-            let mut msgs = context.messages;
-            msgs.extend(prompts.clone());
-            msgs
-        },
-        tools: context.tools.clone(),
-    };
-
-    emit(AgentEvent::AgentStart).await;
-    emit(AgentEvent::TurnStart).await;
-    for prompt in &prompts {
-        emit(AgentEvent::MessageStart { message: prompt.clone() }).await;
-        emit(AgentEvent::MessageEnd { message: prompt.clone() }).await;
-    }
-
-    run_loop(&mut current_context, &mut new_messages, config, tools, emit, signal, stream_fn).await;
-    new_messages
+/// Bundles the long-lived collaborators that drive a single `run` / `run_continue`
+/// invocation. `config`, `emit`, and `stream_fn` stay constant across the entire
+/// loop; per-call inputs (prompts, context, signal) are passed to the methods.
+pub struct AgentLoop<'a> {
+    config: &'a AgentLoopConfig,
+    emit: &'a AgentEventSink,
+    stream_fn: &'a StreamFn,
 }
 
-pub async fn run_agent_loop_continue(
-    context: AgentContext,
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    emit: &AgentEventSink,
-    signal: Option<CancellationToken>,
-    stream_fn: &StreamFn,
-) -> Vec<AgentMessage> {
-    if context.messages.is_empty() {
-        panic!("Cannot continue: no messages in context");
-    }
-    let last_role = context
-        .messages
-        .last()
-        .and_then(|m| m.get("role"))
-        .and_then(|r| r.as_str())
-        .unwrap_or("");
-    if last_role == "assistant" {
-        panic!("Cannot continue from message role: assistant");
+impl<'a> AgentLoop<'a> {
+    pub fn new(
+        config: &'a AgentLoopConfig,
+        emit: &'a AgentEventSink,
+        stream_fn: &'a StreamFn,
+    ) -> Self {
+        Self { config, emit, stream_fn }
     }
 
-    let mut new_messages: Vec<AgentMessage> = vec![];
-    let mut current_context = context.clone();
+    pub async fn run(
+        &self,
+        prompts: Vec<AgentMessage>,
+        context: AgentContext,
+        signal: Option<CancellationToken>,
+    ) -> Vec<AgentMessage> {
+        let mut new_messages: Vec<AgentMessage> = prompts.clone();
+        let mut current_context = context;
+        current_context.messages.extend(prompts.clone());
 
-    emit(AgentEvent::AgentStart).await;
-    emit(AgentEvent::TurnStart).await;
-    run_loop(&mut current_context, &mut new_messages, config, tools, emit, signal, stream_fn).await;
-    new_messages
+        self.emit(AgentEvent::AgentStart).await;
+        self.emit(AgentEvent::TurnStart).await;
+        for prompt in &prompts {
+            self.emit(AgentEvent::MessageStart { message: prompt.clone() }).await;
+            self.emit(AgentEvent::MessageEnd { message: prompt.clone() }).await;
+        }
+
+        self.run_loop(&mut current_context, &mut new_messages, signal).await;
+        new_messages
+    }
+
+    pub async fn run_continue(
+        &self,
+        context: AgentContext,
+        signal: Option<CancellationToken>,
+    ) -> Vec<AgentMessage> {
+        if context.messages.is_empty() {
+            panic!("Cannot continue: no messages in context");
+        }
+        if let Some(AgentMessage::Assistant { .. }) = context.messages.last() {
+            panic!("Cannot continue from message role: assistant");
+        }
+
+        let mut new_messages: Vec<AgentMessage> = vec![];
+        let mut current_context = context;
+
+        self.emit(AgentEvent::AgentStart).await;
+        self.emit(AgentEvent::TurnStart).await;
+        self.run_loop(&mut current_context, &mut new_messages, signal).await;
+        new_messages
+    }
 }
 
 // ============================================================================
 // Main loop
 // ============================================================================
 
-async fn run_loop(
-    current_context: &mut AgentContext,
-    new_messages: &mut Vec<AgentMessage>,
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    emit: &AgentEventSink,
-    signal: Option<CancellationToken>,
-    stream_fn: &StreamFn,
-) {
-    let mut first_turn = true;
-    let mut pending_messages: Vec<AgentMessage> = get_steering_messages(config, true).await;
-
-    loop {
-        let mut has_more_tool_calls = true;
-
-        while has_more_tool_calls || !pending_messages.is_empty() {
-            if let Some(ref token) = signal {
-                if token.is_cancelled() {
-                    emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
-                    return;
-                }
-            }
-
-            if !first_turn {
-                emit(AgentEvent::TurnStart).await;
-            } else {
-                first_turn = false;
-            }
-
-            if !pending_messages.is_empty() {
-                for message in &pending_messages {
-                    emit(AgentEvent::MessageStart { message: message.clone() }).await;
-                    emit(AgentEvent::MessageEnd { message: message.clone() }).await;
-                    current_context.messages.push(message.clone());
-                    new_messages.push(message.clone());
-                }
-                pending_messages.clear();
-            }
-
-            let message = stream_assistant_response(
-                current_context,
-                config,
-                tools,
-                emit,
-                signal.clone(),
-                stream_fn,
-            )
-            .await;
-            new_messages.push(message.clone());
-
-            let stop_reason = message.get("stopReason").and_then(|s| s.as_str()).unwrap_or("stop");
-
-            if stop_reason == "error" || stop_reason == "aborted" {
-                emit(AgentEvent::TurnEnd { message, tool_results: vec![] }).await;
-                emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
-                return;
-            }
-
-            let tool_calls = extract_tool_calls(&message);
-            let mut tool_results: Vec<AgentMessage> = vec![];
-            has_more_tool_calls = false;
-
-            if !tool_calls.is_empty() {
-                let batch = execute_tool_calls(
-                    current_context,
-                    &tool_calls,
-                    config,
-                    tools,
-                    emit,
-                    signal.clone(),
-                )
-                .await;
-                for result in &batch.messages {
-                    current_context.messages.push(result.clone());
-                    new_messages.push(result.clone());
-                }
-                tool_results = batch.messages;
-                has_more_tool_calls = !batch.terminate;
-            }
-
-            emit(AgentEvent::TurnEnd { message, tool_results }).await;
-            pending_messages = get_steering_messages(config, false).await;
-        }
-
-        let follow_up = get_follow_up_messages(config).await;
-        if !follow_up.is_empty() {
-            pending_messages = follow_up;
-            continue;
-        }
-        break;
+impl AgentLoop<'_> {
+    async fn emit(&self, event: AgentEvent) {
+        (self.emit)(event).await;
     }
 
-    emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+    async fn run_loop(
+        &self,
+        current_context: &mut AgentContext,
+        new_messages: &mut Vec<AgentMessage>,
+        signal: Option<CancellationToken>,
+    ) {
+        let mut first_turn = true;
+        let mut pending_messages: Vec<AgentMessage> = self.drain_steer().await;
+
+        loop {
+            let mut has_more_tool_calls = true;
+
+            while has_more_tool_calls || !pending_messages.is_empty() {
+                if let Some(ref token) = signal {
+                    if token.is_cancelled() {
+                        self.emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+                        return;
+                    }
+                }
+
+                if !first_turn {
+                    self.emit(AgentEvent::TurnStart).await;
+                } else {
+                    first_turn = false;
+                }
+
+                if !pending_messages.is_empty() {
+                    for message in &pending_messages {
+                        self.emit(AgentEvent::MessageStart { message: message.clone() }).await;
+                        self.emit(AgentEvent::MessageEnd { message: message.clone() }).await;
+                        current_context.messages.push(message.clone());
+                        new_messages.push(message.clone());
+                    }
+                    pending_messages.clear();
+                }
+
+                let assistant = self
+                    .stream_assistant_response(current_context, signal.clone())
+                    .await;
+                new_messages.push(assistant.clone());
+
+                let stop_reason = assistant.stop_reason().unwrap_or(StopReason::EndTurn);
+                if matches!(stop_reason, StopReason::Error | StopReason::Aborted) {
+                    self.emit(AgentEvent::TurnEnd { message: assistant, tool_results: vec![] })
+                        .await;
+                    self.emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+                    return;
+                }
+
+                let tool_calls = extract_tool_calls(&assistant);
+                let mut tool_results: Vec<AgentMessage> = vec![];
+                has_more_tool_calls = false;
+
+                if !tool_calls.is_empty() {
+                    let batch = self
+                        .execute_tool_calls(current_context, &tool_calls, &assistant, signal.clone())
+                        .await;
+                    for result in &batch.messages {
+                        current_context.messages.push(result.clone());
+                        new_messages.push(result.clone());
+                    }
+                    tool_results = batch.messages;
+                    has_more_tool_calls = !batch.terminate;
+                }
+
+                if let Some(ref hook) = self.config.should_stop_after_turn {
+                    let ctx = ShouldStopAfterTurnContext {
+                        assistant_message: assistant.clone(),
+                        tool_results: tool_results.clone(),
+                        context: current_context.clone(),
+                        has_more_tool_calls,
+                    };
+                    if hook(ctx, signal.clone()).await {
+                        has_more_tool_calls = false;
+                    }
+                }
+
+                if has_more_tool_calls {
+                    if let Some(ref hook) = self.config.prepare_next_turn {
+                        let ctx = PrepareNextTurnContext {
+                            last_assistant_message: assistant.clone(),
+                            tool_results: tool_results.clone(),
+                            context: current_context.clone(),
+                        };
+                        let extras = hook(ctx, signal.clone()).await;
+                        pending_messages.extend(extras);
+                    }
+                }
+
+                self.emit(AgentEvent::TurnEnd { message: assistant, tool_results }).await;
+                pending_messages.extend(self.drain_steer().await);
+            }
+
+            let follow_up = self.drain_follow_up().await;
+            if !follow_up.is_empty() {
+                pending_messages = follow_up;
+                continue;
+            }
+            break;
+        }
+
+        self.emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+    }
 }
 
 // ============================================================================
 // Stream assistant response
 // ============================================================================
 
-async fn stream_assistant_response(
-    context: &mut AgentContext,
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    emit: &AgentEventSink,
-    signal: Option<CancellationToken>,
-    stream_fn: &StreamFn,
-) -> AgentMessage {
-    let mut messages = context.messages.clone();
-    if let Some(ref transform_fn) = config.transform_context {
-        messages = transform_fn(messages.clone(), signal.clone()).await;
-    }
-
-    let llm_messages = (config.convert_to_llm)(messages.clone()).await;
-
-    let resolved_api_key = if let Some(ref get_key) = config.get_api_key {
-        get_key(config.model.provider.clone()).await.or(config.api_key.clone())
-    } else {
-        config.api_key.clone()
-    };
-
-    let stream_input = StreamFnInput {
-        model: config.model.clone(),
-        system_prompt: context.system_prompt.clone(),
-        messages: llm_messages,
-        tools: tools.to_vec(),
-        api_key: resolved_api_key,
-        signal: signal.clone(),
-        session_id: config.session_id.clone(),
-        thinking_budgets: config.thinking_budgets.clone(),
-        transport: config.transport,
-        max_retry_delay_ms: config.max_retry_delay_ms,
-        reasoning: config.reasoning.clone(),
-        temperature: config.temperature,
-        max_tokens: config.max_tokens,
-    };
-
-    let response = match (stream_fn)(stream_input).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            let failure = make_failure_message(&config.model, "error", Some(&err));
-            context.messages.push(failure.clone());
-            emit(AgentEvent::MessageStart { message: failure.clone() }).await;
-            emit(AgentEvent::MessageEnd { message: failure.clone() }).await;
-            return failure;
+impl AgentLoop<'_> {
+    async fn stream_assistant_response(
+        &self,
+        context: &mut AgentContext,
+        signal: Option<CancellationToken>,
+    ) -> AgentMessage {
+        let mut messages = context.messages.clone();
+        if let Some(ref transform_fn) = self.config.transform_context {
+            messages = transform_fn(messages, signal.clone()).await;
         }
-    };
+        let llm_messages = (self.config.convert_to_llm)(messages).await;
 
-    let mut partial_message: Option<AgentMessage> = None;
-    let mut added_partial = false;
+        let resolved_api_key = if let Some(ref get_key) = self.config.get_api_key {
+            get_key(self.config.model.provider.clone())
+                .await
+                .or(self.config.api_key.clone())
+        } else {
+            self.config.api_key.clone()
+        };
 
-    loop {
-        let events = response.take_events();
-        let is_done = response.is_complete();
+        let stream_input = StreamFnInput {
+            model: self.config.model.clone(),
+            system_prompt: context.system_prompt.clone(),
+            messages: llm_messages,
+            tools: context.tools.clone(),
+            api_key: resolved_api_key,
+            signal: signal.clone(),
+            session_id: self.config.session_id.clone(),
+            thinking_budgets: self.config.thinking_budgets.clone(),
+            transport: self.config.transport,
+            max_retry_delay_ms: self.config.max_retry_delay_ms,
+            reasoning: self.config.reasoning.clone(),
+            temperature: self.config.temperature,
+            max_tokens: self.config.max_tokens,
+            provider_options: self.config.provider_options.clone(),
+        };
 
-        if events.is_empty() && is_done {
-            let final_message =
-                response.wait_for_result_try().ok().flatten().unwrap_or_else(|| {
-                    make_failure_message(
-                        &config.model,
-                        "error",
-                        Some("Stream ended without result"),
-                    )
-                });
-            if added_partial {
-                let last = context.messages.len().saturating_sub(1);
-                if last < context.messages.len() {
-                    context.messages[last] = final_message.clone();
-                }
-            } else {
-                context.messages.push(final_message.clone());
-                emit(AgentEvent::MessageStart { message: final_message.clone() }).await;
+        if let Some(ref hook) = self.config.on_payload {
+            let payload = serde_json::json!({
+                "model": stream_input.model.id,
+                "system": stream_input.system_prompt,
+                "messages": stream_input.messages,
+                "transport": format!("{:?}", stream_input.transport).to_lowercase(),
+            });
+            hook(payload).await;
+        }
+
+        let response = match (self.stream_fn)(stream_input).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let failure = make_failure_message(&self.config.model, StopReason::Error, Some(&err));
+                context.messages.push(failure.clone());
+                self.emit(AgentEvent::MessageStart { message: failure.clone() }).await;
+                self.emit(AgentEvent::MessageEnd { message: failure.clone() }).await;
+                return failure;
             }
-            emit(AgentEvent::MessageEnd { message: final_message.clone() }).await;
-            return final_message;
-        }
+        };
 
-        for event in events {
-            match event {
-                AssistantMessageEvent::Start { partial } => {
-                    partial_message = Some(partial.clone());
-                    context.messages.push(partial.clone());
-                    added_partial = true;
-                    emit(AgentEvent::MessageStart { message: partial }).await;
-                }
-                ref ev @ (AssistantMessageEvent::TextStart { .. }
-                | AssistantMessageEvent::TextDelta { .. }
-                | AssistantMessageEvent::TextEnd { .. }
-                | AssistantMessageEvent::ThinkingStart { .. }
-                | AssistantMessageEvent::ThinkingDelta { .. }
-                | AssistantMessageEvent::ThinkingEnd { .. }
-                | AssistantMessageEvent::ToolCallStart { .. }
-                | AssistantMessageEvent::ToolCallDelta { .. }
-                | AssistantMessageEvent::ToolCallEnd { .. }) => {
-                    if let Some(ref _pm) = partial_message {
-                        let updated = partial_from_event(ev);
-                        partial_message = Some(updated.clone());
-                        let last = context.messages.len().saturating_sub(1);
-                        if last < context.messages.len() {
-                            context.messages[last] = updated.clone();
-                        }
-                        emit(AgentEvent::MessageUpdate {
-                            message: updated,
-                            assistant_message_event: ev.clone(),
-                        })
-                        .await;
-                    }
-                }
-                AssistantMessageEvent::Done { message, .. }
-                | AssistantMessageEvent::Error { error: message, .. } => {
+        let mut added_partial = false;
+
+        loop {
+            let events = response.take_events();
+            let is_done = response.is_complete();
+
+            if events.is_empty() {
+                if is_done {
+                    let final_message = match response.wait_for_result_try().ok().flatten() {
+                        Some(m) => m,
+                        None => make_failure_message(
+                            &self.config.model,
+                            StopReason::Error,
+                            Some("Stream ended without result"),
+                        ),
+                    };
                     if added_partial {
-                        let last = context.messages.len().saturating_sub(1);
-                        if last < context.messages.len() {
-                            context.messages[last] = message.clone();
+                        if let Some(last) = context.messages.last_mut() {
+                            *last = final_message.clone();
                         }
                     } else {
-                        context.messages.push(message.clone());
+                        context.messages.push(final_message.clone());
+                        self.emit(AgentEvent::MessageStart { message: final_message.clone() }).await;
                     }
-                    if !added_partial {
-                        emit(AgentEvent::MessageStart { message: message.clone() }).await;
+                    if let Some(ref hook) = self.config.on_response {
+                        hook(final_message.to_json()).await;
                     }
-                    emit(AgentEvent::MessageEnd { message: message.clone() }).await;
-                    return message;
+                    self.emit(AgentEvent::MessageEnd { message: final_message.clone() }).await;
+                    return final_message;
+                }
+                // Park until the bridge task pushes more events or ends the stream.
+                response.wait_for_more().await;
+                continue;
+            }
+
+            for event in events {
+                match event {
+                    AssistantMessageEvent::Start { partial } => {
+                        let msg = partial.into_finalized();
+                        context.messages.push(msg.clone());
+                        added_partial = true;
+                        self.emit(AgentEvent::MessageStart { message: msg }).await;
+                    }
+                    AssistantMessageEvent::Done { message, .. } => {
+                        let final_msg = message;
+                        if added_partial {
+                            if let Some(last) = context.messages.last_mut() {
+                                *last = final_msg.clone();
+                            }
+                        } else {
+                            context.messages.push(final_msg.clone());
+                            self.emit(AgentEvent::MessageStart { message: final_msg.clone() }).await;
+                        }
+                        if let Some(ref hook) = self.config.on_response {
+                            hook(final_msg.to_json()).await;
+                        }
+                        self.emit(AgentEvent::MessageEnd { message: final_msg.clone() }).await;
+                        return final_msg;
+                    }
+                    AssistantMessageEvent::Error { error, .. } => {
+                        let final_msg = error.into_finalized();
+                        if added_partial {
+                            if let Some(last) = context.messages.last_mut() {
+                                *last = final_msg.clone();
+                            }
+                        } else {
+                            context.messages.push(final_msg.clone());
+                            self.emit(AgentEvent::MessageStart { message: final_msg.clone() }).await;
+                        }
+                        if let Some(ref hook) = self.config.on_response {
+                            hook(final_msg.to_json()).await;
+                        }
+                        self.emit(AgentEvent::MessageEnd { message: final_msg.clone() }).await;
+                        return final_msg;
+                    }
+                    ev => {
+                        if let Some(partial) = ev.partial() {
+                            let updated = partial.clone().into_finalized();
+                            if let Some(last) = context.messages.last_mut() {
+                                *last = updated;
+                            }
+                            let snapshot = partial.clone();
+                            self.emit(AgentEvent::MessageUpdate {
+                                partial: snapshot,
+                                assistant_message_event: ev,
+                            })
+                            .await;
+                        }
+                    }
                 }
             }
         }
-    }
-}
-
-fn partial_from_event(event: &AssistantMessageEvent) -> AgentMessage {
-    match event {
-        AssistantMessageEvent::Start { partial }
-        | AssistantMessageEvent::TextStart { partial, .. }
-        | AssistantMessageEvent::TextDelta { partial, .. }
-        | AssistantMessageEvent::TextEnd { partial, .. }
-        | AssistantMessageEvent::ThinkingStart { partial, .. }
-        | AssistantMessageEvent::ThinkingDelta { partial, .. }
-        | AssistantMessageEvent::ThinkingEnd { partial, .. }
-        | AssistantMessageEvent::ToolCallStart { partial, .. }
-        | AssistantMessageEvent::ToolCallDelta { partial, .. }
-        | AssistantMessageEvent::ToolCallEnd { partial, .. } => partial.clone(),
-        _ => serde_json::json!({}),
     }
 }
 
 fn extract_tool_calls(message: &AgentMessage) -> Vec<AgentToolCall> {
-    message
-        .get("content")
-        .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("toolCall"))
-                .filter_map(|block| {
-                    Some(AgentToolCall {
-                        id: block.get("id")?.as_str()?.to_string(),
-                        name: block.get("name")?.as_str()?.to_string(),
-                        arguments: block.get("arguments")?.clone(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(content) = message.assistant_content() else { return vec![] };
+    content.iter().filter_map(|b| match b {
+        ContentBlock::ToolCall { id, name, arguments } => Some(AgentToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+        }),
+        _ => None,
+    }).collect()
 }
 
 // ============================================================================
 // Tool execution dispatch
 // ============================================================================
 
-struct ToolBatch {
-    messages: Vec<AgentMessage>,
-    terminate: bool,
-}
+impl AgentLoop<'_> {
+    async fn execute_tool_calls(
+        &self,
+        current_context: &AgentContext,
+        tool_calls: &[AgentToolCall],
+        assistant_message: &AgentMessage,
+        signal: Option<CancellationToken>,
+    ) -> ToolBatch {
+        let has_sequential = tool_calls.iter().any(|tc| {
+            find_tool(&current_context.tools, &tc.name)
+                .and_then(|t| t.execution_mode()) == Some(ToolExecutionMode::Sequential)
+        });
 
-async fn execute_tool_calls(
-    current_context: &AgentContext,
-    tool_calls: &[AgentToolCall],
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    emit: &AgentEventSink,
-    signal: Option<CancellationToken>,
-) -> ToolBatch {
-    let has_sequential = tool_calls.iter().any(|tc| {
-        find_tool(tools, &tc.name).and_then(|t| t.execution_mode())
-            == Some(ToolExecutionMode::Sequential)
-    });
+        let effective_mode = match self.config.tool_execution {
+            ToolExecutionMode::Sequential => ToolExecutionMode::Sequential,
+            ToolExecutionMode::Parallel if has_sequential => ToolExecutionMode::Sequential,
+            _ => ToolExecutionMode::Parallel,
+        };
 
-    use crate::types::ToolExecutionMode;
-    let effective_mode = match config.tool_execution {
-        ToolExecutionMode::Sequential => ToolExecutionMode::Sequential,
-        ToolExecutionMode::Parallel if has_sequential => ToolExecutionMode::Sequential,
-        _ => ToolExecutionMode::Parallel,
-    };
-
-    match effective_mode {
-        ToolExecutionMode::Sequential => {
-            exec_sequential(current_context, tool_calls, config, tools, emit, signal).await
-        }
-        ToolExecutionMode::Parallel => {
-            exec_parallel(current_context, tool_calls, config, tools, emit, signal).await
+        match effective_mode {
+            ToolExecutionMode::Sequential => {
+                self.exec_sequential(current_context, tool_calls, assistant_message, signal).await
+            }
+            ToolExecutionMode::Parallel => {
+                self.exec_parallel(current_context, tool_calls, assistant_message, signal).await
+            }
         }
     }
 }
@@ -453,201 +473,175 @@ fn find_tool(tools: &[Arc<dyn AgentTool>], name: &str) -> Option<Arc<dyn AgentTo
 // Sequential execution
 // ============================================================================
 
-async fn exec_sequential(
-    current_context: &AgentContext,
-    tool_calls: &[AgentToolCall],
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    emit: &AgentEventSink,
-    signal: Option<CancellationToken>,
-) -> ToolBatch {
-    let mut finalized_calls: Vec<FinalizedToolCall> = vec![];
-    let mut messages: Vec<AgentMessage> = vec![];
+impl AgentLoop<'_> {
+    async fn exec_sequential(
+        &self,
+        current_context: &AgentContext,
+        tool_calls: &[AgentToolCall],
+        assistant_message: &AgentMessage,
+        signal: Option<CancellationToken>,
+    ) -> ToolBatch {
+        let mut finalized_calls: Vec<FinalizedToolCall> = vec![];
+        let mut messages: Vec<AgentMessage> = vec![];
 
-    for tool_call in tool_calls {
-        emit(AgentEvent::ToolExecutionStart {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            args: tool_call.arguments.clone(),
-        })
-        .await;
+        for tool_call in tool_calls {
+            self.emit(AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+            }).await;
 
-        let prep = prepare(current_context, tool_call, config, tools, signal.clone()).await;
-        let finalized = match prep {
-            PreparedToolCall::Immediate { tool_call, result, is_error } => {
-                FinalizedToolCall { tool_call, result, is_error }
-            }
-            PreparedToolCall::Ready { tool_call, tool, args } => {
-                let exec = run_tool(&tool, &tool_call, &args, emit, signal.clone()).await;
-                finalize(current_context, &tool_call, &args, exec, config, signal.clone()).await
-            }
-        };
+            let prep = self.prepare(current_context, tool_call, assistant_message, signal.clone()).await;
+            let finalized = match prep {
+                PreparedToolCall::Immediate { tool_call, result, is_error } => {
+                    FinalizedToolCall { tool_call, result, is_error }
+                }
+                PreparedToolCall::Ready { tool_call, tool, args } => {
+                    let exec = run_tool(&tool, &tool_call, &args, self.emit, signal.clone()).await;
+                    finalize(
+                        current_context, &tool_call, &args, exec, assistant_message,
+                        &self.config.after_tool_call, signal.clone(),
+                    ).await
+                }
+            };
 
-        emit_tool_end(&finalized, emit).await;
-        let msg = make_tool_result_msg(&finalized);
-        emit_tool_result_msg(&msg, emit).await;
-        finalized_calls.push(finalized);
-        messages.push(msg);
-    }
+            emit_tool_end(&finalized, self.emit).await;
+            let msg = make_tool_result_msg(&finalized);
+            emit_tool_result_msg(&msg, self.emit).await;
+            finalized_calls.push(finalized);
+            messages.push(msg);
+        }
 
-    ToolBatch {
-        messages,
-        terminate: should_terminate(&finalized_calls),
+        ToolBatch { messages, terminate: should_terminate(&finalized_calls) }
     }
 }
 
 // ============================================================================
-// Parallel execution
+// Parallel execution — preserve source order in result messages
 // ============================================================================
 
-async fn exec_parallel(
-    current_context: &AgentContext,
-    tool_calls: &[AgentToolCall],
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    emit: &AgentEventSink,
-    signal: Option<CancellationToken>,
-) -> ToolBatch {
-    // Phase 1: prepare all tools (sequential), emit start events
-    // Immediate results are finalized immediately, Ready results spawn async tasks
-    enum FinalizedEntry {
-        Immediate(FinalizedToolCall),
-        Deferred(tokio::task::JoinHandle<FinalizedToolCall>),
-    }
-
-    let mut entries: Vec<FinalizedEntry> = vec![];
-
-    for tool_call in tool_calls {
-        emit(AgentEvent::ToolExecutionStart {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            args: tool_call.arguments.clone(),
-        })
-        .await;
-
-        let prep = prepare(current_context, tool_call, config, tools, signal.clone()).await;
-
-        match prep {
-            PreparedToolCall::Immediate { tool_call, result, is_error } => {
-                // Immediate results: finalize and emit end immediately
-                let finalized = FinalizedToolCall { tool_call, result, is_error };
-                emit_tool_end(&finalized, emit).await;
-                entries.push(FinalizedEntry::Immediate(finalized));
-            }
-            PreparedToolCall::Ready { tool_call, tool, args } => {
-                // Ready results: spawn async task for parallel execution
-                let emit = emit.clone();
-                let sig = signal.clone();
-                let ctx = current_context.clone();
-                let cfg_after = config.after_tool_call.clone();
-
-                let handle = tokio::spawn(async move {
-                    let exec = run_tool(&tool, &tool_call, &args, &emit, sig.clone()).await;
-                    // Use full finalize with proper context (not finalize_simple)
-                    let finalized =
-                        finalize_with_hooks(&ctx, &tool_call, &args, exec, &cfg_after, sig).await;
-                    // Emit end in completion order (as tasks finish)
-                    emit_tool_end(&finalized, &emit).await;
-                    finalized
-                });
-
-                entries.push(FinalizedEntry::Deferred(handle));
-            }
+impl AgentLoop<'_> {
+    async fn exec_parallel(
+        &self,
+        current_context: &AgentContext,
+        tool_calls: &[AgentToolCall],
+        assistant_message: &AgentMessage,
+        signal: Option<CancellationToken>,
+    ) -> ToolBatch {
+        enum Entry {
+            Immediate(FinalizedToolCall),
+            Deferred(tokio::task::JoinHandle<FinalizedToolCall>),
         }
-    }
 
-    // Phase 2: await all deferred tasks (maintains source order in array)
-    let mut finalized_calls: Vec<FinalizedToolCall> = vec![];
-    for entry in entries {
-        match entry {
-            FinalizedEntry::Immediate(f) => finalized_calls.push(f),
-            FinalizedEntry::Deferred(handle) => {
-                if let Ok(f) = handle.await {
-                    finalized_calls.push(f);
+        let mut entries: Vec<Entry> = vec![];
+
+        for tool_call in tool_calls {
+            self.emit(AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+            }).await;
+
+            let prep = self.prepare(current_context, tool_call, assistant_message, signal.clone()).await;
+            match prep {
+                PreparedToolCall::Immediate { tool_call, result, is_error } => {
+                    let f = FinalizedToolCall { tool_call, result, is_error };
+                    emit_tool_end(&f, self.emit).await;
+                    entries.push(Entry::Immediate(f));
+                }
+                PreparedToolCall::Ready { tool_call, tool, args } => {
+                    let emit = self.emit.clone();
+                    let sig = signal.clone();
+                    let ctx = current_context.clone();
+                    let after = self.config.after_tool_call.clone();
+                    let assistant_msg = assistant_message.clone();
+                    let handle = tokio::spawn(async move {
+                        let exec = run_tool(&tool, &tool_call, &args, &emit, sig.clone()).await;
+                        let f = finalize(&ctx, &tool_call, &args, exec, &assistant_msg, &after, sig).await;
+                        emit_tool_end(&f, &emit).await;
+                        f
+                    });
+                    entries.push(Entry::Deferred(handle));
                 }
             }
         }
-    }
 
-    // Phase 3: emit tool result messages in source order
-    let mut messages = vec![];
-    for finalized in &finalized_calls {
-        let msg = make_tool_result_msg(finalized);
-        emit_tool_result_msg(&msg, emit).await;
-        messages.push(msg);
-    }
+        let mut finalized_calls: Vec<FinalizedToolCall> = vec![];
+        for entry in entries {
+            match entry {
+                Entry::Immediate(f) => finalized_calls.push(f),
+                Entry::Deferred(h) => {
+                    if let Ok(f) = h.await { finalized_calls.push(f); }
+                }
+            }
+        }
 
-    ToolBatch {
-        messages,
-        terminate: should_terminate(&finalized_calls),
+        let mut messages = vec![];
+        for f in &finalized_calls {
+            let msg = make_tool_result_msg(f);
+            emit_tool_result_msg(&msg, self.emit).await;
+            messages.push(msg);
+        }
+
+        ToolBatch { messages, terminate: should_terminate(&finalized_calls) }
     }
 }
 
 // ============================================================================
-// Tool preparation
+// Tool preparation, execution, finalization
 // ============================================================================
 
-async fn prepare(
-    current_context: &AgentContext,
-    tool_call: &AgentToolCall,
-    config: &AgentLoopConfig,
-    tools: &[Arc<dyn AgentTool>],
-    signal: Option<CancellationToken>,
-) -> PreparedToolCall {
-    let Some(tool) = find_tool(tools, &tool_call.name) else {
-        return PreparedToolCall::Immediate {
-            tool_call: tool_call.clone(),
-            result: AgentToolResult::error_text(format!("Tool {} not found", tool_call.name)),
-            is_error: true,
-        };
-    };
-
-    // Apply prepareArguments shim
-    let prepared_args = tool.prepare_arguments(tool_call.arguments.clone());
-
-    // Validate
-    let validated = match validate_tool_arguments(tool.as_ref(), prepared_args) {
-        Ok(args) => args,
-        Err(e) => {
+impl AgentLoop<'_> {
+    async fn prepare(
+        &self,
+        current_context: &AgentContext,
+        tool_call: &AgentToolCall,
+        assistant_message: &AgentMessage,
+        signal: Option<CancellationToken>,
+    ) -> PreparedToolCall {
+        let Some(tool) = find_tool(&current_context.tools, &tool_call.name) else {
             return PreparedToolCall::Immediate {
                 tool_call: tool_call.clone(),
-                result: AgentToolResult::error_text(e),
+                result: AgentToolResult::error_text(format!("Tool {} not found", tool_call.name)),
                 is_error: true,
             };
-        }
-    };
-
-    // Check beforeToolCall
-    if let Some(ref before_hook) = config.before_tool_call {
-        let hook_ctx = crate::types::BeforeToolCallContext {
-            assistant_message: serde_json::json!({}),
-            tool_call: tool_call.clone(),
-            args: validated.clone(),
-            context: current_context.clone(),
         };
-        if let Some(result) = before_hook(hook_ctx, signal.clone()).await {
-            if result.block {
+
+        let prepared_args = tool.prepare_arguments(tool_call.arguments.clone());
+        let validated = match validate_tool_arguments(tool.as_ref(), prepared_args) {
+            Ok(args) => args,
+            Err(e) => {
                 return PreparedToolCall::Immediate {
                     tool_call: tool_call.clone(),
-                    result: AgentToolResult::error_text(
-                        result.reason.unwrap_or_else(|| "Tool execution was blocked".to_string()),
-                    ),
+                    result: AgentToolResult::error_text(e),
                     is_error: true,
                 };
             }
-        }
-    }
+        };
 
-    PreparedToolCall::Ready {
-        tool_call: tool_call.clone(),
-        tool,
-        args: validated,
+        if let Some(ref before) = self.config.before_tool_call {
+            let ctx = BeforeToolCallContext {
+                assistant_message: assistant_message.clone(),
+                tool_call: tool_call.clone(),
+                args: validated.clone(),
+                context: current_context.clone(),
+            };
+            if let Some(result) = before(ctx, signal.clone()).await {
+                if result.block {
+                    return PreparedToolCall::Immediate {
+                        tool_call: tool_call.clone(),
+                        result: AgentToolResult::error_text(
+                            result.reason.unwrap_or_else(|| "Tool execution was blocked".into()),
+                        ),
+                        is_error: true,
+                    };
+                }
+            }
+        }
+
+        PreparedToolCall::Ready { tool_call: tool_call.clone(), tool, args: validated }
     }
 }
-
-// ============================================================================
-// Tool execution
-// ============================================================================
 
 async fn run_tool(
     tool: &Arc<dyn AgentTool>,
@@ -659,10 +653,9 @@ async fn run_tool(
     let tc_id = tool_call.id.clone();
     let tc_name = tool_call.name.clone();
     let tc_args = tool_call.arguments.clone();
-    let emit = emit.clone();
-
+    let emit_for_update = emit.clone();
     let on_update: Option<AgentToolUpdateCallback> = Some(Box::new(move |partial| {
-        let emit = emit.clone();
+        let emit = emit_for_update.clone();
         let id = tc_id.clone();
         let name = tc_name.clone();
         let args = tc_args.clone();
@@ -672,8 +665,7 @@ async fn run_tool(
                 tool_name: name,
                 args,
                 partial_result: serde_json::to_value(&partial.content).unwrap_or_default(),
-            })
-            .await;
+            }).await;
         });
     }));
 
@@ -686,105 +678,36 @@ async fn run_tool(
     }
 }
 
-// ============================================================================
-// Tool finalization
-// ============================================================================
-
 async fn finalize(
     current_context: &AgentContext,
     tool_call: &AgentToolCall,
     args: &serde_json::Value,
     executed: ExecutedToolCall,
-    config: &AgentLoopConfig,
+    assistant_message: &AgentMessage,
+    after_hook: &Option<AfterToolCallFn>,
     signal: Option<CancellationToken>,
 ) -> FinalizedToolCall {
     let mut result = executed.result;
     let mut is_error = executed.is_error;
 
-    if let Some(after_hook) = &config.after_tool_call {
-        let hook_ctx = AfterToolCallContext {
-            assistant_message: serde_json::json!({}),
+    if let Some(hook) = after_hook {
+        let ctx = AfterToolCallContext {
+            assistant_message: assistant_message.clone(),
             tool_call: tool_call.clone(),
             args: args.clone(),
             result: result.clone(),
             is_error,
             context: current_context.clone(),
         };
-        if let Some(override_result) = after_hook(hook_ctx, signal).await {
-            if let Some(content) = override_result.content {
-                result.content = content;
-            }
-            if let Some(details) = override_result.details {
-                result.details = details;
-            }
-            if let Some(ie) = override_result.is_error {
-                is_error = ie;
-            }
-            if let Some(term) = override_result.terminate {
-                result.terminate = term;
-            }
+        if let Some(over) = hook(ctx, signal).await {
+            if let Some(content) = over.content { result.content = content; }
+            if let Some(details) = over.details { result.details = details; }
+            if let Some(ie) = over.is_error { is_error = ie; }
+            if let Some(t) = over.terminate { result.terminate = t; }
         }
     }
 
-    FinalizedToolCall {
-        tool_call: tool_call.clone(),
-        result,
-        is_error,
-    }
-}
-
-/// Finalize with hooks for parallel execution (with proper context).
-async fn finalize_with_hooks(
-    current_context: &AgentContext,
-    tool_call: &AgentToolCall,
-    args: &serde_json::Value,
-    executed: ExecutedToolCall,
-    after_tool_call: &Option<
-        std::sync::Arc<
-            dyn Fn(
-                    AfterToolCallContext,
-                    Option<CancellationToken>,
-                ) -> Pin<
-                    Box<dyn Future<Output = Option<crate::types::AfterToolCallResult>> + Send>,
-                > + Send
-                + Sync,
-        >,
-    >,
-    signal: Option<CancellationToken>,
-) -> FinalizedToolCall {
-    let mut result = executed.result;
-    let mut is_error = executed.is_error;
-
-    if let Some(after_hook) = after_tool_call {
-        let hook_ctx = AfterToolCallContext {
-            assistant_message: serde_json::json!({}),
-            tool_call: tool_call.clone(),
-            args: args.clone(),
-            result: result.clone(),
-            is_error,
-            context: current_context.clone(),
-        };
-        if let Some(override_result) = after_hook(hook_ctx, signal).await {
-            if let Some(content) = override_result.content {
-                result.content = content;
-            }
-            if let Some(details) = override_result.details {
-                result.details = details;
-            }
-            if let Some(ie) = override_result.is_error {
-                is_error = ie;
-            }
-            if let Some(term) = override_result.terminate {
-                result.terminate = term;
-            }
-        }
-    }
-
-    FinalizedToolCall {
-        tool_call: tool_call.clone(),
-        result,
-        is_error,
-    }
+    FinalizedToolCall { tool_call: tool_call.clone(), result, is_error }
 }
 
 // ============================================================================
@@ -795,74 +718,63 @@ fn should_terminate(finalized: &[FinalizedToolCall]) -> bool {
     !finalized.is_empty() && finalized.iter().all(|f| f.result.terminate)
 }
 
-async fn emit_tool_end(finalized: &FinalizedToolCall, emit: &AgentEventSink) {
+async fn emit_tool_end(f: &FinalizedToolCall, emit: &AgentEventSink) {
     emit(AgentEvent::ToolExecutionEnd {
-        tool_call_id: finalized.tool_call.id.clone(),
-        tool_name: finalized.tool_call.name.clone(),
-        result: serde_json::to_value(&finalized.result).unwrap_or_default(),
-        is_error: finalized.is_error,
-    })
-    .await;
+        tool_call_id: f.tool_call.id.clone(),
+        tool_name: f.tool_call.name.clone(),
+        result: f.result.clone(),
+        is_error: f.is_error,
+    }).await;
 }
 
-fn make_tool_result_msg(finalized: &FinalizedToolCall) -> AgentMessage {
-    serde_json::json!({
-        "role": "toolResult",
-        "toolCallId": finalized.tool_call.id,
-        "toolName": finalized.tool_call.name,
-        "content": finalized.result.content,
-        "details": finalized.result.details,
-        "isError": finalized.is_error,
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    })
-}
-
-async fn emit_tool_result_msg(message: &AgentMessage, emit: &AgentEventSink) {
-    emit(AgentEvent::MessageStart { message: message.clone() }).await;
-    emit(AgentEvent::MessageEnd { message: message.clone() }).await;
-}
-
-fn make_failure_message(
-    model: &crate::types::ModelInfo,
-    stop_reason: &str,
-    error_message: Option<&str>,
-) -> AgentMessage {
-    serde_json::json!({
-        "role": "assistant",
-        "content": [{"type": "text", "text": ""}],
-        "api": model.api,
-        "provider": model.provider,
-        "model": model.id,
-        "usage": {
-            "input": 0, "output": 0,
-            "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
-        },
-        "stopReason": stop_reason,
-        "errorMessage": error_message.unwrap_or(""),
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    })
-}
-
-async fn get_steering_messages(config: &AgentLoopConfig, _skip: bool) -> Vec<AgentMessage> {
-    if let Some(ref getter) = config.get_steering_messages {
-        getter().await
-    } else {
-        vec![]
+fn make_tool_result_msg(f: &FinalizedToolCall) -> AgentMessage {
+    AgentMessage::ToolResult {
+        tool_call_id: f.tool_call.id.clone(),
+        tool_name: f.tool_call.name.clone(),
+        content: f.result.content.clone(),
+        details: serde_json::to_value(&f.result.details).ok(),
+        is_error: f.is_error,
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
     }
 }
 
-async fn get_follow_up_messages(config: &AgentLoopConfig) -> Vec<AgentMessage> {
-    if let Some(ref getter) = config.get_follow_up_messages {
-        getter().await
-    } else {
-        vec![]
+async fn emit_tool_result_msg(m: &AgentMessage, emit: &AgentEventSink) {
+    emit(AgentEvent::MessageStart { message: m.clone() }).await;
+    emit(AgentEvent::MessageEnd { message: m.clone() }).await;
+}
+
+fn make_failure_message(model: &ModelInfo, stop_reason: StopReason, error_message: Option<&str>) -> AgentMessage {
+    AgentMessage::Assistant {
+        content: vec![ContentBlock::Text { text: String::new() }],
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        usage: Usage::default(),
+        stop_reason,
+        error_message: error_message.map(|s| s.to_string()),
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+impl AgentLoop<'_> {
+    async fn drain_steer(&self) -> Vec<AgentMessage> {
+        if let Some(ref get) = self.config.get_steering_messages { get().await } else { vec![] }
+    }
+
+    async fn drain_follow_up(&self) -> Vec<AgentMessage> {
+        if let Some(ref get) = self.config.get_follow_up_messages { get().await } else { vec![] }
+    }
+}
+
+/// Build a `ToolDefinition` slice from the agent context. Useful when wiring
+/// up llm-client requests; kept here so the loop doesn't expose it on every path.
+pub fn tools_to_definitions(tools: &[Arc<dyn AgentTool>]) -> Vec<ToolDefinition> {
+    tools.iter().map(|t| ToolDefinition {
+        name: t.name().to_string(),
+        description: t.description().to_string(),
+        input_schema: t.parameters(),
+    }).collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -874,87 +786,16 @@ mod tests {
     }
 
     #[test]
-    fn test_should_terminate_all_true() {
-        let calls = vec![FinalizedToolCall {
-            tool_call: AgentToolCall {
-                id: "1".into(),
-                name: "t".into(),
-                arguments: serde_json::json!({}),
-            },
-            result: AgentToolResult {
-                content: vec![],
-                details: serde_json::Value::Null,
-                terminate: true,
-            },
-            is_error: false,
-        }];
-        assert!(should_terminate(&calls));
-    }
-
-    #[test]
-    fn test_should_terminate_mixed() {
-        let calls = vec![
-            FinalizedToolCall {
-                tool_call: AgentToolCall {
-                    id: "1".into(),
-                    name: "t1".into(),
-                    arguments: serde_json::json!({}),
-                },
-                result: AgentToolResult {
-                    content: vec![],
-                    details: serde_json::Value::Null,
-                    terminate: true,
-                },
-                is_error: false,
-            },
-            FinalizedToolCall {
-                tool_call: AgentToolCall {
-                    id: "2".into(),
-                    name: "t2".into(),
-                    arguments: serde_json::json!({}),
-                },
-                result: AgentToolResult {
-                    content: vec![],
-                    details: serde_json::Value::Null,
-                    terminate: false,
-                },
-                is_error: false,
-            },
-        ];
-        assert!(!should_terminate(&calls));
-    }
-
-    #[test]
-    fn test_make_tool_result_msg() {
-        use crate::types::ContentBlock;
-
-        let f = FinalizedToolCall {
-            tool_call: AgentToolCall {
-                id: "tc1".into(),
-                name: "bash".into(),
-                arguments: serde_json::json!({"command": "ls"}),
-            },
-            result: AgentToolResult {
-                content: vec![ContentBlock::Text { text: "output".into() }],
-                details: serde_json::Value::Null,
-                terminate: false,
-            },
-            is_error: false,
-        };
-        let msg = make_tool_result_msg(&f);
-        assert_eq!(msg["role"], "toolResult");
-        assert_eq!(msg["toolCallId"], "tc1");
-    }
-
-    #[test]
     fn test_extract_tool_calls() {
-        let msg = serde_json::json!({
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "Let me run that"},
-                {"type": "toolCall", "id": "tc1", "name": "bash", "arguments": {"command": "ls"}}
-            ]
-        });
+        let msg = AgentMessage::Assistant {
+            content: vec![
+                ContentBlock::Text { text: "x".into() },
+                ContentBlock::ToolCall { id: "tc1".into(), name: "bash".into(), arguments: serde_json::json!({}) },
+            ],
+            api: crate::types::Api::Anthropic, provider: "".into(), model: "".into(),
+            usage: Usage::default(), stop_reason: StopReason::EndTurn,
+            error_message: None, timestamp: 0,
+        };
         let calls = extract_tool_calls(&msg);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "bash");

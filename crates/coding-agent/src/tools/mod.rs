@@ -14,15 +14,15 @@ pub use bash::{
 pub use edit::{
     Edit, EditTool, EditToolDetails, EditToolOptions, LocalEditOperations, EditOperations,
     apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
-    normalize_to_lf, restore_line_endings, strip_bom,
+    generate_unified_patch, normalize_to_lf, restore_line_endings, strip_bom,
 };
-pub use find::FindTool;
-pub use grep::GrepTool;
-pub use ls::LsTool;
+pub use find::{FindTool, FindToolDetails};
+pub use grep::{GrepTool, GrepToolDetails};
+pub use ls::{LsTool, LsToolDetails};
 pub use read::{
-    ReadTool, ReadToolOptions, LocalReadOperations, ReadOperations,
-    truncate_head,
+    ImageDimensions, ReadTool, ReadToolDetails, ReadToolOptions, LocalReadOperations,
+    ReadOperations, truncate_head,
 };
 pub use write::{
-    WriteTool, WriteToolOptions, LocalWriteOperations, WriteOperations,
+    WriteTool, WriteToolDetails, WriteToolOptions, LocalWriteOperations, WriteOperations,
 };

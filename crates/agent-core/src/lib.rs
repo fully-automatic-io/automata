@@ -1,36 +1,41 @@
-// Agent Core - Core agent framework
-//
-// This crate provides the foundational types and traits for building AI agents.
+// Agent Core — foundational types and the low-level agent loop.
 
+pub mod agent;
 pub mod agent_loop;
 pub mod event;
-pub mod hooks;
-pub mod message;
+pub mod harness;
 pub mod proxy;
 pub mod queue;
 pub mod tool;
 pub mod types;
 
-// Re-export agent module (legacy compatibility wrapper)
-pub mod agent;
-pub use agent::Agent;
+// ============================================================================
+// Re-exports
+// ============================================================================
 
-pub use agent_loop::{run_agent_loop, run_agent_loop_continue, AgentEventSink};
+pub use agent::{Agent, AgentOptions, AgentSnapshot, PromptInput};
+pub use agent_loop::{
+    tools_to_definitions, AgentEventSink, AgentLoop, AssistantMessageEventStream, StreamFn,
+    StreamFnInput,
+};
 pub use event::{
-    AgentEvent, AgentEventListener, AgentEventReceiver, AgentEventChannel,
+    AgentEvent, AgentEventChannel, AgentEventListener, AgentEventReceiver,
     AssistantMessageEvent, EventStream, FnEventListener,
 };
-pub use hooks::{
-    AfterToolCallHook, BeforeToolCallHook, ConvertToLlmHook, DefaultConvertToLlmHook,
-    HookRegistry, TransformContextHook, default_convert_to_llm,
-};
-pub use message::{AgentMessage as AgentMessageTrait, MessageRole, StandardMessage};
+pub use harness::messages::{convert_to_llm, default_convert_to_llm};
 pub use queue::{MessageQueue, QueueMode};
-pub use tool::{AgentTool, ToolRegistry, create_error_tool_result, validate_tool_arguments};
+pub use tool::{
+    create_error_tool_result, create_success_tool_result, downcast_details,
+    validate_tool_arguments, AgentTool, ToolDefinitionWrapper, ToolRegistry,
+};
 pub use types::{
-    AgentContext, AgentLoopConfig, AgentMessage, AgentState, AgentToolCall, AgentToolResult,
-    AgentToolUpdateCallback, AfterToolCallContext, AfterToolCallResult,
-    BeforeToolCallContext, BeforeToolCallResult, ContentBlock, Cost, Message,
-    MessageContent, ModelInfo, StopReason, ThinkingBudgets, ThinkingLevel,
-    ToolExecutionMode, Transport, Usage,
+    AfterToolCallContext, AfterToolCallFn, AfterToolCallResult, AgentContext, AgentLoopConfig,
+    AgentMessage, AgentState, AgentToolCall, AgentToolResult, AgentToolUpdateCallback,
+    AnthropicOptions, Api, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult,
+    CacheRetention, ContentBlock, ContentPart, ConvertToLlmFn, Cost, GetApiKeyFn, GetMessagesFn,
+    LlmMessage, LlmRequest, LlmResponse, Message, MessageContent, Model, ModelCost, ModelInfo,
+    OnPayloadFn, OnResponseFn, OpenaiOptions, PrepareNextTurnContext, PrepareNextTurnFn,
+    ProviderOptions, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, SimpleStreamOptions,
+    StopReason, ThinkingBudgets, ThinkingLevel, ToolDefinition, ToolExecutionMode,
+    TransformContextFn, Transport, Usage, UsageCost,
 };

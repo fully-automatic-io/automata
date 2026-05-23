@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use unicode_normalization::UnicodeNormalization;
 
 // ============================================================================
 // Edit type
@@ -27,7 +28,10 @@ pub struct Edit {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EditToolDetails {
+    /// Display-oriented diff with line numbers
     pub diff: String,
+    /// Standard unified patch (git-applyable)
+    pub patch: String,
     #[serde(rename = "firstChangedLine", skip_serializing_if = "Option::is_none")]
     pub first_changed_line: Option<usize>,
 }
@@ -127,64 +131,97 @@ pub fn restore_line_endings(content: &str, ending: &str) -> String {
 
 /// Fuzzy normalize text for matching (handle Unicode variants)
 fn fuzzy_normalize(text: &str) -> String {
-    text
+    // NFKC normalization first (handles composed/decomposed Unicode variants)
+    let normalized: String = text.nfkc().collect();
+    normalized
         // Strip trailing whitespace from each line
         .lines()
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
         // Smart quotes to ASCII
-        .replace('\u{2018}', "'") // '
-        .replace('\u{2019}', "'") // '
-        .replace('\u{201C}', "\"") // "
-        .replace('\u{201D}', "\"") // "
+        .replace('\u{2018}', "'")
+        .replace('\u{2019}', "'")
+        .replace('\u{201C}', "\"")
+        .replace('\u{201D}', "\"")
         // Em/en dashes to ASCII
-        .replace('\u{2013}', "-") // –
-        .replace('\u{2014}', "-") // —
+        .replace('\u{2013}', "-")
+        .replace('\u{2014}', "-")
         // Special spaces to normal space
-        .replace('\u{00A0}', " ") // non-breaking space
-        .replace('\u{2009}', " ") // thin space
+        .replace('\u{00A0}', " ")
+        .replace('\u{2009}', " ")
 }
 
-/// Find text with fuzzy matching
+/// Find text with fuzzy matching, returns (byte_start, byte_end) in original content
 fn fuzzy_find_text(content: &str, search: &str) -> Option<(usize, usize)> {
     // Try exact match first
     if let Some(pos) = content.find(search) {
         return Some((pos, pos + search.len()));
     }
 
-    // Try fuzzy match
-    let normalized_content = fuzzy_normalize(content);
-    let normalized_search = fuzzy_normalize(search);
+    // Fuzzy match on normalized versions
+    let norm_content = fuzzy_normalize(content);
+    let norm_search = fuzzy_normalize(search);
 
-    if let Some(pos) = normalized_content.find(&normalized_search) {
-        // Map back to original position (approximate)
-        return Some((pos, pos + search.len()));
-    }
+    let match_byte_start = norm_content.find(&norm_search)?;
+    let match_byte_end = match_byte_start + norm_search.len();
 
-    None
+    // Map byte positions in normalized string back to char counts, then to original byte positions
+    let chars_before = norm_content[..match_byte_start].chars().count();
+    let chars_in_match = norm_content[match_byte_start..match_byte_end].chars().count();
+
+    let orig_start = content.char_indices().nth(chars_before).map(|(i, _)| i)?;
+    let orig_end = content
+        .char_indices()
+        .nth(chars_before + chars_in_match)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+
+    Some((orig_start, orig_end))
 }
 
-/// Check if oldText appears exactly once in content
-fn check_uniqueness(content: &str, old_text: &str) -> Result<(), String> {
+/// Count occurrences of `needle` in `haystack` (non-overlapping)
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
     let mut count = 0;
     let mut pos = 0;
-
-    while let Some(found) = content[pos..].find(old_text) {
+    while let Some(found) = haystack[pos..].find(needle) {
         count += 1;
-        pos += found + old_text.len();
+        pos += found + needle.len();
+    }
+    count
+}
 
-        if count > 1 {
-            return Err(format!(
-                "oldText appears {} times in the file. It must be unique. \
-                Please provide more context to make it unique.",
-                count
-            ));
-        }
+/// Check if oldText appears exactly once in content (with fuzzy fallback)
+fn check_uniqueness(content: &str, old_text: &str) -> Result<(), String> {
+    // Try exact match first
+    let exact_count = count_occurrences(content, old_text);
+    if exact_count == 1 {
+        return Ok(());
+    }
+    if exact_count > 1 {
+        return Err(format!(
+            "oldText appears {} times in the file. It must be unique. \
+            Please provide more context to make it unique.",
+            exact_count
+        ));
     }
 
-    if count == 0 {
+    // Fall back to fuzzy match — handles smart quotes, NFKC variants, etc.
+    let norm_content = fuzzy_normalize(content);
+    let norm_old = fuzzy_normalize(old_text);
+    let fuzzy_count = count_occurrences(&norm_content, &norm_old);
+
+    if fuzzy_count == 0 {
         Err("oldText not found in file".to_string())
+    } else if fuzzy_count > 1 {
+        Err(format!(
+            "oldText appears {} times in the file. It must be unique. \
+            Please provide more context to make it unique.",
+            fuzzy_count
+        ))
     } else {
         Ok(())
     }
@@ -259,6 +296,18 @@ pub fn generate_diff_string(old: &str, new: &str) -> (String, Option<usize>) {
     }
 
     (output, first_changed_line)
+}
+
+/// Generate a standard unified patch (git-applyable) using
+/// `similar::TextDiff::unified_diff()`.
+pub fn generate_unified_patch(path: &str, old: &str, new: &str, context_lines: usize) -> String {
+    let diff = TextDiff::from_lines(old, new);
+    let header_a = format!("a/{}", path);
+    let header_b = format!("b/{}", path);
+    diff.unified_diff()
+        .context_radius(context_lines)
+        .header(&header_a, &header_b)
+        .to_string()
 }
 
 // ============================================================================
@@ -492,8 +541,9 @@ impl AgentTool for EditTool {
                         as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
-            // Generate diff
+            // Generate diff (display) + unified patch (git-applyable)
             let (diff, first_changed_line) = generate_diff_string(&base, &new);
+            let patch = generate_unified_patch(&path, &base, &new, 4);
 
             Ok(AgentToolResult {
                 content: vec![ContentBlock::Text {
@@ -505,6 +555,7 @@ impl AgentTool for EditTool {
                 }],
                 details: serde_json::to_value(EditToolDetails {
                     diff,
+                    patch,
                     first_changed_line,
                 })
                 .unwrap_or_default(),
@@ -646,6 +697,15 @@ mod tests {
         assert!(diff.contains("-│b"));
         assert!(diff.contains("+│x"));
         assert_eq!(first, Some(2));
+    }
+
+    #[test]
+    fn test_generate_unified_patch_has_git_headers() {
+        let patch = generate_unified_patch("src/foo.rs", "a\nb\nc\n", "a\nx\nc\n", 4);
+        assert!(patch.contains("--- a/src/foo.rs"), "patch missing -- header: {}", patch);
+        assert!(patch.contains("+++ b/src/foo.rs"), "patch missing ++ header: {}", patch);
+        assert!(patch.contains("-b"));
+        assert!(patch.contains("+x"));
     }
 
     #[tokio::test]

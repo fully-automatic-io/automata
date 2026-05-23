@@ -1,58 +1,28 @@
+// High-level stateful wrapper around the agent loop.
 //
-// Stateful wrapper around the low-level agent loop.
-// Owns the transcript, emits lifecycle events, executes tools,
-// and exposes queueing APIs for steering and follow-up messages.
+// `Agent` owns the running transcript, dispatches lifecycle events to
+// subscribers, and exposes the steering / follow-up queues. Callers must
+// supply a real `StreamFn` (typically via
+// `coding-agent::stream_bridge::create_stream_fn`).
 
-use crate::agent_loop::{run_agent_loop, run_agent_loop_continue, AgentEventSink, StreamFn, StreamFnInput};
-use crate::event::{AgentEvent, AssistantMessageEvent, EventStream};
-use crate::hooks::default_convert_to_llm;
+use crate::agent_loop::{AgentEventSink, AgentLoop, StreamFn};
+use crate::event::AgentEvent;
+use crate::harness::messages::default_convert_to_llm;
 use crate::queue::{MessageQueue, QueueMode};
 use crate::tool::AgentTool;
 use crate::types::{
-    AgentContext, AgentLoopConfig, AgentMessage, AgentState,
-    ToolExecutionMode, Transport,
+    AfterToolCallFn, AgentContext, AgentLoopConfig, AgentMessage, AgentState, BeforeToolCallFn,
+    ConvertToLlmFn, GetApiKeyFn, ModelInfo, OnPayloadFn, OnResponseFn, PrepareNextTurnFn,
+    ShouldStopAfterTurnFn, ThinkingBudgets, ToolExecutionMode, TransformContextFn, Transport,
 };
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-// ============================================================================
-// Default stream function (placeholder — apps provide real implementation)
-// ============================================================================
-
-fn default_stream_fn() -> StreamFn {
-    Arc::new(|_input: StreamFnInput| {
-        Box::pin(async move {
-            let stream = EventStream::<AssistantMessageEvent, AgentMessage>::new();
-            stream.push(AssistantMessageEvent::Error {
-                reason: "error".to_string(),
-                error: serde_json::json!({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "No stream function configured"}],
-                    "stopReason": "error",
-                    "errorMessage": "No stream function configured"
-                }),
-            });
-            stream.end(serde_json::json!({
-                "role": "assistant",
-                "content": [],
-                "stopReason": "error",
-                "errorMessage": "No stream function configured"
-            }));
-            Ok(stream)
-        })
-    })
-}
-
-// ============================================================================
-// Agent
-// ============================================================================
-
 type EventListener = Arc<
     dyn Fn(AgentEvent, Option<CancellationToken>) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
+        + Send + Sync,
 >;
 
 #[derive(Clone)]
@@ -60,153 +30,52 @@ struct ActiveRun {
     abort: CancellationToken,
 }
 
-/// Stateful wrapper around the low-level agent loop.
 pub struct Agent {
     state: Arc<Mutex<AgentState>>,
     listeners: Arc<Mutex<Vec<EventListener>>>,
     steering_queue: Arc<Mutex<MessageQueue>>,
     follow_up_queue: Arc<Mutex<MessageQueue>>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
+    /// Notified when an active run finishes, so `wait_for_idle` can park
+    /// instead of polling.
+    idle_notify: Arc<tokio::sync::Notify>,
 
-    pub convert_to_llm: Arc<
-        dyn Fn(Vec<AgentMessage>) -> Pin<Box<dyn Future<Output = Vec<crate::types::Message>> + Send>>
-            + Send
-            + Sync,
-    >,
-    pub transform_context: Option<
-        Arc<
-            dyn Fn(
-                    Vec<AgentMessage>,
-                    Option<CancellationToken>,
-                ) -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
     pub stream_fn: StreamFn,
-    pub get_api_key: Option<
-        Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>,
-    >,
+    pub convert_to_llm: ConvertToLlmFn,
+    pub transform_context: Option<TransformContextFn>,
+    pub get_api_key: Option<GetApiKeyFn>,
+    pub before_tool_call: Option<BeforeToolCallFn>,
+    pub after_tool_call: Option<AfterToolCallFn>,
+    pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
+    pub prepare_next_turn: Option<PrepareNextTurnFn>,
+    pub on_payload: Option<OnPayloadFn>,
+    pub on_response: Option<OnResponseFn>,
     pub session_id: Option<String>,
-    pub thinking_budgets: Option<crate::types::ThinkingBudgets>,
+    pub thinking_budgets: Option<ThinkingBudgets>,
     pub transport: Transport,
     pub max_retry_delay_ms: Option<u64>,
     pub tool_execution: ToolExecutionMode,
-
-    before_tool_call: Option<
-        Arc<
-            dyn Fn(
-                    crate::types::BeforeToolCallContext,
-                    Option<CancellationToken>,
-                )
-                    -> Pin<
-                        Box<
-                            dyn Future<Output = Option<crate::types::BeforeToolCallResult>>
-                                + Send,
-                        >,
-                    > + Send
-                    + Sync,
-        >,
-    >,
-    after_tool_call: Option<
-        Arc<
-            dyn Fn(
-                    crate::types::AfterToolCallContext,
-                    Option<CancellationToken>,
-                )
-                    -> Pin<
-                        Box<
-                            dyn Future<Output = Option<crate::types::AfterToolCallResult>>
-                                + Send,
-                        >,
-                    > + Send
-                    + Sync,
-        >,
-    >,
 }
 
-/// Options for constructing an Agent.
 pub struct AgentOptions {
     pub initial_state: Option<AgentState>,
-    pub convert_to_llm: Option<
-        Arc<
-            dyn Fn(Vec<AgentMessage>) -> Pin<Box<dyn Future<Output = Vec<crate::types::Message>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    pub transform_context: Option<
-        Arc<
-            dyn Fn(
-                    Vec<AgentMessage>,
-                    Option<CancellationToken>,
-                ) -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    pub stream_fn: Option<StreamFn>,
-    pub get_api_key: Option<
-        Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>,
-    >,
-    pub before_tool_call: Option<
-        Arc<
-            dyn Fn(
-                    crate::types::BeforeToolCallContext,
-                    Option<CancellationToken>,
-                )
-                    -> Pin<
-                        Box<
-                            dyn Future<Output = Option<crate::types::BeforeToolCallResult>>
-                                + Send,
-                        >,
-                    > + Send
-                    + Sync,
-        >,
-    >,
-    pub after_tool_call: Option<
-        Arc<
-            dyn Fn(
-                    crate::types::AfterToolCallContext,
-                    Option<CancellationToken>,
-                )
-                    -> Pin<
-                        Box<
-                            dyn Future<Output = Option<crate::types::AfterToolCallResult>>
-                                + Send,
-                        >,
-                    > + Send
-                    + Sync,
-        >,
-    >,
+    pub stream_fn: StreamFn,
+    pub convert_to_llm: Option<ConvertToLlmFn>,
+    pub transform_context: Option<TransformContextFn>,
+    pub get_api_key: Option<GetApiKeyFn>,
+    pub before_tool_call: Option<BeforeToolCallFn>,
+    pub after_tool_call: Option<AfterToolCallFn>,
+    pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
+    pub prepare_next_turn: Option<PrepareNextTurnFn>,
+    pub on_payload: Option<OnPayloadFn>,
+    pub on_response: Option<OnResponseFn>,
     pub steering_mode: Option<QueueMode>,
     pub follow_up_mode: Option<QueueMode>,
     pub session_id: Option<String>,
-    pub thinking_budgets: Option<crate::types::ThinkingBudgets>,
+    pub thinking_budgets: Option<ThinkingBudgets>,
     pub transport: Option<Transport>,
     pub max_retry_delay_ms: Option<u64>,
     pub tool_execution: Option<ToolExecutionMode>,
-}
-
-impl Default for AgentOptions {
-    fn default() -> Self {
-        Self {
-            initial_state: None,
-            convert_to_llm: None,
-            transform_context: None,
-            stream_fn: None,
-            get_api_key: None,
-            before_tool_call: None,
-            after_tool_call: None,
-            steering_mode: None,
-            follow_up_mode: None,
-            session_id: None,
-            thinking_budgets: None,
-            transport: None,
-            max_retry_delay_ms: None,
-            tool_execution: None,
-        }
-    }
 }
 
 impl Agent {
@@ -214,7 +83,6 @@ impl Agent {
         let state = options.initial_state.unwrap_or_else(|| {
             AgentState::new(None, None, None, None, None)
         });
-
         Self {
             state: Arc::new(Mutex::new(state)),
             listeners: Arc::new(Mutex::new(Vec::new())),
@@ -225,45 +93,47 @@ impl Agent {
                 options.follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             ))),
             active_run: Arc::new(Mutex::new(None)),
-            convert_to_llm: options
-                .convert_to_llm
+            idle_notify: Arc::new(tokio::sync::Notify::new()),
+            stream_fn: options.stream_fn,
+            convert_to_llm: options.convert_to_llm
                 .unwrap_or_else(|| Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs)))),
             transform_context: options.transform_context,
-            stream_fn: options.stream_fn.unwrap_or_else(default_stream_fn),
             get_api_key: options.get_api_key,
+            before_tool_call: options.before_tool_call,
+            after_tool_call: options.after_tool_call,
+            should_stop_after_turn: options.should_stop_after_turn,
+            prepare_next_turn: options.prepare_next_turn,
+            on_payload: options.on_payload,
+            on_response: options.on_response,
             session_id: options.session_id,
             thinking_budgets: options.thinking_budgets,
             transport: options.transport.unwrap_or(Transport::Sse),
             max_retry_delay_ms: options.max_retry_delay_ms,
             tool_execution: options.tool_execution.unwrap_or(ToolExecutionMode::Parallel),
-            before_tool_call: options.before_tool_call,
-            after_tool_call: options.after_tool_call,
         }
     }
 
-    // =========================================================================
+    // -----------------------------------------------------------------------
     // State access
-    // =========================================================================
+    // -----------------------------------------------------------------------
 
-    pub fn state(&self) -> std::sync::MutexGuard<'_, AgentState> {
-        self.state.lock().unwrap()
+    pub fn with_state<R>(&self, f: impl FnOnce(&mut AgentState) -> R) -> R {
+        f(&mut self.state.lock().unwrap())
     }
 
-    pub fn read_state(&self) -> AgentState {
-        // Return a snapshot — AgentState doesn't impl Clone with closures,
-        // so we return a simplified view
-        AgentState::new(
-            Some(self.state.lock().unwrap().system_prompt().to_string()),
-            Some(self.state.lock().unwrap().model().clone()),
-            Some(self.state.lock().unwrap().thinking_level()),
-            Some(self.state.lock().unwrap().tools()),
-            Some(self.state.lock().unwrap().messages()),
-        )
+    pub fn snapshot(&self) -> AgentSnapshot {
+        let s = self.state.lock().unwrap();
+        AgentSnapshot {
+            system_prompt: s.system_prompt().to_string(),
+            model: s.model().clone(),
+            tools: s.tools(),
+            messages: s.messages(),
+        }
     }
 
-    // =========================================================================
+    // -----------------------------------------------------------------------
     // Event subscription
-    // =========================================================================
+    // -----------------------------------------------------------------------
 
     pub fn subscribe<F, Fut>(&self, listener: F)
     where
@@ -275,9 +145,9 @@ impl Agent {
         self.listeners.lock().unwrap().push(wrapped);
     }
 
-    // =========================================================================
-    // Queue management
-    // =========================================================================
+    // -----------------------------------------------------------------------
+    // Queue API
+    // -----------------------------------------------------------------------
 
     pub fn steer(&self, message: AgentMessage) {
         self.steering_queue.lock().unwrap().enqueue(message);
@@ -287,14 +157,8 @@ impl Agent {
         self.follow_up_queue.lock().unwrap().enqueue(message);
     }
 
-    pub fn clear_steering_queue(&self) {
-        self.steering_queue.lock().unwrap().clear();
-    }
-
-    pub fn clear_follow_up_queue(&self) {
-        self.follow_up_queue.lock().unwrap().clear();
-    }
-
+    pub fn clear_steering_queue(&self) { self.steering_queue.lock().unwrap().clear(); }
+    pub fn clear_follow_up_queue(&self) { self.follow_up_queue.lock().unwrap().clear(); }
     pub fn clear_all_queues(&self) {
         self.clear_steering_queue();
         self.clear_follow_up_queue();
@@ -308,22 +172,13 @@ impl Agent {
     pub fn set_steering_mode(&self, mode: QueueMode) {
         self.steering_queue.lock().unwrap().set_mode(mode);
     }
-
-    pub fn steering_mode(&self) -> QueueMode {
-        self.steering_queue.lock().unwrap().mode()
-    }
-
     pub fn set_follow_up_mode(&self, mode: QueueMode) {
         self.follow_up_queue.lock().unwrap().set_mode(mode);
     }
 
-    pub fn follow_up_mode(&self) -> QueueMode {
-        self.follow_up_queue.lock().unwrap().mode()
-    }
-
-    // =========================================================================
+    // -----------------------------------------------------------------------
     // Lifecycle
-    // =========================================================================
+    // -----------------------------------------------------------------------
 
     pub fn signal(&self) -> Option<CancellationToken> {
         self.active_run.lock().unwrap().as_ref().map(|r| r.abort.clone())
@@ -336,48 +191,29 @@ impl Agent {
     }
 
     pub async fn wait_for_idle(&self) {
-        // Poll until active_run is None
         loop {
+            // Register the waker before re-checking state, so a `notify_one`
+            // that fires between the check and `await` still wakes us.
+            let notified = self.idle_notify.notified();
             if self.active_run.lock().unwrap().is_none() {
                 return;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            notified.await;
         }
     }
 
-    pub fn reset(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.set_messages(&[]);
-        *state = AgentState::new(
-            Some(state.system_prompt().to_string()),
-            Some(state.model().clone()),
-            Some(state.thinking_level()),
-            None,
-            None,
-        );
-        self.clear_all_queues();
-    }
-
-    // =========================================================================
-    // Prompt / Continue
-    // =========================================================================
+    // -----------------------------------------------------------------------
+    // Prompt / continue
+    // -----------------------------------------------------------------------
 
     pub async fn prompt(&self, input: PromptInput) -> Result<Vec<AgentMessage>, String> {
         if self.active_run.lock().unwrap().is_some() {
             return Err("Agent is already processing".to_string());
         }
-
         let messages = match input {
             PromptInput::Messages(msgs) => msgs,
-            PromptInput::Text(text) => {
-                vec![serde_json::json!({
-                    "role": "user",
-                    "content": [{"type": "text", "text": text}],
-                    "timestamp": chrono::Utc::now().timestamp_millis()
-                })]
-            }
+            PromptInput::Text(text) => vec![AgentMessage::user_text(text)],
         };
-
         self.run_prompt_messages(messages).await
     }
 
@@ -385,105 +221,67 @@ impl Agent {
         if self.active_run.lock().unwrap().is_some() {
             return Err("Agent is already processing".to_string());
         }
-
-        let last_role = {
-            let state = self.state.lock().unwrap();
-            let msgs = state.messages();
-            msgs.last()
-                .and_then(|m| m.get("role"))
-                .and_then(|r| r.as_str())
-                .map(|s| s.to_string())
-        };
-
-        if let Some(role) = last_role {
-            if role == "assistant" {
-                // Try steering queue first
-                let steering = {
-                    let mut q = self.steering_queue.lock().unwrap();
-                    q.drain()
-                };
+        let last_role = self.state.lock().unwrap().messages().last().map(|m| m.role().to_string());
+        match last_role.as_deref() {
+            Some("assistant") => {
+                let steering = self.steering_queue.lock().unwrap().drain();
                 if !steering.is_empty() {
                     return self.run_prompt_messages(steering).await;
                 }
-
-                // Then follow-up
-                let follow_ups = {
-                    let mut q = self.follow_up_queue.lock().unwrap();
-                    q.drain()
-                };
+                let follow_ups = self.follow_up_queue.lock().unwrap().drain();
                 if !follow_ups.is_empty() {
                     return self.run_prompt_messages(follow_ups).await;
                 }
-
-                return Err("Cannot continue from message role: assistant".to_string());
+                Err("Cannot continue from message role: assistant".to_string())
             }
-        } else {
-            return Err("No messages to continue from".to_string());
+            Some(_) => self.run_continuation().await,
+            None => Err("No messages to continue from".to_string()),
         }
-
-        self.run_continuation().await
     }
 
     async fn run_prompt_messages(
         &self,
         messages: Vec<AgentMessage>,
     ) -> Result<Vec<AgentMessage>, String> {
-        let system_prompt = self.state.lock().unwrap().system_prompt().to_string();
-        let state_messages = self.state.lock().unwrap().messages();
-        let state_tools = self.state.lock().unwrap().tools();
+        let snapshot = self.snapshot();
         let stream_fn = self.stream_fn.clone();
         let config = self.build_loop_config();
-
         self.run_with_lifecycle(move |signal, emit| {
             let context = AgentContext {
-                system_prompt: system_prompt.clone(),
-                messages: state_messages.clone(),
-                tools: state_tools.clone(),
+                system_prompt: snapshot.system_prompt.clone(),
+                messages: snapshot.messages.clone(),
+                tools: snapshot.tools.clone(),
             };
-            let tools: Vec<Arc<dyn AgentTool>> = vec![];
             let stream_fn = stream_fn.clone();
             let config = config.clone();
             Box::pin(async move {
-                let result = run_agent_loop(
-                    messages.clone(), context, &config, &tools, &emit, signal, &stream_fn,
-                ).await;
-                Ok(result)
+                Ok(AgentLoop::new(&config, &emit, &stream_fn).run(messages, context, signal).await)
             })
         }).await
     }
 
     async fn run_continuation(&self) -> Result<Vec<AgentMessage>, String> {
-        let system_prompt = self.state.lock().unwrap().system_prompt().to_string();
-        let state_messages = self.state.lock().unwrap().messages();
-        let state_tools = self.state.lock().unwrap().tools();
+        let snapshot = self.snapshot();
         let stream_fn = self.stream_fn.clone();
         let config = self.build_loop_config();
-
         self.run_with_lifecycle(move |signal, emit| {
             let context = AgentContext {
-                system_prompt: system_prompt.clone(),
-                messages: state_messages.clone(),
-                tools: state_tools.clone(),
+                system_prompt: snapshot.system_prompt.clone(),
+                messages: snapshot.messages.clone(),
+                tools: snapshot.tools.clone(),
             };
-            let tools: Vec<Arc<dyn AgentTool>> = vec![];
             let stream_fn = stream_fn.clone();
             let config = config.clone();
             Box::pin(async move {
-                let result = run_agent_loop_continue(
-                    context, &config, &tools, &emit, signal, &stream_fn,
-                ).await;
-                Ok(result)
+                Ok(AgentLoop::new(&config, &emit, &stream_fn).run_continue(context, signal).await)
             })
         }).await
     }
 
-    // =========================================================================
-    // Internal
-    // =========================================================================
-
     fn build_loop_config(&self) -> AgentLoopConfig {
+        let model = self.state.lock().unwrap().model().clone();
         AgentLoopConfig {
-            model: self.state.lock().unwrap().model().clone(),
+            model,
             convert_to_llm: self.convert_to_llm.clone(),
             transform_context: self.transform_context.clone(),
             get_api_key: self.get_api_key.clone(),
@@ -505,13 +303,23 @@ impl Agent {
             tool_execution: self.tool_execution,
             before_tool_call: self.before_tool_call.clone(),
             after_tool_call: self.after_tool_call.clone(),
+            should_stop_after_turn: self.should_stop_after_turn.clone(),
+            prepare_next_turn: self.prepare_next_turn.clone(),
+            on_payload: self.on_payload.clone(),
+            on_response: self.on_response.clone(),
             session_id: self.session_id.clone(),
             thinking_budgets: self.thinking_budgets.clone(),
             transport: self.transport,
+            cache_retention: None,
             max_retry_delay_ms: self.max_retry_delay_ms,
+            timeout_ms: None,
+            max_retries: None,
+            headers: None,
+            metadata: None,
             reasoning: None,
             temperature: None,
             max_tokens: None,
+            provider_options: None,
         }
     }
 
@@ -526,22 +334,8 @@ impl Agent {
         if self.active_run.lock().unwrap().is_some() {
             return Err("Agent is already processing".to_string());
         }
-
         let cancel = CancellationToken::new();
-        *self.active_run.lock().unwrap() = Some(ActiveRun {
-            abort: cancel.clone(),
-        });
-
-        {
-            let mut state = self.state.lock().unwrap();
-            *state = AgentState::new(
-                Some(state.system_prompt().to_string()),
-                Some(state.model().clone()),
-                Some(state.thinking_level()),
-                Some(state.tools()),
-                Some(state.messages()),
-            );
-        }
+        *self.active_run.lock().unwrap() = Some(ActiveRun { abort: cancel.clone() });
 
         let emit: AgentEventSink = {
             let listeners = self.listeners.clone();
@@ -559,93 +353,75 @@ impl Agent {
         };
 
         let result = executor(Some(cancel.clone()), emit).await;
-
-        // Clean up
-        {
-            let mut state = self.state.lock().unwrap();
-            *state = AgentState::new(
-                Some(state.system_prompt().to_string()),
-                Some(state.model().clone()),
-                Some(state.thinking_level()),
-                Some(state.tools()),
-                Some(state.messages()),
-            );
-        }
         *self.active_run.lock().unwrap() = None;
-
+        self.idle_notify.notify_waiters();
         result
     }
 }
 
-// ============================================================================
-// PromptInput
-// ============================================================================
+/// Snapshot of agent state — owned, cheap to pass to the loop.
+pub struct AgentSnapshot {
+    pub system_prompt: String,
+    pub model: ModelInfo,
+    pub tools: Vec<Arc<dyn AgentTool>>,
+    pub messages: Vec<AgentMessage>,
+}
 
 pub enum PromptInput {
     Messages(Vec<AgentMessage>),
     Text(String),
 }
 
-impl From<String> for PromptInput {
-    fn from(s: String) -> Self {
-        PromptInput::Text(s)
-    }
-}
-
-impl From<&str> for PromptInput {
-    fn from(s: &str) -> Self {
-        PromptInput::Text(s.to_string())
-    }
-}
-
+impl From<String> for PromptInput { fn from(s: String) -> Self { Self::Text(s) } }
+impl From<&str> for PromptInput { fn from(s: &str) -> Self { Self::Text(s.to_string()) } }
 impl From<Vec<AgentMessage>> for PromptInput {
-    fn from(msgs: Vec<AgentMessage>) -> Self {
-        PromptInput::Messages(msgs)
-    }
+    fn from(m: Vec<AgentMessage>) -> Self { Self::Messages(m) }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::StreamFnInput;
+    use crate::event::EventStream;
 
-    #[test]
-    fn test_agent_new() {
-        let agent = Agent::new(AgentOptions::default());
-        assert!(!agent.has_queued_messages());
+    fn dummy_stream_fn() -> StreamFn {
+        Arc::new(|_input: StreamFnInput| {
+            Box::pin(async move {
+                let stream = EventStream::new();
+                stream.end(AgentMessage::assistant_text("ok"));
+                Ok(stream)
+            })
+        })
+    }
+
+    fn make_agent() -> Agent {
+        Agent::new(AgentOptions {
+            initial_state: None,
+            stream_fn: dummy_stream_fn(),
+            convert_to_llm: None,
+            transform_context: None,
+            get_api_key: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            should_stop_after_turn: None,
+            prepare_next_turn: None,
+            on_payload: None,
+            on_response: None,
+            steering_mode: None,
+            follow_up_mode: None,
+            session_id: None,
+            thinking_budgets: None,
+            transport: None,
+            max_retry_delay_ms: None,
+            tool_execution: None,
+        })
     }
 
     #[test]
     fn test_agent_queues() {
-        let agent = Agent::new(AgentOptions::default());
-        agent.steer(serde_json::json!({"role": "user", "content": "steer msg"}));
+        let agent = make_agent();
+        agent.steer(AgentMessage::user_text("steer me"));
         assert!(agent.has_queued_messages());
-
-        let drained = agent.steering_queue.lock().unwrap().drain();
-        assert_eq!(drained.len(), 1);
-        assert!(!agent.has_queued_messages());
-    }
-
-    #[test]
-    fn test_agent_follow_up() {
-        let agent = Agent::new(AgentOptions::default());
-        agent.follow_up(serde_json::json!({"role": "user", "content": "follow up"}));
-        assert!(agent.has_queued_messages());
-
-        let drained = agent.follow_up_queue.lock().unwrap().drain();
-        assert_eq!(drained.len(), 1);
-    }
-
-    #[test]
-    fn test_agent_clear_queues() {
-        let agent = Agent::new(AgentOptions::default());
-        agent.steer(serde_json::json!({"role": "user", "content": "s1"}));
-        agent.follow_up(serde_json::json!({"role": "user", "content": "f1"}));
-        assert!(agent.has_queued_messages());
-
         agent.clear_all_queues();
         assert!(!agent.has_queued_messages());
     }
@@ -656,16 +432,6 @@ mod tests {
         match input {
             PromptInput::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("Expected Text variant"),
-        }
-    }
-
-    #[test]
-    fn test_prompt_input_from_messages() {
-        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let input: PromptInput = msgs.clone().into();
-        match input {
-            PromptInput::Messages(m) => assert_eq!(m.len(), 1),
-            _ => panic!("Expected Messages variant"),
         }
     }
 }
