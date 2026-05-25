@@ -12,7 +12,6 @@ use crate::types::{
     ContentPart, LlmMessage, LlmRequest, LlmResponse, MessageContent, StopReason, Usage,
 };
 use async_trait::async_trait;
-use futures::stream;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -202,17 +201,204 @@ impl LlmProvider for OpenAIResponsesProvider {
     }
 
     async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
-        // Streaming will be added when the agent loop migrates to consume the
-        // Responses event format. For now we expose a non-streaming wrapper so
-        // callers can use complete() and still receive an LlmStream-compatible
-        // single-shot terminal event.
-        let resp = self.complete(request).await?;
-        let events = vec![
-            Ok(LlmEvent::MessageStart { id: resp.id.clone(), model: resp.model.clone() }),
-            Ok(LlmEvent::MessageStop),
-        ];
-        Ok(Box::pin(stream::iter(events)))
+        use eventsource_stream::Eventsource;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let body = self.build_body(&request, true);
+        let resp = self.send_with_retry(body).await?;
+
+        let state = Arc::new(Mutex::new(TranslateState {
+            current_index: 0,
+            current_kind: BlockKind::None,
+            tool_buf: String::new(),
+        }));
+
+        let byte_stream = resp.bytes_stream();
+        let sse = byte_stream.eventsource();
+        let stream = futures::StreamExt::flat_map(sse, move |result| {
+            let state = state.clone();
+            futures::stream::once(async move { translate_event(result, state).await })
+        });
+        let stream = futures::StreamExt::flat_map(stream, futures::stream::iter);
+
+        Ok(Box::pin(stream))
     }
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum BlockKind { None, Text, Thinking, ToolCall }
+
+struct TranslateState {
+    current_index: usize,
+    current_kind: BlockKind,
+    tool_buf: String,
+}
+
+async fn translate_event(
+    result: Result<eventsource_stream::Event, eventsource_stream::EventStreamError<reqwest::Error>>,
+    state: std::sync::Arc<tokio::sync::Mutex<TranslateState>>,
+) -> Vec<Result<LlmEvent, LlmError>> {
+    use crate::streaming::Delta;
+    use crate::types::ContentBlock;
+
+    let event = match result {
+        Ok(e) => e,
+        Err(e) => return vec![Err(LlmError::StreamError(e.to_string()))],
+    };
+    if event.data == "[DONE]" {
+        return vec![Ok(LlmEvent::MessageStop)];
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&event.data) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut out: Vec<Result<LlmEvent, LlmError>> = Vec::new();
+    let mut s = state.lock().await;
+
+    match event.event.as_str() {
+        "response.created" => {
+            if let Some(resp) = payload.get("response") {
+                let id = resp.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let model = resp.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                out.push(Ok(LlmEvent::MessageStart { id, model }));
+            }
+        }
+        "response.output_item.added" => {
+            let item = match payload.get("item") {
+                Some(v) => v,
+                None => return out,
+            };
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            s.current_index = payload.get("output_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(s.current_index);
+            match item_type {
+                "reasoning" => {
+                    s.current_kind = BlockKind::Thinking;
+                    out.push(Ok(LlmEvent::ContentBlockStart {
+                        index: s.current_index,
+                        content_block: ContentBlock::Thinking { thinking: String::new() },
+                    }));
+                }
+                "message" => {
+                    s.current_kind = BlockKind::Text;
+                    out.push(Ok(LlmEvent::ContentBlockStart {
+                        index: s.current_index,
+                        content_block: ContentBlock::Text { text: String::new() },
+                    }));
+                }
+                "function_call" => {
+                    s.current_kind = BlockKind::ToolCall;
+                    s.tool_buf.clear();
+                    let id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    out.push(Ok(LlmEvent::ContentBlockStart {
+                        index: s.current_index,
+                        content_block: ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments: serde_json::json!({}),
+                        },
+                    }));
+                }
+                _ => {}
+            }
+        }
+        "response.output_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta" => {
+            let delta_text = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if delta_text.is_empty() {
+                return out;
+            }
+            let delta = if matches!(s.current_kind, BlockKind::Thinking) {
+                Delta::ThinkingDelta { thinking: delta_text }
+            } else {
+                Delta::TextDelta { text: delta_text }
+            };
+            out.push(Ok(LlmEvent::ContentBlockDelta { index: s.current_index, delta }));
+        }
+        "response.function_call_arguments.delta" => {
+            let delta_text = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !delta_text.is_empty() {
+                s.tool_buf.push_str(&delta_text);
+                out.push(Ok(LlmEvent::ContentBlockDelta {
+                    index: s.current_index,
+                    delta: Delta::InputJsonDelta { partial_json: delta_text },
+                }));
+            }
+        }
+        "response.function_call_arguments.done" => {
+            if let Some(full) = payload.get("arguments").and_then(|v| v.as_str()) {
+                if full.starts_with(&s.tool_buf) && full.len() > s.tool_buf.len() {
+                    let tail = full[s.tool_buf.len()..].to_string();
+                    out.push(Ok(LlmEvent::ContentBlockDelta {
+                        index: s.current_index,
+                        delta: Delta::InputJsonDelta { partial_json: tail },
+                    }));
+                }
+            }
+        }
+        "response.output_item.done" => {
+            out.push(Ok(LlmEvent::ContentBlockStop { index: s.current_index }));
+            s.current_kind = BlockKind::None;
+        }
+        "response.completed" => {
+            let usage = payload.get("response").and_then(|r| r.get("usage")).map(|u| {
+                let cache_read = u.get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let input_total = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                Usage {
+                    input: input_total.saturating_sub(cache_read),
+                    output: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    cache_read,
+                    cache_write: 0,
+                    total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    cost: Default::default(),
+                }
+            });
+            let resp = payload.get("response");
+            let status = resp.and_then(|r| r.get("status")).and_then(|v| v.as_str()).unwrap_or("");
+            let stop_reason = if status == "incomplete" {
+                Some(StopReason::MaxTokens)
+            } else {
+                let has_tool = resp
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                    .map(|arr| arr.iter().any(|v| v.get("type").and_then(|t| t.as_str()) == Some("function_call")))
+                    .unwrap_or(false);
+                Some(if has_tool { StopReason::ToolUse } else { StopReason::EndTurn })
+            };
+            out.push(Ok(LlmEvent::MessageDelta {
+                delta: crate::streaming::MessageDelta { stop_reason, stop_sequence: None },
+                usage,
+            }));
+            out.push(Ok(LlmEvent::MessageStop));
+        }
+        "response.failed" | "error" => {
+            let msg = payload
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .or_else(|| payload.get("error").and_then(|e| e.get("message")).and_then(|v| v.as_str()))
+                .unwrap_or("Responses API error")
+                .to_string();
+            out.push(Ok(LlmEvent::Error {
+                error: crate::streaming::StreamError {
+                    error_type: "responses_error".into(),
+                    message: msg,
+                },
+            }));
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Convert one of our `LlmMessage`s into zero or more Responses-API input items.
@@ -453,6 +639,198 @@ mod tests {
             assert_eq!(thinking, "thinking...");
         } else {
             panic!("expected Thinking");
+        }
+    }
+
+    // ── streaming-translation tests ──
+    use eventsource_stream::Event;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn ev(name: &str, json: serde_json::Value) -> Result<Event, eventsource_stream::EventStreamError<reqwest::Error>> {
+        Ok(Event {
+            event: name.into(),
+            data: serde_json::to_string(&json).unwrap(),
+            id: String::new(),
+            retry: None,
+        })
+    }
+
+    fn fresh_state() -> Arc<Mutex<TranslateState>> {
+        Arc::new(Mutex::new(TranslateState {
+            current_index: 0,
+            current_kind: BlockKind::None,
+            tool_buf: String::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn translate_response_created_emits_message_start() {
+        let s = fresh_state();
+        let evs = translate_event(
+            ev("response.created", serde_json::json!({"response": {"id": "r1", "model": "gpt-5"}})),
+            s,
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::MessageStart { id, model }) => {
+                assert_eq!(id, "r1");
+                assert_eq!(model, "gpt-5");
+            }
+            _ => panic!("expected MessageStart, got {:?}", evs[0]),
+        }
+    }
+
+    #[tokio::test]
+    async fn translate_text_block_lifecycle() {
+        let s = fresh_state();
+        // item.added (message)
+        let _ = translate_event(
+            ev("response.output_item.added", serde_json::json!({
+                "output_index": 0, "item": {"type": "message"}
+            })),
+            s.clone(),
+        ).await;
+        // delta
+        let evs = translate_event(
+            ev("response.output_text.delta", serde_json::json!({"delta": "Hi "})),
+            s.clone(),
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::ContentBlockDelta { index: 0, delta: crate::streaming::Delta::TextDelta { text } }) => {
+                assert_eq!(text, "Hi ");
+            }
+            _ => panic!("expected TextDelta, got {:?}", evs[0]),
+        }
+        // item.done
+        let evs = translate_event(
+            ev("response.output_item.done", serde_json::json!({"item": {"type": "message"}})),
+            s.clone(),
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::ContentBlockStop { index: 0 }) => {}
+            _ => panic!("expected ContentBlockStop, got {:?}", evs[0]),
+        }
+    }
+
+    #[tokio::test]
+    async fn translate_tool_call_args_streaming() {
+        let s = fresh_state();
+        let _ = translate_event(
+            ev("response.output_item.added", serde_json::json!({
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "tc1", "name": "bash"}
+            })),
+            s.clone(),
+        ).await;
+        let evs = translate_event(
+            ev("response.function_call_arguments.delta", serde_json::json!({"delta": "{\"cmd"})),
+            s.clone(),
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::ContentBlockDelta { delta: crate::streaming::Delta::InputJsonDelta { partial_json }, .. }) => {
+                assert_eq!(partial_json, "{\"cmd");
+            }
+            _ => panic!("expected InputJsonDelta, got {:?}", evs[0]),
+        }
+        // .done with the canonical full string emits any tail delta only.
+        let evs = translate_event(
+            ev("response.function_call_arguments.done", serde_json::json!({"arguments": "{\"cmd\":\"ls\"}"})),
+            s.clone(),
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::ContentBlockDelta { delta: crate::streaming::Delta::InputJsonDelta { partial_json }, .. }) => {
+                assert_eq!(partial_json, "\":\"ls\"}");
+            }
+            _ => panic!("expected tail InputJsonDelta, got {:?}", evs[0]),
+        }
+    }
+
+    #[tokio::test]
+    async fn translate_response_completed_emits_usage_and_stop() {
+        let s = fresh_state();
+        let evs = translate_event(
+            ev("response.completed", serde_json::json!({
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "total_tokens": 150,
+                        "input_tokens_details": {"cached_tokens": 30}
+                    },
+                    "output": [{"type": "message"}]
+                }
+            })),
+            s,
+        ).await;
+        // First event: MessageDelta with usage.
+        match &evs[0] {
+            Ok(LlmEvent::MessageDelta { delta, usage }) => {
+                assert_eq!(delta.stop_reason, Some(StopReason::EndTurn));
+                let u = usage.as_ref().unwrap();
+                assert_eq!(u.input, 70);  // 100 - 30 cached
+                assert_eq!(u.output, 50);
+                assert_eq!(u.cache_read, 30);
+                assert_eq!(u.total_tokens, 150);
+            }
+            _ => panic!("expected MessageDelta, got {:?}", evs[0]),
+        }
+        // Second event: MessageStop.
+        match &evs[1] {
+            Ok(LlmEvent::MessageStop) => {}
+            _ => panic!("expected MessageStop, got {:?}", evs[1]),
+        }
+    }
+
+    #[tokio::test]
+    async fn translate_tool_use_stop_reason() {
+        let s = fresh_state();
+        let evs = translate_event(
+            ev("response.completed", serde_json::json!({
+                "response": {
+                    "status": "completed",
+                    "output": [{"type": "function_call"}]
+                }
+            })),
+            s,
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::MessageDelta { delta, .. }) => {
+                assert_eq!(delta.stop_reason, Some(StopReason::ToolUse));
+            }
+            _ => panic!("expected MessageDelta with ToolUse"),
+        }
+    }
+
+    #[tokio::test]
+    async fn translate_response_incomplete_maps_to_max_tokens() {
+        let s = fresh_state();
+        let evs = translate_event(
+            ev("response.completed", serde_json::json!({
+                "response": {"status": "incomplete", "output": []}
+            })),
+            s,
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::MessageDelta { delta, .. }) => {
+                assert_eq!(delta.stop_reason, Some(StopReason::MaxTokens));
+            }
+            _ => panic!("expected MessageDelta with MaxTokens"),
+        }
+    }
+
+    #[tokio::test]
+    async fn translate_response_failed_emits_error() {
+        let s = fresh_state();
+        let evs = translate_event(
+            ev("response.failed", serde_json::json!({
+                "response": {"error": {"message": "boom"}}
+            })),
+            s,
+        ).await;
+        match &evs[0] {
+            Ok(LlmEvent::Error { error }) => assert_eq!(error.message, "boom"),
+            _ => panic!("expected Error, got {:?}", evs[0]),
         }
     }
 }

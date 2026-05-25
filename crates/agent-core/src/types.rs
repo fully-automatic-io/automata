@@ -681,7 +681,14 @@ pub struct AnthropicOptions {
 /// Provider-specific knobs OpenAI providers respect. Reserved for future
 /// use; empty for now.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct OpenaiOptions {}
+pub struct OpenaiOptions {
+    /// Use Anthropic-style `cache_control: {type: "ephemeral"}` inline cache
+    /// hints instead of the native `prompt_cache_retention` parameter. Set
+    /// for OpenAI-compatible endpoints that proxy to Anthropic (DeepSeek,
+    /// Cloudflare Workers AI, Together AI, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "anthropicCacheControl")]
+    pub anthropic_cache_control: Option<bool>,
+}
 
 impl LlmRequest {
     pub fn new(model: impl Into<String>, messages: Vec<AgentMessage>) -> Self {

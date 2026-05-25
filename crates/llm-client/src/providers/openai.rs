@@ -1,7 +1,10 @@
 
 use crate::provider::{LlmError, LlmProvider, LlmStream, ProviderConfig};
 use crate::streaming::{Delta, LlmEvent};
-use crate::types::{ContentPart, LlmMessage, LlmRequest, LlmResponse, StopReason, Usage, MessageContent};
+use crate::types::{
+    CacheRetention, ContentPart, LlmMessage, LlmRequest, LlmResponse, MessageContent, StopReason,
+    Usage,
+};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -78,6 +81,30 @@ impl OpenAIProvider {
             body["reasoning_effort"] = json!(eff);
         }
 
+        // Prompt-cache control:
+        //   - native OpenAI: top-level `prompt_cache_retention: "24h"` for long cache
+        //   - Anthropic-compat aliases (set via OpenaiOptions): inject inline
+        //     `cache_control: {type: "ephemeral", ttl?: "1h"}` on system / last
+        //     tool / last user message
+        if let Some(retention) = request.cache_retention {
+            if retention != CacheRetention::None {
+                let use_anthropic_style = request
+                    .openai_options()
+                    .and_then(|o| o.anthropic_cache_control)
+                    .unwrap_or(false);
+                if use_anthropic_style {
+                    let cache_control = match retention {
+                        CacheRetention::Long => json!({"type": "ephemeral", "ttl": "1h"}),
+                        CacheRetention::Short => json!({"type": "ephemeral"}),
+                        CacheRetention::None => json!(null),
+                    };
+                    apply_anthropic_cache_control(&mut body, &cache_control);
+                } else if retention == CacheRetention::Long {
+                    body["prompt_cache_retention"] = json!("24h");
+                }
+            }
+        }
+
         body
     }
 
@@ -131,6 +158,66 @@ impl OpenAIProvider {
             }
         }
         Err(last_err.unwrap_or(LlmError::Other("retry exhausted".into())))
+    }
+}
+
+/// Apply Anthropic-style `cache_control` hints to an OpenAI Chat Completions
+/// request body. Inserts on the system message (text content), the last tool
+/// definition, and the last user / assistant turn — matching pi-mono's
+/// `applyAnthropicCacheControl`.
+fn apply_anthropic_cache_control(body: &mut serde_json::Value, cache_control: &serde_json::Value) {
+    // 1. System (or developer) message — promote string content to an array
+    //    of `{type: "text", text, cache_control}` parts.
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role == "system" || role == "developer" {
+                attach_cache_to_text_content(msg, cache_control);
+                break;
+            }
+        }
+        // 2. Last user/assistant turn.
+        for msg in messages.iter_mut().rev() {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role == "user" || role == "assistant" {
+                attach_cache_to_text_content(msg, cache_control);
+                break;
+            }
+        }
+    }
+    // 3. Last tool definition.
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        if let Some(last) = tools.last_mut() {
+            if let Some(obj) = last.as_object_mut() {
+                obj.insert("cache_control".into(), cache_control.clone());
+            }
+        }
+    }
+}
+
+/// Attach `cache_control` to the last text part of a message, promoting flat
+/// string content to a single-element array if needed.
+fn attach_cache_to_text_content(msg: &mut serde_json::Value, cache_control: &serde_json::Value) {
+    let content = match msg.get_mut("content") {
+        Some(c) => c,
+        None => return,
+    };
+    if let Some(s) = content.as_str() {
+        let s = s.to_string();
+        *content = json!([{ "type": "text", "text": s, "cache_control": cache_control }]);
+        return;
+    }
+    if let Some(arr) = content.as_array_mut() {
+        // Find last text-like part; fallback to last part.
+        let last_text_idx = arr.iter().rposition(|p| {
+            matches!(p.get("type").and_then(|t| t.as_str()), Some("text") | Some("input_text"))
+        });
+        let idx = last_text_idx.or_else(|| arr.len().checked_sub(1));
+        if let Some(i) = idx {
+            if let Some(obj) = arr[i].as_object_mut() {
+                obj.insert("cache_control".into(), cache_control.clone());
+            }
+        }
     }
 }
 
@@ -301,5 +388,120 @@ impl LlmProvider for OpenAIProvider {
         });
 
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{AnthropicOptions, OpenaiOptions, ProviderOptions};
+
+    fn provider() -> OpenAIProvider {
+        OpenAIProvider::new(ProviderConfig::new("test"))
+    }
+
+    fn req(model: &str) -> LlmRequest {
+        LlmRequest {
+            model: model.into(),
+            messages: vec![LlmMessage::user_text("hi")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_long_native_emits_prompt_cache_retention() {
+        let mut r = req("gpt-5");
+        r.cache_retention = Some(CacheRetention::Long);
+        let body = provider().build_body(&r, false);
+        assert_eq!(body["prompt_cache_retention"], "24h");
+        assert!(body.get("messages").and_then(|m| m.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("content"))
+            .map(|c| c.is_string())
+            .unwrap_or(false), "native cache must not promote content shape");
+    }
+
+    #[test]
+    fn cache_short_native_no_emit() {
+        // Short-cache is OpenAI's default behavior; no top-level field needed.
+        let mut r = req("gpt-5");
+        r.cache_retention = Some(CacheRetention::Short);
+        let body = provider().build_body(&r, false);
+        assert!(body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn cache_none_emits_nothing() {
+        let mut r = req("gpt-5");
+        r.cache_retention = Some(CacheRetention::None);
+        let body = provider().build_body(&r, false);
+        assert!(body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn cache_long_anthropic_style_inline_control() {
+        let mut r = req("deepseek-chat");
+        r.cache_retention = Some(CacheRetention::Long);
+        r.provider_options = Some(ProviderOptions::Openai(OpenaiOptions {
+            anthropic_cache_control: Some(true),
+        }));
+        let body = provider().build_body(&r, false);
+        assert!(body.get("prompt_cache_retention").is_none());
+        // Last user message should now be an array with a `cache_control` part.
+        let messages = body["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        let parts = last["content"].as_array().expect("content promoted to array");
+        assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(parts[0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn cache_short_anthropic_style_no_ttl() {
+        let mut r = req("deepseek-chat");
+        r.cache_retention = Some(CacheRetention::Short);
+        r.provider_options = Some(ProviderOptions::Openai(OpenaiOptions {
+            anthropic_cache_control: Some(true),
+        }));
+        let body = provider().build_body(&r, false);
+        let messages = body["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        let parts = last["content"].as_array().unwrap();
+        assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+        assert!(parts[0]["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn cache_anthropic_style_attaches_to_last_tool() {
+        let mut r = req("deepseek-chat");
+        r.cache_retention = Some(CacheRetention::Long);
+        r.tools = vec![crate::types::ToolDefinition {
+            name: "first".into(),
+            description: "f".into(),
+            input_schema: serde_json::json!({}),
+        }, crate::types::ToolDefinition {
+            name: "second".into(),
+            description: "s".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        r.provider_options = Some(ProviderOptions::Openai(OpenaiOptions {
+            anthropic_cache_control: Some(true),
+        }));
+        let body = provider().build_body(&r, false);
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none(), "first tool unchanged");
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_options_on_openai_request_ignored() {
+        // Type system can't prevent caller mismatching; runtime simply ignores.
+        let mut r = req("gpt-5");
+        r.cache_retention = Some(CacheRetention::Long);
+        r.provider_options = Some(ProviderOptions::Anthropic(AnthropicOptions {
+            force_adaptive_thinking: Some(true),
+        }));
+        let body = provider().build_body(&r, false);
+        // Falls back to native cache (anthropic_cache_control is None).
+        assert_eq!(body["prompt_cache_retention"], "24h");
     }
 }

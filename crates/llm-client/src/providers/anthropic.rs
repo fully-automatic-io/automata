@@ -1,6 +1,6 @@
 
 use crate::provider::{AuthMethod, LlmError, LlmProvider, LlmStream, ProviderConfig};
-use crate::streaming::parse_sse_event;
+use crate::streaming::{Delta, LlmEvent, MessageDelta as StreamMessageDelta, StreamError};
 use crate::types::{
     ContentPart, LlmMessage, LlmRequest, LlmResponse, MessageContent, StopReason,
     ThinkingBudgets, ThinkingLevel, Usage,
@@ -259,7 +259,112 @@ fn parse_stop_reason(s: &str) -> StopReason {
         "max_tokens" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
         "tool_use" => StopReason::ToolUse,
+        "refusal" => StopReason::Error,
+        "pause_turn" => StopReason::EndTurn,
         _ => StopReason::EndTurn,
+    }
+}
+
+/// Translate one Anthropic-API SSE event into our internal `LlmEvent`.
+///
+/// Anthropic's wire format uses snake_case (`tool_use`, `end_turn`, `input_json_delta`)
+/// and stores tool args under `input`, while our internal `ContentBlock` /
+/// `StopReason` enums use camelCase (`toolCall`, `toolUse`, `arguments`). This
+/// function bridges both directions.
+fn parse_anthropic_sse(event_type: &str, data: &str) -> Option<LlmEvent> {
+    if data == "[DONE]" {
+        return Some(LlmEvent::MessageStop);
+    }
+    let payload: serde_json::Value = serde_json::from_str(data).ok()?;
+    match event_type {
+        "ping" => Some(LlmEvent::Ping),
+        "message_start" => {
+            let msg = payload.get("message")?;
+            let id = msg.get("id")?.as_str()?.to_string();
+            let model = msg.get("model")?.as_str()?.to_string();
+            Some(LlmEvent::MessageStart { id, model })
+        }
+        "content_block_start" => {
+            let index = payload.get("index")?.as_u64()? as usize;
+            let cb = payload.get("content_block")?;
+            let kind = cb.get("type")?.as_str()?;
+            let content_block = match kind {
+                "text" => ContentPart::Text {
+                    text: cb.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                },
+                "thinking" => ContentPart::Thinking {
+                    thinking: cb.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                },
+                "tool_use" => ContentPart::ToolCall {
+                    id: cb.get("id")?.as_str()?.to_string(),
+                    name: cb.get("name")?.as_str()?.to_string(),
+                    arguments: cb.get("input").cloned().unwrap_or(serde_json::json!({})),
+                },
+                _ => return None,
+            };
+            Some(LlmEvent::ContentBlockStart { index, content_block })
+        }
+        "content_block_delta" => {
+            let index = payload.get("index")?.as_u64()? as usize;
+            let d = payload.get("delta")?;
+            let dtype = d.get("type")?.as_str()?;
+            let delta = match dtype {
+                "text_delta" => Delta::TextDelta {
+                    text: d.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                },
+                "input_json_delta" => Delta::InputJsonDelta {
+                    partial_json: d.get("partial_json").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                },
+                "thinking_delta" => Delta::ThinkingDelta {
+                    thinking: d.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                },
+                "signature_delta" => Delta::SignatureDelta {
+                    signature: d.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                },
+                _ => return None,
+            };
+            Some(LlmEvent::ContentBlockDelta { index, delta })
+        }
+        "content_block_stop" => {
+            let index = payload.get("index")?.as_u64()? as usize;
+            Some(LlmEvent::ContentBlockStop { index })
+        }
+        "message_delta" => {
+            let stop_reason = payload.get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(|v| v.as_str())
+                .map(parse_stop_reason);
+            let stop_sequence = payload.get("delta")
+                .and_then(|d| d.get("stop_sequence"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Anthropic usage deltas use cache_creation_input_tokens / cache_read_input_tokens
+            // / input_tokens / output_tokens — flatten into our `Usage` shape.
+            let usage = payload.get("usage").map(|u| Usage {
+                input: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_read: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_write: u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                total_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                    + u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cost: Default::default(),
+            });
+            Some(LlmEvent::MessageDelta {
+                delta: StreamMessageDelta { stop_reason, stop_sequence },
+                usage,
+            })
+        }
+        "message_stop" => Some(LlmEvent::MessageStop),
+        "error" => {
+            let err = payload.get("error")?;
+            Some(LlmEvent::Error {
+                error: StreamError {
+                    error_type: err.get("type").and_then(|v| v.as_str()).unwrap_or("error").to_string(),
+                    message: err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error").to_string(),
+                },
+            })
+        }
+        _ => None,
     }
 }
 
@@ -330,10 +435,7 @@ impl LlmProvider for AnthropicProvider {
         let byte_stream = resp.bytes_stream();
         let stream = byte_stream.eventsource().filter_map(|result| async move {
             match result {
-                Ok(event) => {
-                    let parsed = parse_sse_event(&event.event, &event.data);
-                    parsed.map(Ok)
-                }
+                Ok(event) => parse_anthropic_sse(&event.event, &event.data).map(Ok),
                 Err(e) => Some(Err(LlmError::StreamError(e.to_string()))),
             }
         });
