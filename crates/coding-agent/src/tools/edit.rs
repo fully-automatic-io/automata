@@ -129,55 +129,77 @@ pub fn restore_line_endings(content: &str, ending: &str) -> String {
     }
 }
 
-/// Fuzzy normalize text for matching (handle Unicode variants)
+/// Normalize text for fuzzy matching. Mirrors pi-mono's
+/// `normalizeForFuzzyMatch` (edit-diff.ts):
+///
+/// 1. NFKC compatibility composition
+/// 2. Strip trailing whitespace from each line
+/// 3. Smart quotes → ASCII (`'` and `"`)
+/// 4. Unicode dashes → ASCII `-`
+/// 5. Special-width spaces → ASCII space
 fn fuzzy_normalize(text: &str) -> String {
-    // NFKC normalization first (handles composed/decomposed Unicode variants)
-    let normalized: String = text.nfkc().collect();
-    normalized
-        // Strip trailing whitespace from each line
-        .lines()
-        .map(|line| line.trim_end())
+    let nfkc: String = text.nfkc().collect();
+    let trimmed = nfkc
+        .split('\n')
+        .map(str::trim_end)
         .collect::<Vec<_>>()
-        .join("\n")
-        // Smart quotes to ASCII
-        .replace('\u{2018}', "'")
-        .replace('\u{2019}', "'")
-        .replace('\u{201C}', "\"")
-        .replace('\u{201D}', "\"")
-        // Em/en dashes to ASCII
-        .replace('\u{2013}', "-")
-        .replace('\u{2014}', "-")
-        // Special spaces to normal space
-        .replace('\u{00A0}', " ")
-        .replace('\u{2009}', " ")
+        .join("\n");
+    trimmed
+        .chars()
+        .map(|c| match c {
+            // Smart single quotes: ‘ ’ ‚ ‛
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            // Smart double quotes: “ ” „ ‟
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            // Dashes / hyphens / minus: ‐ ‑ ‒ – — ― −
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // Special-width spaces: NBSP, en/em/thin/hair/etc, narrow NBSP, math, ideographic.
+            '\u{00A0}'
+            | '\u{2002}'..='\u{200A}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect()
 }
 
-/// Find text with fuzzy matching, returns (byte_start, byte_end) in original content
-fn fuzzy_find_text(content: &str, search: &str) -> Option<(usize, usize)> {
-    // Try exact match first
-    if let Some(pos) = content.find(search) {
-        return Some((pos, pos + search.len()));
+/// Outcome of locating `old_text` inside `content`.
+///
+/// When `used_fuzzy` is `true`, `content_for_replacement` is the
+/// fuzzy-normalized version of `content` and the edit must be applied
+/// against that string (matching pi-mono semantics: minor formatting
+/// differences get normalized into the file).
+struct FuzzyMatch {
+    range: std::ops::Range<usize>,
+    /// `true` if the exact-match path failed and the fuzzy normalization
+    /// path produced the hit. Exposed so callers can surface a soft
+    /// warning (matches pi-mono `usedFuzzyMatch`); not consumed yet.
+    #[allow(dead_code)]
+    used_fuzzy: bool,
+    content_for_replacement: String,
+}
+
+/// Find `old_text` in `content`. Tries exact match first, then falls back
+/// to fuzzy matching against [`fuzzy_normalize`]'d versions.
+fn fuzzy_find_text(content: &str, old_text: &str) -> Option<FuzzyMatch> {
+    if let Some(pos) = content.find(old_text) {
+        return Some(FuzzyMatch {
+            range: pos..pos + old_text.len(),
+            used_fuzzy: false,
+            content_for_replacement: content.to_string(),
+        });
     }
 
-    // Fuzzy match on normalized versions
     let norm_content = fuzzy_normalize(content);
-    let norm_search = fuzzy_normalize(search);
-
-    let match_byte_start = norm_content.find(&norm_search)?;
-    let match_byte_end = match_byte_start + norm_search.len();
-
-    // Map byte positions in normalized string back to char counts, then to original byte positions
-    let chars_before = norm_content[..match_byte_start].chars().count();
-    let chars_in_match = norm_content[match_byte_start..match_byte_end].chars().count();
-
-    let orig_start = content.char_indices().nth(chars_before).map(|(i, _)| i)?;
-    let orig_end = content
-        .char_indices()
-        .nth(chars_before + chars_in_match)
-        .map(|(i, _)| i)
-        .unwrap_or(content.len());
-
-    Some((orig_start, orig_end))
+    let norm_old = fuzzy_normalize(old_text);
+    let pos = norm_content.find(&norm_old)?;
+    Some(FuzzyMatch {
+        range: pos..pos + norm_old.len(),
+        used_fuzzy: true,
+        content_for_replacement: norm_content,
+    })
 }
 
 /// Count occurrences of `needle` in `haystack` (non-overlapping)
@@ -245,9 +267,14 @@ pub fn apply_edits_to_normalized_content(
         check_uniqueness(&result, &edit.old_text)?;
 
         // Try exact match first, then fuzzy
-        if let Some((start, end)) = fuzzy_find_text(&result, &edit.old_text) {
-            let before = &result[..start];
-            let after = &result[end..];
+        if let Some(m) = fuzzy_find_text(&result, &edit.old_text) {
+            // When fuzzy matching, work in the normalized space — minor
+            // formatting differences (smart quotes, special spaces) are
+            // intentionally normalized into the resulting file. Mirrors
+            // pi-mono's `contentForReplacement` semantics.
+            let base = m.content_for_replacement;
+            let before = &base[..m.range.start];
+            let after = &base[m.range.end..];
             result = format!("{}{}{}", before, edit.new_text, after);
         } else {
             return Err(format!(
@@ -308,6 +335,57 @@ pub fn generate_unified_patch(path: &str, old: &str, new: &str, context_lines: u
         .context_radius(context_lines)
         .header(&header_a, &header_b)
         .to_string()
+}
+
+/// Result of a preview diff computation.
+#[derive(Debug, Clone)]
+pub struct EditDiffResult {
+    pub diff: String,
+    pub patch: String,
+    pub first_changed_line: Option<usize>,
+}
+
+/// Compute the diff for one or more edits **without writing the file**.
+/// Used for preview rendering before the tool executes.
+///
+/// Returns `Err(message)` if the file can't be read or the edits are invalid.
+pub async fn compute_edits_diff<O: EditOperations>(
+    path: &str,
+    edits: &[Edit],
+    cwd: &str,
+    operations: &O,
+) -> Result<EditDiffResult, String> {
+    let absolute = if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        std::path::Path::new(cwd).join(path).to_string_lossy().into_owned()
+    };
+
+    let raw = operations.read_file(&absolute).await
+        .map_err(|e| format!("Could not read file: {path}. {e}"))?;
+    let raw_str = String::from_utf8_lossy(&raw);
+    let (_bom, stripped) = strip_bom(&raw_str);
+    let normalized = normalize_to_lf(stripped);
+    let (base, new) = apply_edits_to_normalized_content(&normalized, edits, path)?;
+    let (diff, first_changed_line) = generate_diff_string(&base, &new);
+    let patch = generate_unified_patch(path, &base, &new, 4);
+    Ok(EditDiffResult { diff, patch, first_changed_line })
+}
+
+/// Convenience wrapper for a single-edit preview.
+pub async fn compute_edit_diff<O: EditOperations>(
+    path: &str,
+    old_text: &str,
+    new_text: &str,
+    cwd: &str,
+    operations: &O,
+) -> Result<EditDiffResult, String> {
+    compute_edits_diff(
+        path,
+        &[Edit { old_text: old_text.to_string(), new_text: new_text.to_string() }],
+        cwd,
+        operations,
+    ).await
 }
 
 // ============================================================================
@@ -443,7 +521,7 @@ impl AgentTool for EditTool {
         _tool_call_id: String,
         params: serde_json::Value,
         signal: Option<CancellationToken>,
-        _on_update: Option<AgentToolUpdateCallback>,
+        on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let path = params
             .get("path")
@@ -479,6 +557,8 @@ impl AgentTool for EditTool {
         }
 
         let absolute_path = self.resolve_path(path);
+
+        let on_update_arc: Option<Arc<AgentToolUpdateCallback>> = on_update.map(Arc::new);
 
         // Use file mutation queue to prevent concurrent edits
         let result = with_file_mutation_queue(&absolute_path, async {
@@ -529,6 +609,26 @@ impl AgentTool for EditTool {
                 });
             }
 
+            // Generate diff (display) + unified patch (git-applyable) early so we
+            // can stream a preview before writing.
+            let (diff, first_changed_line) = generate_diff_string(&base, &new);
+            let patch = generate_unified_patch(&path, &base, &new, 4);
+
+            // Emit streaming partial: diff preview before disk write hits.
+            if let Some(cb) = &on_update_arc {
+                let partial = AgentToolResult {
+                    content: vec![ContentBlock::Text { text: diff.clone() }],
+                    details: serde_json::to_value(EditToolDetails {
+                        diff: diff.clone(),
+                        patch: patch.clone(),
+                        first_changed_line,
+                    })
+                    .unwrap_or_default(),
+                    terminate: false,
+                };
+                cb(partial);
+            }
+
             // Restore BOM and line endings
             let final_content = format!("{}{}", bom, restore_line_endings(&new, original_ending));
 
@@ -540,10 +640,6 @@ impl AgentTool for EditTool {
                     Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
                         as Box<dyn std::error::Error + Send + Sync>
                 })?;
-
-            // Generate diff (display) + unified patch (git-applyable)
-            let (diff, first_changed_line) = generate_diff_string(&base, &new);
-            let patch = generate_unified_patch(&path, &base, &new, 4);
 
             Ok(AgentToolResult {
                 content: vec![ContentBlock::Text {
@@ -609,6 +705,71 @@ mod tests {
         let smart_quotes = "\u{2018}hello\u{2019} \u{201C}world\u{201D}";
         let normalized = fuzzy_normalize(smart_quotes);
         assert_eq!(normalized, "'hello' \"world\"");
+    }
+
+    #[test]
+    fn test_fuzzy_normalize_extended_quote_set() {
+        // Single quotes: ‘ ’ ‚ ‛
+        for ch in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+            assert_eq!(fuzzy_normalize(&ch.to_string()), "'");
+        }
+        // Double quotes: “ ” „ ‟
+        for ch in ['\u{201C}', '\u{201D}', '\u{201E}', '\u{201F}'] {
+            assert_eq!(fuzzy_normalize(&ch.to_string()), "\"");
+        }
+    }
+
+    #[test]
+    fn test_fuzzy_normalize_extended_dash_set() {
+        // ‐ ‑ ‒ – — ― −
+        for ch in [
+            '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
+        ] {
+            assert_eq!(fuzzy_normalize(&ch.to_string()), "-");
+        }
+    }
+
+    #[test]
+    fn test_fuzzy_normalize_extended_space_set() {
+        // NBSP, en/em/thin/hair/etc, narrow NBSP, math, ideographic.
+        // Embed each between letters so trim_end doesn't strip it.
+        for ch in [
+            '\u{00A0}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
+            '\u{2008}', '\u{2009}', '\u{200A}', '\u{202F}', '\u{205F}', '\u{3000}',
+        ] {
+            let input = format!("a{}b", ch);
+            assert_eq!(fuzzy_normalize(&input), "a b", "char U+{:04X}", ch as u32);
+        }
+    }
+
+    #[test]
+    fn test_fuzzy_find_returns_normalized_content_when_used_fuzzy() {
+        let content = "fn greet() {\n    println!(\u{201C}hi\u{201D});\n}\n";
+        let m = fuzzy_find_text(content, "println!(\"hi\")").expect("fuzzy hit");
+        assert!(m.used_fuzzy);
+        // The result content has straight quotes, so applying an edit against
+        // the normalized base writes ASCII quotes to disk.
+        let slice = &m.content_for_replacement[m.range.clone()];
+        assert_eq!(slice, "println!(\"hi\")");
+    }
+
+    #[test]
+    fn test_apply_edits_fuzzy_normalizes_into_file() {
+        // Source has smart quotes; oldText uses ASCII. The post-edit content
+        // should carry ASCII quotes everywhere — matches pi-mono semantics.
+        let src = "let s = \u{201C}hello\u{201D};\nlet t = \u{201C}world\u{201D};\n";
+        let edits = vec![Edit {
+            old_text: "let s = \"hello\";".into(),
+            new_text: "let s = \"HELLO\";".into(),
+        }];
+        let (_, new) =
+            apply_edits_to_normalized_content(src, &edits, "/x.rs").expect("apply");
+        assert!(new.contains("let s = \"HELLO\";"));
+        // The other line should also have been normalized (fuzzy rewrite of
+        // entire file — a deliberate choice mirroring pi-mono).
+        assert!(new.contains("let t = \"world\";"));
+        assert!(!new.contains('\u{201C}'));
+        assert!(!new.contains('\u{201D}'));
     }
 
     #[test]
@@ -714,5 +875,97 @@ mod tests {
         assert_eq!(tool.name(), "edit");
         assert_eq!(tool.label(), "edit");
         assert_eq!(tool.execution_mode(), Some(ToolExecutionMode::Sequential));
+    }
+
+    #[tokio::test]
+    async fn test_compute_edits_diff_preview() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.rs");
+        std::fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+        let ops = LocalEditOperations;
+        let result = compute_edits_diff(
+            path.to_str().unwrap(),
+            &[Edit { old_text: "hello".into(), new_text: "world".into() }],
+            dir.path().to_str().unwrap(),
+            &ops,
+        ).await.unwrap();
+
+        assert!(result.diff.contains("-│") || result.diff.contains("+│"));
+        assert!(result.patch.contains("--- a/"));
+        assert!(result.patch.contains("+++ b/"));
+        assert!(result.patch.contains("-    println!(\"hello\")"));
+        assert!(result.patch.contains("+    println!(\"world\")"));
+        // File must NOT be modified.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("hello"), "file must not be modified by preview");
+    }
+
+    #[tokio::test]
+    async fn test_compute_edit_diff_single() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let ops = LocalEditOperations;
+        let result = compute_edit_diff(
+            path.to_str().unwrap(),
+            "b",
+            "x",
+            dir.path().to_str().unwrap(),
+            &ops,
+        ).await.unwrap();
+
+        assert!(result.patch.contains("-b"));
+        assert!(result.patch.contains("+x"));
+        assert_eq!(result.first_changed_line, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_compute_edits_diff_missing_file() {
+        let ops = LocalEditOperations;
+        let err = compute_edits_diff(
+            "/no/such/file.txt",
+            &[Edit { old_text: "x".into(), new_text: "y".into() }],
+            "/",
+            &ops,
+        ).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn streaming_callback_receives_diff_preview() {
+        use std::sync::Mutex as StdMutex;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("foo.txt");
+        tokio::fs::write(&file, "alpha\nbeta\ngamma\n").await.unwrap();
+
+        let tool = EditTool::new(
+            dir.path().to_string_lossy().into_owned(),
+            EditToolOptions::default(),
+        );
+
+        let updates: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let on_update: AgentToolUpdateCallback = Box::new(move |partial: AgentToolResult| {
+            if let Some(diff) = partial.details.get("diff").and_then(|v| v.as_str()) {
+                updates_clone.lock().unwrap().push(diff.to_string());
+            }
+        });
+
+        let params = serde_json::json!({
+            "path": file.to_string_lossy(),
+            "edits": [{ "oldText": "beta", "newText": "BETA" }]
+        });
+        let result = tool.execute("test".into(), params, None, Some(on_update)).await;
+        assert!(result.is_ok(), "edit should succeed: {:?}", result.err());
+
+        let collected = updates.lock().unwrap();
+        assert_eq!(collected.len(), 1, "expected one diff preview update");
+        assert!(
+            collected[0].contains("BETA"),
+            "preview diff should contain new text, got: {:?}",
+            collected[0]
+        );
     }
 }

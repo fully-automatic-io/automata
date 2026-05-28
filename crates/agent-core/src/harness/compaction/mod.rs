@@ -3,9 +3,10 @@ pub mod compaction;
 pub mod utils;
 
 pub use compaction::{
-    compact, estimate_context_tokens, estimate_tokens, find_turn_start_index,
-    prepare_compaction, CompactionError, CompactionPreparation, CompactionResult,
-    CompactionSettings, StreamFn, SUMMARIZATION_SYSTEM_PROMPT,
+    compact, estimate_context_tokens, estimate_context_tokens_with_source, estimate_tokens,
+    find_turn_start_index, prepare_compaction, CompactionError, CompactionPreparation,
+    CompactionResult, CompactionSettings, ContextTokenEstimate, StreamFn,
+    SUMMARIZATION_SYSTEM_PROMPT,
 };
 pub use branch_summarization::{
     collect_entries_for_branch_summary, generate_branch_summary, BranchSummaryResult,

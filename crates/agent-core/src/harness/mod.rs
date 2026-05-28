@@ -7,7 +7,10 @@ pub mod session;
 pub mod skills;
 pub mod utils;
 
-pub use agent_harness::{AgentHarness, HarnessConfig, HarnessError, HarnessPhase};
+pub use agent_harness::{
+    AbortResult, AgentHarness, AutoCompactionConfig, CompactionReason, HarnessConfig,
+    HarnessError, HarnessEvent, HarnessPhase, PostRunDecision,
+};
 pub use compaction::{
     compact, estimate_context_tokens, estimate_tokens, prepare_compaction,
     CompactionError, CompactionPreparation, CompactionResult, CompactionSettings, StreamFn,

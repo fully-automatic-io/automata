@@ -115,6 +115,33 @@ pub fn estimate_context_tokens(messages: &[AgentMessage]) -> usize {
     messages.iter().map(estimate_tokens).sum()
 }
 
+/// Like [`estimate_context_tokens`] but also reports which message contributed
+/// the usage data (or `None` if no successful assistant exists). Used by
+/// `_checkCompaction` to detect stale post-compaction usage data.
+pub struct ContextTokenEstimate {
+    pub tokens: usize,
+    pub last_usage_index: Option<usize>,
+}
+
+pub fn estimate_context_tokens_with_source(messages: &[AgentMessage]) -> ContextTokenEstimate {
+    for (i, msg) in messages.iter().enumerate().rev() {
+        if let AgentMessage::Assistant { stop_reason, usage, .. } = msg {
+            if !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
+                let tokens = if usage.total_tokens > 0 {
+                    usage.total_tokens as usize
+                } else {
+                    (usage.input + usage.output + usage.cache_read + usage.cache_write) as usize
+                };
+                return ContextTokenEstimate { tokens, last_usage_index: Some(i) };
+            }
+        }
+    }
+    ContextTokenEstimate {
+        tokens: messages.iter().map(estimate_tokens).sum(),
+        last_usage_index: None,
+    }
+}
+
 fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> {
     match entry {
         SessionTreeEntry::Message { message, .. } => Some(message.clone()),
@@ -384,4 +411,75 @@ async fn generate_turn_prefix_summary(messages: &[AgentMessage], stream_fn: &Str
     let prompt_text = format!("<conversation>\n{}\n</conversation>\n\n{}", conversation_text, TURN_PREFIX_SUMMARIZATION_PROMPT);
     let summarization_messages = vec![AgentMessage::user_text(prompt_text)];
     stream_fn(summarization_messages, SUMMARIZATION_SYSTEM_PROMPT).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Api, Usage};
+
+    fn assistant_with_total(total: u64) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![],
+            api: Api::Anthropic,
+            provider: "p".into(),
+            model: "m".into(),
+            usage: Usage { total_tokens: total, ..Default::default() },
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            timestamp: 0,
+        }
+    }
+
+    fn errored_assistant() -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![],
+            api: Api::Anthropic,
+            provider: "p".into(),
+            model: "m".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("oops".into()),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn estimate_with_source_tracks_index() {
+        let messages = vec![
+            AgentMessage::user_text("a"),     // 0
+            assistant_with_total(1500),       // 1 — successful
+            AgentMessage::user_text("b"),     // 2
+            errored_assistant(),              // 3 — skipped (error)
+        ];
+        let est = estimate_context_tokens_with_source(&messages);
+        assert_eq!(est.tokens, 1500);
+        assert_eq!(est.last_usage_index, Some(1));
+    }
+
+    #[test]
+    fn estimate_with_source_falls_back_when_no_assistant() {
+        let messages = vec![AgentMessage::user_text("hello world")];
+        let est = estimate_context_tokens_with_source(&messages);
+        assert_eq!(est.last_usage_index, None);
+        assert!(est.tokens > 0);  // Estimated from text length
+    }
+
+    #[test]
+    fn estimate_with_source_skips_aborted_and_error() {
+        let messages = vec![
+            assistant_with_total(900),        // 0 — successful, picked
+            AgentMessage::Assistant {         // 1 — Aborted, skipped
+                content: vec![],
+                api: Api::Anthropic, provider: "p".into(), model: "m".into(),
+                usage: Usage { total_tokens: 9999, ..Default::default() },
+                stop_reason: StopReason::Aborted,
+                error_message: None, timestamp: 0,
+            },
+            errored_assistant(),              // 2 — Error, skipped
+        ];
+        let est = estimate_context_tokens_with_source(&messages);
+        assert_eq!(est.tokens, 900);
+        assert_eq!(est.last_usage_index, Some(0));
+    }
 }

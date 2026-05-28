@@ -488,6 +488,61 @@ impl Session {
         Ok(id)
     }
 
+    pub async fn append_custom(
+        &mut self,
+        custom_type: &str,
+        data: Option<serde_json::Value>,
+    ) -> Result<String, SessionError> {
+        let id = self.storage.create_entry_id().await;
+        let parent_id = self.storage.get_leaf_id().await;
+        self.storage.append_entry(SessionTreeEntry::Custom {
+            id: id.clone(),
+            parent_id,
+            timestamp: now_iso(),
+            custom_type: custom_type.to_string(),
+            data,
+        }).await?;
+        Ok(id)
+    }
+
+    pub async fn append_custom_message(
+        &mut self,
+        custom_type: &str,
+        content: serde_json::Value,
+        display: bool,
+        details: Option<serde_json::Value>,
+    ) -> Result<String, SessionError> {
+        let id = self.storage.create_entry_id().await;
+        let parent_id = self.storage.get_leaf_id().await;
+        self.storage.append_entry(SessionTreeEntry::CustomMessage {
+            id: id.clone(),
+            parent_id,
+            timestamp: now_iso(),
+            custom_type: custom_type.to_string(),
+            content,
+            display,
+            details,
+        }).await?;
+        Ok(id)
+    }
+
+    pub async fn append_label(
+        &mut self,
+        target_id: &str,
+        label: Option<String>,
+    ) -> Result<String, SessionError> {
+        let id = self.storage.create_entry_id().await;
+        let parent_id = self.storage.get_leaf_id().await;
+        self.storage.append_entry(SessionTreeEntry::Label {
+            id: id.clone(),
+            parent_id,
+            timestamp: now_iso(),
+            target_id: target_id.to_string(),
+            label,
+        }).await?;
+        Ok(id)
+    }
+
     pub async fn move_to(
         &mut self,
         entry_id: Option<&str>,

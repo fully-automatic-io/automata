@@ -9,6 +9,10 @@ pub mod providers {
     pub mod openai_responses;
 }
 
+// Auto-retry / overflow detection live in agent-core (they need AgentMessage
+// types and the harness uses them). Re-export so existing call sites work.
+pub use agent_core::auto_retry::{compute_retry_delay, is_retryable_error, RetrySettings};
+pub use agent_core::overflow::is_context_overflow;
 pub use provider::{AuthMethod, LlmError, LlmProvider, LlmStream, ProviderConfig};
 pub use providers::anthropic::AnthropicProvider;
 pub use providers::openai::OpenAIProvider;

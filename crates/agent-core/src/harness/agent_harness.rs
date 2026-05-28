@@ -13,18 +13,22 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{AgentEventSink, AgentLoop, StreamFn};
 use crate::event::AgentEvent;
+use crate::auto_retry::{compute_retry_delay, is_retryable_error};
 use crate::harness::compaction::{
-    compact, prepare_compaction, CompactionError, CompactionResult, CompactionSettings,
-    StreamFn as CompactionStreamFn,
+    compact, estimate_context_tokens_with_source, prepare_compaction, CompactionError,
+    CompactionResult, CompactionSettings, StreamFn as CompactionStreamFn,
 };
 use crate::harness::messages::default_convert_to_llm;
-use crate::harness::session::{BranchSummaryOptions, Session, SessionContext, SessionError};
+use crate::harness::session::{
+    BranchSummaryOptions, Session, SessionContext, SessionError, SessionTreeEntry,
+};
+use crate::overflow::is_context_overflow;
 use crate::tool::AgentTool;
 use crate::types::{
     AfterToolCallFn, AgentContext, AgentLoopConfig, AgentMessage, BeforeToolCallFn,
     ConvertToLlmFn, ModelInfo, OnPayloadFn, OnResponseFn, PrepareNextTurnFn,
-    ShouldStopAfterTurnFn, ThinkingBudgets, ThinkingLevel, ToolExecutionMode, TransformContextFn,
-    Transport,
+    ShouldStopAfterTurnFn, StopReason, ThinkingBudgets, ThinkingLevel, ToolExecutionMode,
+    TransformContextFn, Transport,
 };
 
 // ============================================================================
@@ -66,9 +70,97 @@ pub enum HarnessError {
 pub enum HarnessEvent {
     Agent(AgentEvent),
     Compaction { result: CompactionResult },
+    CompactionStart { reason: CompactionReason },
+    CompactionEnd {
+        reason: CompactionReason,
+        result: Option<CompactionResult>,
+        aborted: bool,
+        will_retry: bool,
+        error_message: Option<String>,
+    },
+    AutoRetryStart {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error_message: String,
+    },
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        final_error: Option<String>,
+    },
+    /// Model changed via `set_model`. `previous` is the prior model id.
+    ModelSelect {
+        provider: String,
+        model_id: String,
+        previous_provider: Option<String>,
+        previous_model_id: Option<String>,
+    },
+    /// Thinking level changed via `set_thinking_level`.
+    ThinkingLevelSelect {
+        level: ThinkingLevel,
+        previous: ThinkingLevel,
+    },
+    /// Steering / follow-up / next-turn queue contents changed.
+    QueueUpdate {
+        steer_count: usize,
+        follow_up_count: usize,
+        next_turn_count: usize,
+    },
     SavePoint,
     Settled,
-    Aborted,
+    Aborted {
+        cleared_steer: Vec<AgentMessage>,
+        cleared_follow_up: Vec<AgentMessage>,
+    },
+}
+
+/// Why an auto-compaction was triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionReason {
+    /// LLM returned a context-overflow error; harness will compact and
+    /// retry the turn (subject to one-shot recovery limit).
+    Overflow,
+    /// Context tokens crossed the configured threshold; harness will
+    /// compact but **not** retry — caller submits the next prompt manually.
+    Threshold,
+}
+
+/// Outcome of an `abort()` call. Surfaces the queued messages that were
+/// discarded so callers can warn the user / re-enqueue them.
+#[derive(Debug, Clone, Default)]
+pub struct AbortResult {
+    pub cleared_steer: Vec<AgentMessage>,
+    pub cleared_follow_up: Vec<AgentMessage>,
+}
+
+/// Wires a compaction strategy into the harness so [`execute_turn`] can
+/// auto-run [`AgentHarness::check_pre_prompt`] before sending a new
+/// prompt — recovering gracefully from the prior turn's aborted/error
+/// state. Set via [`AgentHarness::set_auto_compaction`]; leave unset to
+/// keep the harness behaviour identical to manual calls.
+#[derive(Clone)]
+pub struct AutoCompactionConfig {
+    pub settings: CompactionSettings,
+    /// Wrapped in `Arc` because [`CompactionStreamFn`] is a `Box<dyn Fn>`
+    /// — the harness needs to keep one copy and hand another to
+    /// `check_pre_prompt`, so we share ownership.
+    pub stream_fn: Arc<CompactionStreamFn>,
+}
+
+impl AutoCompactionConfig {
+    pub fn new(settings: CompactionSettings, stream_fn: CompactionStreamFn) -> Self {
+        Self { settings, stream_fn: Arc::new(stream_fn) }
+    }
+}
+
+impl std::fmt::Debug for AutoCompactionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoCompactionConfig")
+            .field("settings", &self.settings)
+            .field("stream_fn", &"<fn>")
+            .finish()
+    }
 }
 
 pub type HarnessListener = Arc<
@@ -95,6 +187,31 @@ enum PendingWrite {
         from_id: String,
         summary: String,
         details: Option<serde_json::Value>,
+    },
+    /// Plugin-defined custom entry (no message body).
+    Custom {
+        custom_type: String,
+        data: Option<serde_json::Value>,
+    },
+    /// Plugin-defined custom message entry (carries content / display).
+    CustomMessage {
+        custom_type: String,
+        content: serde_json::Value,
+        display: bool,
+        details: Option<serde_json::Value>,
+    },
+    /// Attach (or remove if `label` is `None`) a label on a target entry.
+    Label {
+        target_id: String,
+        label: Option<String>,
+    },
+    /// Update session-info name.
+    SessionInfo {
+        name: Option<String>,
+    },
+    /// Move the leaf pointer (for tree navigation).
+    Leaf {
+        target_id: Option<String>,
     },
 }
 
@@ -170,9 +287,23 @@ pub struct AgentHarness {
     steer_queue: Arc<Mutex<Vec<AgentMessage>>>,
     follow_up_queue: Arc<Mutex<Vec<AgentMessage>>>,
     next_turn_queue: Arc<Mutex<Vec<AgentMessage>>>,
+    steer_mode: Arc<Mutex<crate::queue::QueueMode>>,
+    follow_up_mode: Arc<Mutex<crate::queue::QueueMode>>,
     listeners: Arc<Mutex<Vec<HarnessListener>>>,
     resources: Arc<Mutex<HarnessResources>>,
     abort: Arc<Mutex<CancellationToken>>,
+
+    // Auto-compaction / retry state.
+    overflow_recovery_attempted: Arc<Mutex<bool>>,
+    retry_attempt: Arc<Mutex<u32>>,
+    retry_settings: Arc<Mutex<crate::auto_retry::RetrySettings>>,
+    last_assistant_message: Arc<Mutex<Option<AgentMessage>>>,
+
+    /// When `Some`, `execute_turn` automatically runs `check_pre_prompt`
+    /// using the stored settings + stream fn. Mirrors pi-mono
+    /// `agent-session.ts:1041-1052` behavior. Caller opts in via
+    /// [`AgentHarness::set_auto_compaction`].
+    auto_compaction: Arc<Mutex<Option<AutoCompactionConfig>>>,
 
     // Caller-supplied stream/convert hooks. Required.
     stream_fn: StreamFn,
@@ -210,9 +341,16 @@ impl AgentHarness {
             steer_queue: Arc::new(Mutex::new(vec![])),
             follow_up_queue: Arc::new(Mutex::new(vec![])),
             next_turn_queue: Arc::new(Mutex::new(vec![])),
+            steer_mode: Arc::new(Mutex::new(crate::queue::QueueMode::default())),
+            follow_up_mode: Arc::new(Mutex::new(crate::queue::QueueMode::default())),
             listeners: Arc::new(Mutex::new(vec![])),
             resources: Arc::new(Mutex::new(HarnessResources::default())),
             abort: Arc::new(Mutex::new(CancellationToken::new())),
+            overflow_recovery_attempted: Arc::new(Mutex::new(false)),
+            retry_attempt: Arc::new(Mutex::new(0)),
+            retry_settings: Arc::new(Mutex::new(crate::auto_retry::RetrySettings::default())),
+            last_assistant_message: Arc::new(Mutex::new(None)),
+            auto_compaction: Arc::new(Mutex::new(None)),
             stream_fn: options.stream_fn,
             convert_to_llm: options.convert_to_llm
                 .unwrap_or_else(|| Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs)))),
@@ -228,11 +366,32 @@ impl AgentHarness {
 
     pub async fn phase(&self) -> HarnessPhase { *self.phase.lock().await }
 
+    /// Test-only: force the phase to a specific value (e.g. simulate a concurrent
+    /// turn / compaction). Production code should never call this.
+    #[doc(hidden)]
+    pub async fn set_phase_for_test(&self, phase: HarnessPhase) {
+        *self.phase.lock().await = phase;
+    }
+
     pub async fn signal(&self) -> CancellationToken { self.abort.lock().await.clone() }
 
-    pub async fn abort(&self) {
+    /// Cancel the in-flight turn (if any) and clear the steer / follow-up
+    /// queues. Returns the messages that were discarded so callers can
+    /// surface them to the user (e.g. "you had 3 queued steers, none
+    /// reached the model"). Mirrors pi-mono `agent-harness.ts:936-963`.
+    pub async fn abort(&self) -> AbortResult {
+        let cleared_steer = std::mem::take(&mut *self.steer_queue.lock().await);
+        let cleared_follow_up = std::mem::take(&mut *self.follow_up_queue.lock().await);
         self.abort.lock().await.cancel();
-        self.dispatch(HarnessEvent::Aborted).await;
+        if !cleared_steer.is_empty() || !cleared_follow_up.is_empty() {
+            self.dispatch_queue_update().await;
+        }
+        self.dispatch(HarnessEvent::Aborted {
+            cleared_steer: cleared_steer.clone(),
+            cleared_follow_up: cleared_follow_up.clone(),
+        })
+        .await;
+        AbortResult { cleared_steer, cleared_follow_up }
     }
 
     /// Reset the abort token so a subsequent run can be cancelled cleanly.
@@ -271,26 +430,74 @@ impl AgentHarness {
 
     pub async fn steer(&self, message: AgentMessage) {
         self.steer_queue.lock().await.push(message);
+        self.dispatch_queue_update().await;
     }
 
     pub async fn follow_up(&self, message: AgentMessage) {
         self.follow_up_queue.lock().await.push(message);
+        self.dispatch_queue_update().await;
     }
 
     pub async fn next_turn(&self, message: AgentMessage) {
         self.next_turn_queue.lock().await.push(message);
+        self.dispatch_queue_update().await;
     }
 
     pub async fn drain_steer(&self) -> Vec<AgentMessage> {
-        std::mem::take(&mut *self.steer_queue.lock().await)
+        let v = std::mem::take(&mut *self.steer_queue.lock().await);
+        if !v.is_empty() { self.dispatch_queue_update().await; }
+        v
     }
 
     pub async fn drain_follow_up(&self) -> Vec<AgentMessage> {
-        std::mem::take(&mut *self.follow_up_queue.lock().await)
+        let v = std::mem::take(&mut *self.follow_up_queue.lock().await);
+        if !v.is_empty() { self.dispatch_queue_update().await; }
+        v
     }
 
     pub async fn drain_next_turn(&self) -> Vec<AgentMessage> {
-        std::mem::take(&mut *self.next_turn_queue.lock().await)
+        let v = std::mem::take(&mut *self.next_turn_queue.lock().await);
+        if !v.is_empty() { self.dispatch_queue_update().await; }
+        v
+    }
+
+    /// Current drain policy for the steering queue.
+    pub async fn steer_mode(&self) -> crate::queue::QueueMode {
+        *self.steer_mode.lock().await
+    }
+
+    /// Set the drain policy for the steering queue.
+    pub async fn set_steer_mode(&self, mode: crate::queue::QueueMode) {
+        *self.steer_mode.lock().await = mode;
+    }
+
+    /// Current drain policy for the follow-up queue.
+    pub async fn follow_up_mode(&self) -> crate::queue::QueueMode {
+        *self.follow_up_mode.lock().await
+    }
+
+    /// Set the drain policy for the follow-up queue.
+    pub async fn set_follow_up_mode(&self, mode: crate::queue::QueueMode) {
+        *self.follow_up_mode.lock().await = mode;
+    }
+
+    /// Install (or remove with `None`) an auto-compaction strategy. When
+    /// installed, [`execute_turn`] will run [`check_pre_prompt`] before
+    /// sending the prompt so an aborted / errored prior turn doesn't bleed
+    /// into the new context.
+    pub async fn set_auto_compaction(&self, config: Option<AutoCompactionConfig>) {
+        *self.auto_compaction.lock().await = config;
+    }
+
+    async fn dispatch_queue_update(&self) {
+        let steer = self.steer_queue.lock().await.len();
+        let follow_up = self.follow_up_queue.lock().await.len();
+        let next_turn = self.next_turn_queue.lock().await.len();
+        self.dispatch(HarnessEvent::QueueUpdate {
+            steer_count: steer,
+            follow_up_count: follow_up,
+            next_turn_count: next_turn,
+        }).await;
     }
 
     // -----------------------------------------------------------------------
@@ -302,16 +509,29 @@ impl AgentHarness {
     }
 
     pub async fn set_thinking_level(&self, level: ThinkingLevel) {
+        let previous = self.config.lock().await.thinking_level;
         self.config.lock().await.thinking_level = level;
         self.pending.lock().await.push(PendingWrite::ThinkingLevelChange(level));
+        self.dispatch(HarnessEvent::ThinkingLevelSelect { level, previous }).await;
     }
 
     pub async fn set_model(&self, provider: String, model_id: String) {
         let mut cfg = self.config.lock().await;
+        let prev_provider = cfg.model_provider.clone();
+        let prev_model = cfg.model_id.clone();
         cfg.model_provider = provider.clone();
         cfg.model_id = model_id.clone();
         drop(cfg);
-        self.pending.lock().await.push(PendingWrite::ModelChange { provider, model_id });
+        self.pending.lock().await.push(PendingWrite::ModelChange {
+            provider: provider.clone(),
+            model_id: model_id.clone(),
+        });
+        self.dispatch(HarnessEvent::ModelSelect {
+            provider,
+            model_id,
+            previous_provider: Some(prev_provider),
+            previous_model_id: Some(prev_model),
+        }).await;
     }
 
     pub async fn set_active_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
@@ -344,6 +564,12 @@ impl AgentHarness {
         let msg = AgentMessage::user_text(text);
         let id = self.session.lock().await.append_message(msg).await?;
         Ok(id)
+    }
+
+    /// Test / inspection accessor for the underlying session. Hold the lock
+    /// briefly — the harness needs to acquire it during turns and writes.
+    pub fn session(&self) -> Arc<Mutex<Session>> {
+        self.session.clone()
     }
 
     pub async fn append_message(&self, message: AgentMessage) -> Result<String, HarnessError> {
@@ -397,13 +623,99 @@ impl AgentHarness {
             .await?)
     }
 
+    /// Append (or queue, if not idle) a custom plugin entry.
+    pub async fn record_custom(
+        &self,
+        custom_type: &str,
+        data: Option<serde_json::Value>,
+    ) -> Result<String, HarnessError> {
+        if *self.phase.lock().await != HarnessPhase::Idle {
+            self.pending.lock().await.push(PendingWrite::Custom {
+                custom_type: custom_type.to_string(),
+                data,
+            });
+            return Ok(String::new());
+        }
+        Ok(self.session.lock().await.append_custom(custom_type, data).await?)
+    }
+
+    /// Append (or queue) a custom plugin message.
+    pub async fn record_custom_message(
+        &self,
+        custom_type: &str,
+        content: serde_json::Value,
+        display: bool,
+        details: Option<serde_json::Value>,
+    ) -> Result<String, HarnessError> {
+        if *self.phase.lock().await != HarnessPhase::Idle {
+            self.pending.lock().await.push(PendingWrite::CustomMessage {
+                custom_type: custom_type.to_string(),
+                content,
+                display,
+                details,
+            });
+            return Ok(String::new());
+        }
+        Ok(self.session.lock().await
+            .append_custom_message(custom_type, content, display, details)
+            .await?)
+    }
+
+    /// Attach (or queue, or remove if `label` is `None`) a label on `target_id`.
+    pub async fn record_label(
+        &self,
+        target_id: &str,
+        label: Option<String>,
+    ) -> Result<String, HarnessError> {
+        if *self.phase.lock().await != HarnessPhase::Idle {
+            self.pending.lock().await.push(PendingWrite::Label {
+                target_id: target_id.to_string(),
+                label,
+            });
+            return Ok(String::new());
+        }
+        Ok(self.session.lock().await.append_label(target_id, label).await?)
+    }
+
+    /// Update (or queue) the session-info name.
+    pub async fn set_session_name(&self, name: &str) -> Result<String, HarnessError> {
+        if *self.phase.lock().await != HarnessPhase::Idle {
+            self.pending.lock().await.push(PendingWrite::SessionInfo {
+                name: Some(name.to_string()),
+            });
+            return Ok(String::new());
+        }
+        Ok(self.session.lock().await.append_session_name(name).await?)
+    }
+
+    /// Move (or queue a move of) the session leaf pointer.
+    pub async fn move_leaf(&self, target_id: Option<&str>) -> Result<(), HarnessError> {
+        if *self.phase.lock().await != HarnessPhase::Idle {
+            self.pending.lock().await.push(PendingWrite::Leaf {
+                target_id: target_id.map(|s| s.to_string()),
+            });
+            return Ok(());
+        }
+        self.session.lock().await.move_to(target_id, None).await?;
+        Ok(())
+    }
+
     pub async fn navigate_tree(
         &self,
         entry_id: Option<&str>,
         summary: Option<BranchSummaryOptions>,
     ) -> Result<Option<String>, HarnessError> {
         self.require_idle().await?;
-        Ok(self.session.lock().await.move_to(entry_id, summary).await?)
+        // Hold the BranchSummary phase for the duration of the call so a
+        // concurrent turn / compaction can't race with branch summarization.
+        *self.phase.lock().await = HarnessPhase::BranchSummary;
+        self.flush_pending().await?;
+
+        let result = self.session.lock().await.move_to(entry_id, summary).await;
+
+        *self.phase.lock().await = HarnessPhase::Idle;
+        self.dispatch(HarnessEvent::Settled).await;
+        Ok(result?)
     }
 
     // -----------------------------------------------------------------------
@@ -451,10 +763,348 @@ impl AgentHarness {
     }
 
     // -----------------------------------------------------------------------
+    // Auto-compaction trigger + retry decision (the `_handlePostAgentRun`
+    // state machine, in pi-mono terms).
+    // -----------------------------------------------------------------------
+
+    /// Cached last assistant message from the just-completed turn. Returns
+    /// `None` until a turn produces an assistant message.
+    pub async fn last_assistant_message(&self) -> Option<AgentMessage> {
+        self.last_assistant_message.lock().await.clone()
+    }
+
+    /// Test-only: override the cached last-assistant-message.
+    #[doc(hidden)]
+    pub async fn set_last_assistant_for_test(&self, msg: Option<AgentMessage>) {
+        *self.last_assistant_message.lock().await = msg;
+    }
+
+    /// Test-only: read overflow_recovery_attempted flag.
+    #[doc(hidden)]
+    pub async fn overflow_recovery_attempted_for_test(&self) -> bool {
+        *self.overflow_recovery_attempted.lock().await
+    }
+
+    /// Test-only: read retry_attempt counter.
+    #[doc(hidden)]
+    pub async fn retry_attempt_for_test(&self) -> u32 {
+        *self.retry_attempt.lock().await
+    }
+
+    /// Configure the auto-retry settings (enabled / max_retries / base_delay_ms).
+    pub async fn set_retry_settings(&self, settings: crate::auto_retry::RetrySettings) {
+        *self.retry_settings.lock().await = settings;
+    }
+
+    /// Reset the overflow / retry state machines. Called automatically when a
+    /// new prompt is submitted; callers rarely need to invoke directly.
+    pub async fn reset_recovery_state(&self) {
+        *self.overflow_recovery_attempted.lock().await = false;
+        *self.retry_attempt.lock().await = 0;
+    }
+
+    /// Run the post-turn dispatch logic against the just-completed assistant
+    /// message. Returns a `PostRunDecision` describing whether the caller
+    /// should re-run the turn (compact-and-retry / auto-retry) or stop.
+    ///
+    /// Mirrors pi-mono's `_handlePostAgentRun` + `_checkCompaction` +
+    /// `_isRetryableError` + `_prepareRetry` flow. The harness itself does
+    /// not loop — callers (or a higher-level wrapper) decide whether to
+    /// continue based on the returned decision.
+    pub async fn check_post_run(
+        &self,
+        compaction_settings: &CompactionSettings,
+        compaction_stream_fn: &CompactionStreamFn,
+    ) -> Result<PostRunDecision, HarnessError> {
+        self.check_post_run_inner(compaction_settings, compaction_stream_fn, true).await
+    }
+
+    /// Inner check used by both `check_post_run` (post-turn) and
+    /// `check_pre_prompt` (pre-prompt). When `skip_aborted` is true, an
+    /// aborted prior turn short-circuits to `Stop`. When false, aborted
+    /// turns still flow into the threshold-compaction path so the
+    /// follow-up prompt sees a clean context. Mirrors pi-mono
+    /// `_checkCompaction(_, skipAbortedCheck)`.
+    async fn check_post_run_inner(
+        &self,
+        compaction_settings: &CompactionSettings,
+        compaction_stream_fn: &CompactionStreamFn,
+        skip_aborted: bool,
+    ) -> Result<PostRunDecision, HarnessError> {
+        let Some(msg) = self.last_assistant_message().await else {
+            return Ok(PostRunDecision::Stop);
+        };
+        let AgentMessage::Assistant {
+            stop_reason,
+            timestamp: msg_timestamp,
+            provider: msg_provider,
+            model: msg_model,
+            usage: msg_usage,
+            ..
+        } = &msg
+        else {
+            return Ok(PostRunDecision::Stop);
+        };
+
+        // Skip aborted / cancelled turns unless the caller (pre-prompt
+        // path) explicitly opted in to handling them.
+        if skip_aborted && *stop_reason == StopReason::Aborted {
+            return Ok(PostRunDecision::Stop);
+        }
+
+        let cfg = self.config.lock().await;
+        let cur_provider = cfg.model_provider.clone();
+        let cur_model_id = cfg.model_id.clone();
+        drop(cfg);
+
+        let resources = self.resources.lock().await;
+        let context_window = resources.model_info.as_ref().map(|m| m.context_window).unwrap_or(0);
+        drop(resources);
+
+        // Stale-message protection: a pre-compaction usage record must not
+        // re-trigger compaction on the next prompt. Compare timestamps.
+        if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await {
+            if (*msg_timestamp as i64) <= latest_compaction_ts {
+                return Ok(PostRunDecision::Stop);
+            }
+        }
+
+        let same_model = msg_provider == &cur_provider && msg_model == &cur_model_id;
+
+        // ── 1. Auto-retry on transient errors (5xx / 429 / network) ──
+        // Tried before compaction because retry is cheaper. Overflow errors
+        // are filtered out by `is_retryable_error`.
+        if *stop_reason == StopReason::Error {
+            let settings = *self.retry_settings.lock().await;
+            if same_model && is_retryable_error(&msg, Some(context_window)) {
+                let next_attempt = *self.retry_attempt.lock().await + 1;
+                if let Some(delay_ms) = compute_retry_delay(next_attempt, &settings) {
+                    *self.retry_attempt.lock().await = next_attempt;
+                    let err = msg.assistant_error_message().unwrap_or_default();
+                    self.dispatch(HarnessEvent::AutoRetryStart {
+                        attempt: next_attempt,
+                        max_attempts: settings.max_retries,
+                        delay_ms,
+                        error_message: err.to_string(),
+                    }).await;
+                    // Drop the error message from session state so the retry
+                    // doesn't re-include it as context.
+                    self.drop_last_assistant_from_session().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    return Ok(PostRunDecision::Retry { attempt: next_attempt });
+                } else {
+                    // Exhausted; emit retry_end with the final failure.
+                    let attempt = *self.retry_attempt.lock().await;
+                    *self.retry_attempt.lock().await = 0;
+                    self.dispatch(HarnessEvent::AutoRetryEnd {
+                        success: false,
+                        attempt,
+                        final_error: msg.assistant_error_message().map(|s| s.to_string()),
+                    }).await;
+                }
+            }
+        } else if *self.retry_attempt.lock().await > 0 {
+            // Successful response after a retry — emit retry_end.
+            let attempt = *self.retry_attempt.lock().await;
+            *self.retry_attempt.lock().await = 0;
+            self.dispatch(HarnessEvent::AutoRetryEnd {
+                success: true,
+                attempt,
+                final_error: None,
+            }).await;
+        }
+
+        // ── 2. Overflow path (drop error msg, compact, retry once) ──
+        if same_model && is_context_overflow(&msg, Some(context_window)) {
+            if *self.overflow_recovery_attempted.lock().await {
+                self.dispatch(HarnessEvent::CompactionEnd {
+                    reason: CompactionReason::Overflow,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(
+                        "Context overflow recovery failed after one compact-and-retry attempt. \
+                         Try reducing context or switching to a larger-context model.".into(),
+                    ),
+                }).await;
+                return Ok(PostRunDecision::Stop);
+            }
+            *self.overflow_recovery_attempted.lock().await = true;
+            self.drop_last_assistant_from_session().await;
+            self.run_auto_compaction(CompactionReason::Overflow, true, compaction_settings, compaction_stream_fn).await?;
+            return Ok(PostRunDecision::CompactedRetry);
+        }
+
+        // ── 3. Threshold path — compact but don't retry. ──
+        // For error-stop messages with no usage, fall back to estimating
+        // from the last successful assistant in the branch.
+        let context_tokens = if *stop_reason == StopReason::Error {
+            let session_ctx = self.session.lock().await.build_context().await?;
+            let est = estimate_context_tokens_with_source(&session_ctx.messages);
+            let Some(idx) = est.last_usage_index else {
+                return Ok(PostRunDecision::Stop);  // No usage data anywhere.
+            };
+            // Verify the source isn't pre-compaction either.
+            if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await {
+                if let Some(AgentMessage::Assistant { timestamp, .. }) = session_ctx.messages.get(idx) {
+                    if (*timestamp as i64) <= latest_compaction_ts {
+                        return Ok(PostRunDecision::Stop);
+                    }
+                }
+            }
+            est.tokens
+        } else {
+            // Successful response — use the message's own usage.
+            let total = msg_usage.total_tokens.max(
+                msg_usage.input + msg_usage.output + msg_usage.cache_read + msg_usage.cache_write,
+            );
+            total as usize
+        };
+
+        if should_compact_at_threshold(context_tokens, context_window as usize, compaction_settings) {
+            self.run_auto_compaction(CompactionReason::Threshold, false, compaction_settings, compaction_stream_fn).await?;
+            // Threshold-triggered compaction does not auto-retry the turn.
+        }
+        Ok(PostRunDecision::Stop)
+    }
+
+    /// Internal helper that runs a compaction with `compaction_start` /
+    /// `compaction_end` events.
+    async fn run_auto_compaction(
+        &self,
+        reason: CompactionReason,
+        will_retry: bool,
+        settings: &CompactionSettings,
+        stream_fn: &CompactionStreamFn,
+    ) -> Result<(), HarnessError> {
+        self.dispatch(HarnessEvent::CompactionStart { reason }).await;
+        let result = self.compact(settings, stream_fn).await;
+        match result {
+            Ok(r) => {
+                self.dispatch(HarnessEvent::CompactionEnd {
+                    reason,
+                    result: r,
+                    aborted: false,
+                    will_retry,
+                    error_message: None,
+                }).await;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.dispatch(HarnessEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted: matches!(e, HarnessError::Compaction(CompactionError::Aborted)),
+                    will_retry: false,
+                    error_message: Some(msg),
+                }).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Walk the current branch in reverse to find the most recent compaction
+    /// timestamp (millis since epoch), if any.
+    async fn latest_compaction_timestamp(&self) -> Option<i64> {
+        let branch = self.session.lock().await.get_branch().await.ok()?;
+        for entry in branch.iter().rev() {
+            if let SessionTreeEntry::Compaction { timestamp, .. } = entry {
+                return chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .ok()
+                    .map(|dt| dt.timestamp_millis());
+            }
+        }
+        None
+    }
+
+    /// Drop the last assistant entry from the in-memory session view. Used
+    /// before retry / overflow recovery so the context doesn't include the
+    /// error message on the re-run.
+    async fn drop_last_assistant_from_session(&self) {
+        // The session model is append-only; we add a leaf-move write that
+        // reverts to the parent of the last entry. This mirrors pi-mono's
+        // `agent.state.messages.slice(0, -1)`.
+        let branch = match self.session.lock().await.get_branch().await {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        // Find the last assistant message entry.
+        let target_parent = branch.iter().rev().find_map(|e| {
+            if let SessionTreeEntry::Message { message, parent_id, .. } = e {
+                if matches!(message, AgentMessage::Assistant { .. }) {
+                    return Some(parent_id.clone());
+                }
+            }
+            None
+        });
+        if let Some(parent) = target_parent.flatten() {
+            let _ = self.session.lock().await.move_to(Some(&parent), None).await;
+        }
+    }
+}
+
+/// Decision returned by [`AgentHarness::check_post_run`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PostRunDecision {
+    /// Caller should re-run the same turn — compaction completed (overflow
+    /// recovery), error message has been dropped from the session view.
+    CompactedRetry,
+    /// Caller should re-run the same turn — auto-retry triggered after a
+    /// transient error, error message dropped, backoff slept.
+    Retry { attempt: u32 },
+    /// No further action; the turn is settled.
+    Stop,
+}
+
+fn should_compact_at_threshold(
+    context_tokens: usize,
+    context_window: usize,
+    settings: &CompactionSettings,
+) -> bool {
+    if !settings.enabled || context_window == 0 {
+        return false;
+    }
+    // Pi-mono uses `(context_window - reserve_tokens)` as the soft cap;
+    // we approximate by triggering when free space drops below
+    // `keep_recent_tokens` plus a small buffer.
+    let cap = context_window.saturating_sub(settings.reserve_tokens);
+    context_tokens >= cap
+}
+
+impl AgentHarness {
     // Turn execution — drives the agent loop with current resources / hooks.
     // -----------------------------------------------------------------------
 
     pub async fn execute_turn(
+        &self,
+        prompts: Vec<AgentMessage>,
+    ) -> Result<Vec<AgentMessage>, HarnessError> {
+        self.require_idle().await?;
+        // Reset overflow + retry state at the start of every fresh user turn.
+        self.reset_recovery_state().await;
+
+        // Pre-prompt compaction check (pi-mono parity): if an
+        // auto-compaction strategy was installed, check whether the prior
+        // turn left aborted / error state and, if so, compact before the
+        // new prompt arrives.
+        if let Some(cfg) = self.auto_compaction.lock().await.clone() {
+            // `check_pre_prompt` does its own no-op early-exit when there's
+            // nothing to clean up, so this is cheap on the happy path.
+            self.check_pre_prompt(&cfg.settings, &cfg.stream_fn).await?;
+        }
+
+        self.continue_turn(prompts).await
+    }
+
+    /// Like [`execute_turn`] but does **not** reset overflow / retry counters.
+    /// Used internally after `check_post_run` returns `CompactedRetry` /
+    /// `Retry` so the recovery state machine carries across the re-run.
+    ///
+    /// Also accepts an optional compaction stream fn for the pre-prompt check:
+    /// if the last assistant message is an aborted / overflow response, compact
+    /// before running the new turn (pi-mono `agent-session.ts:1041-1052`).
+    pub async fn continue_turn(
         &self,
         prompts: Vec<AgentMessage>,
     ) -> Result<Vec<AgentMessage>, HarnessError> {
@@ -471,6 +1121,34 @@ impl AgentHarness {
         *self.phase.lock().await = HarnessPhase::Idle;
         self.dispatch(HarnessEvent::Settled).await;
         result
+    }
+
+    /// Pre-prompt compaction check: if the last assistant message is an
+    /// aborted / overflow response, compact before the new turn so the
+    /// context is clean. Returns `true` if compaction ran (caller may want
+    /// to `continue_turn` with empty prompts to let the model re-run).
+    ///
+    /// Mirrors pi-mono `agent-session.ts:1041-1052`.
+    pub async fn check_pre_prompt(
+        &self,
+        compaction_settings: &CompactionSettings,
+        compaction_stream_fn: &CompactionStreamFn,
+    ) -> Result<bool, HarnessError> {
+        let Some(msg) = self.last_assistant_message().await else {
+            return Ok(false);
+        };
+        let AgentMessage::Assistant { stop_reason, .. } = &msg else {
+            return Ok(false);
+        };
+        // Only act on aborted or error-terminated turns.
+        if !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
+            return Ok(false);
+        }
+        // Pre-prompt path: process aborted messages too (skip_aborted=false).
+        let dec = self
+            .check_post_run_inner(compaction_settings, compaction_stream_fn, false)
+            .await?;
+        Ok(dec != PostRunDecision::Stop)
     }
 
     async fn run_turn(
@@ -515,16 +1193,46 @@ impl AgentHarness {
             api_key: opts.api_key.clone(),
             get_steering_messages: {
                 let q = self.steer_queue.clone();
+                let mode = self.steer_mode.clone();
                 Some(Arc::new(move || {
                     let q = q.clone();
-                    Box::pin(async move { std::mem::take(&mut *q.lock().await) })
+                    let mode = mode.clone();
+                    Box::pin(async move {
+                        let mode = *mode.lock().await;
+                        let mut guard = q.lock().await;
+                        match mode {
+                            crate::queue::QueueMode::All => std::mem::take(&mut *guard),
+                            crate::queue::QueueMode::OneAtATime => {
+                                if guard.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![guard.remove(0)]
+                                }
+                            }
+                        }
+                    })
                 }))
             },
             get_follow_up_messages: {
                 let q = self.follow_up_queue.clone();
+                let mode = self.follow_up_mode.clone();
                 Some(Arc::new(move || {
                     let q = q.clone();
-                    Box::pin(async move { std::mem::take(&mut *q.lock().await) })
+                    let mode = mode.clone();
+                    Box::pin(async move {
+                        let mode = *mode.lock().await;
+                        let mut guard = q.lock().await;
+                        match mode {
+                            crate::queue::QueueMode::All => std::mem::take(&mut *guard),
+                            crate::queue::QueueMode::OneAtATime => {
+                                if guard.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![guard.remove(0)]
+                                }
+                            }
+                        }
+                    })
                 }))
             },
             tool_execution: opts.tool_execution.unwrap_or(ToolExecutionMode::Parallel),
@@ -552,14 +1260,20 @@ impl AgentHarness {
         let session = self.session.clone();
         let listeners = self.listeners.clone();
         let abort = self.abort.clone();
+        let last_assistant = self.last_assistant_message.clone();
         let emit: AgentEventSink = Arc::new(move |event: AgentEvent| {
             let session = session.clone();
             let listeners = listeners.clone();
             let abort = abort.clone();
+            let last_assistant = last_assistant.clone();
             Box::pin(async move {
-                // Persist message_end events to the session.
+                // Persist message_end events to the session and cache the
+                // most recent assistant message for `_handlePostAgentRun`.
                 if let AgentEvent::MessageEnd { ref message } = event {
                     let _ = session.lock().await.append_message(message.clone()).await;
+                    if matches!(message, AgentMessage::Assistant { .. }) {
+                        *last_assistant.lock().await = Some(message.clone());
+                    }
                 }
                 let signal = Some(abort.lock().await.clone());
                 let listeners = listeners.lock().await.clone();
@@ -604,6 +1318,23 @@ impl AgentHarness {
                 }
                 PendingWrite::BranchSummary { from_id, summary, details } => {
                     session.append_branch_summary(&from_id, &summary, details, None).await?;
+                }
+                PendingWrite::Custom { custom_type, data } => {
+                    session.append_custom(&custom_type, data).await?;
+                }
+                PendingWrite::CustomMessage { custom_type, content, display, details } => {
+                    session.append_custom_message(&custom_type, content, display, details).await?;
+                }
+                PendingWrite::Label { target_id, label } => {
+                    session.append_label(&target_id, label).await?;
+                }
+                PendingWrite::SessionInfo { name } => {
+                    if let Some(n) = name {
+                        session.append_session_name(&n).await?;
+                    }
+                }
+                PendingWrite::Leaf { target_id } => {
+                    session.move_to(target_id.as_deref(), None).await?;
                 }
             }
         }

@@ -562,6 +562,15 @@ impl AgentMessage {
         if let Self::Assistant { content, .. } = self { Some(content) } else { None }
     }
 
+    /// Returns the assistant `errorMessage` field if set.
+    pub fn assistant_error_message(&self) -> Option<&str> {
+        if let Self::Assistant { error_message, .. } = self {
+            error_message.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Returns the assistant `stopReason` if this is an assistant message.
     pub fn stop_reason(&self) -> Option<StopReason> {
         if let Self::Assistant { stop_reason, .. } = self { Some(*stop_reason) } else { None }

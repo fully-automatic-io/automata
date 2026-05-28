@@ -178,7 +178,7 @@ impl AgentTool for WriteTool {
         _tool_call_id: String,
         params: serde_json::Value,
         _signal: Option<CancellationToken>,
-        _on_update: Option<AgentToolUpdateCallback>,
+        on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let path = params
             .get("path")
@@ -233,6 +233,24 @@ impl AgentTool for WriteTool {
                 Ensure this is intentional.",
                 path
             ));
+        }
+
+        // Emit streaming partial: full content preview before disk write hits.
+        if let Some(cb) = on_update.as_ref() {
+            let partial = AgentToolResult {
+                content: vec![ContentBlock::Text {
+                    text: final_content.clone(),
+                }],
+                details: serde_json::to_value(WriteToolDetails {
+                    bytes: final_content.len(),
+                    file_exists,
+                    emojis_filtered: content != final_content,
+                    is_documentation: is_documentation_file(path),
+                })
+                .unwrap_or_default(),
+                terminate: false,
+            };
+            cb(partial);
         }
 
         // Create parent directories
@@ -351,5 +369,36 @@ mod tests {
         });
         let result = tool.execute("test".into(), params, None, None).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn streaming_callback_receives_preview_before_write() {
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteTool::new(
+            dir.path().to_string_lossy().into_owned(),
+            WriteToolOptions::default(),
+        );
+
+        let updates: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let on_update: AgentToolUpdateCallback = Box::new(move |partial: AgentToolResult| {
+            for block in &partial.content {
+                if let ContentBlock::Text { text } = block {
+                    updates_clone.lock().unwrap().push(text.clone());
+                }
+            }
+        });
+
+        let params = serde_json::json!({
+            "path": "preview.txt",
+            "content": "hello streaming preview"
+        });
+        let result = tool.execute("test".into(), params, None, Some(on_update)).await;
+        assert!(result.is_ok());
+
+        let collected = updates.lock().unwrap();
+        assert_eq!(collected.len(), 1, "expected one preview update");
+        assert_eq!(collected[0], "hello streaming preview");
     }
 }

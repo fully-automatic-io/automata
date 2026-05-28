@@ -396,12 +396,11 @@ impl AgentTool for ReadTool {
         let limit = params.get("limit")
             .and_then(|v| v.as_u64());
 
-        // Resolve absolute path
-        let absolute_path = if Path::new(path).is_absolute() {
-            path.to_string()
-        } else {
-            Path::new(&self.cwd).join(path).to_string_lossy().to_string()
-        };
+        // Resolve absolute path — try macOS filename variants if the canonical
+        // path doesn't exist (screenshot AM/PM space, NFD, curly quotes).
+        let absolute_path = crate::tools::path_utils::resolve_read_path(path, &self.cwd)
+            .to_string_lossy()
+            .into_owned();
 
         // Check file exists and is accessible
         self.operations.access(&absolute_path).await

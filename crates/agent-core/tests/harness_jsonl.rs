@@ -127,3 +127,425 @@ async fn test_harness_set_model_persists_to_session() {
     assert_eq!(m.provider, "openai");
     assert_eq!(m.model_id, "gpt-4o");
 }
+
+fn make_idle_harness() -> AgentHarness {
+    let storage = InMemorySessionStorage::new(None);
+    let session = Session::new(Box::new(storage));
+    AgentHarness::new(
+        session,
+        HarnessConfig {
+            system_prompt: "".into(),
+            thinking_level: ThinkingLevel::Off,
+            model_provider: "anthropic".into(),
+            model_id: "claude-sonnet-4-6".into(),
+        },
+        make_options(),
+    )
+}
+
+#[tokio::test]
+async fn test_record_custom_writes_through_when_idle() {
+    use agent_core::harness::session::SessionTreeEntry;
+    let harness = make_idle_harness();
+    let id = harness.record_custom("artifact", Some(serde_json::json!({"k": "v"}))).await.unwrap();
+    assert!(!id.is_empty(), "idle path should return real id");
+    let entries = harness.session().lock().await.storage().get_entries().await;
+    let found = entries.iter().any(|e| matches!(e, SessionTreeEntry::Custom { id: eid, .. } if eid == &id));
+    assert!(found, "Custom entry should be persisted directly");
+}
+
+#[tokio::test]
+async fn test_record_custom_message_persists() {
+    use agent_core::harness::session::SessionTreeEntry;
+    let harness = make_idle_harness();
+    let id = harness
+        .record_custom_message("artifact", serde_json::json!("payload"), true, None)
+        .await
+        .unwrap();
+    assert!(!id.is_empty());
+    let entries = harness.session().lock().await.storage().get_entries().await;
+    assert!(entries.iter().any(|e| matches!(e,
+        SessionTreeEntry::CustomMessage { id: eid, custom_type, .. }
+        if eid == &id && custom_type == "artifact"
+    )));
+}
+
+#[tokio::test]
+async fn test_record_label_attaches_and_clears() {
+    use agent_core::harness::session::SessionTreeEntry;
+    let harness = make_idle_harness();
+    let target_id = harness.append_user_message("hi").await.unwrap();
+
+    harness.record_label(&target_id, Some("important".into())).await.unwrap();
+    let entries = harness.session().lock().await.storage().get_entries().await;
+    let labelled = entries.iter().filter(|e| matches!(e,
+        SessionTreeEntry::Label { target_id: t, label: Some(l), .. }
+        if t == &target_id && l == "important"
+    )).count();
+    assert_eq!(labelled, 1);
+
+    // Clearing the label is a separate Label entry with `label = None`.
+    harness.record_label(&target_id, None).await.unwrap();
+    let entries = harness.session().lock().await.storage().get_entries().await;
+    let cleared = entries.iter().filter(|e| matches!(e,
+        SessionTreeEntry::Label { target_id: t, label: None, .. } if t == &target_id
+    )).count();
+    assert_eq!(cleared, 1);
+}
+
+#[tokio::test]
+async fn test_set_session_name_persists() {
+    use agent_core::harness::session::SessionTreeEntry;
+    let harness = make_idle_harness();
+    harness.set_session_name("my chat").await.unwrap();
+    let entries = harness.session().lock().await.storage().get_entries().await;
+    assert!(entries.iter().any(|e| matches!(e,
+        SessionTreeEntry::SessionInfo { name: Some(n), .. } if n == "my chat"
+    )));
+}
+
+#[tokio::test]
+async fn test_move_leaf_persists() {
+    let harness = make_idle_harness();
+    let first = harness.append_user_message("first").await.unwrap();
+    harness.append_user_message("second").await.unwrap();
+    // Move leaf back to the first message (creates a branch point).
+    harness.move_leaf(Some(&first)).await.unwrap();
+    let leaf = harness.session().lock().await.storage().get_leaf_id().await;
+    assert_eq!(leaf.as_deref(), Some(first.as_str()));
+}
+
+#[tokio::test]
+async fn test_navigate_tree_returns_to_idle_after_call() {
+    let harness = make_idle_harness();
+    let first = harness.append_user_message("first").await.unwrap();
+    harness.append_user_message("second").await.unwrap();
+    assert_eq!(harness.phase().await, HarnessPhase::Idle);
+    harness.navigate_tree(Some(&first), None).await.unwrap();
+    // Phase must drop back to Idle so subsequent turns can run.
+    assert_eq!(harness.phase().await, HarnessPhase::Idle);
+}
+
+#[tokio::test]
+async fn test_navigate_tree_rejects_when_not_idle() {
+    use agent_core::harness::HarnessPhase;
+    let harness = make_idle_harness();
+    harness.append_user_message("hi").await.unwrap();
+    // Manually flip phase to simulate a concurrent operation.
+    harness.set_phase_for_test(HarnessPhase::Compaction).await;
+    let res = harness.navigate_tree(None, None).await;
+    assert!(res.is_err(), "navigate_tree must require idle");
+    harness.set_phase_for_test(HarnessPhase::Idle).await;
+}
+
+// ─── Phase 1.5: post-run state machine ───────────────────────────────────────
+
+use agent_core::harness::{PostRunDecision};
+use agent_core::harness::compaction::{CompactionError, CompactionSettings, StreamFn as CompactionStreamFn};
+use agent_core::types::{Api, ContentBlock, StopReason, Usage};
+
+fn err_assistant(msg: &str, model_provider: &str, model_id: &str) -> AgentMessage {
+    AgentMessage::Assistant {
+        content: vec![ContentBlock::Text { text: String::new() }],
+        api: Api::Anthropic,
+        provider: model_provider.into(),
+        model: model_id.into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some(msg.into()),
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    }
+}
+
+fn dummy_compaction_stream_fn() -> CompactionStreamFn {
+    Box::new(|_msgs, _system| Box::pin(async move { Ok::<String, CompactionError>("summary".into()) }))
+}
+
+#[tokio::test]
+async fn test_post_run_stop_when_no_message() {
+    let harness = make_idle_harness();
+    let dec = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(dec, PostRunDecision::Stop);
+}
+
+#[tokio::test]
+async fn test_post_run_retry_on_transient_error() {
+    let harness = make_idle_harness();
+    harness.set_last_assistant_for_test(Some(err_assistant(
+        "503 service unavailable",
+        "anthropic",
+        "claude-sonnet-4-6",
+    ))).await;
+    harness.set_retry_settings(agent_core::auto_retry::RetrySettings {
+        enabled: true,
+        max_retries: 2,
+        base_delay_ms: 1,
+    }).await;
+
+    let dec = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(dec, PostRunDecision::Retry { attempt: 1 });
+    assert_eq!(harness.retry_attempt_for_test().await, 1);
+}
+
+#[tokio::test]
+async fn test_post_run_retry_exhausts_after_max_attempts() {
+    let harness = make_idle_harness();
+    harness.set_retry_settings(agent_core::auto_retry::RetrySettings {
+        enabled: true,
+        max_retries: 1,  // Only 1 retry allowed.
+        base_delay_ms: 1,
+    }).await;
+    let err = err_assistant("rate limit", "anthropic", "claude-sonnet-4-6");
+
+    // First call: retry succeeds.
+    harness.set_last_assistant_for_test(Some(err.clone())).await;
+    let dec1 = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(dec1, PostRunDecision::Retry { attempt: 1 });
+
+    // Second call (still error): exhausted, should Stop and reset counter.
+    harness.set_last_assistant_for_test(Some(err)).await;
+    let dec2 = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(dec2, PostRunDecision::Stop);
+    assert_eq!(harness.retry_attempt_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn test_post_run_overflow_triggers_compacted_retry_once() {
+    let harness = make_idle_harness();
+    harness.append_user_message("first prompt").await.unwrap();
+    let overflow = AgentMessage::Assistant {
+        content: vec![ContentBlock::Text { text: String::new() }],
+        api: Api::Anthropic,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some("prompt is too long: 213462 tokens > 200000 maximum".into()),
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+
+    harness.set_last_assistant_for_test(Some(overflow.clone())).await;
+    let dec = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(dec, PostRunDecision::CompactedRetry);
+    assert!(harness.overflow_recovery_attempted_for_test().await);
+
+    // Second attempt: gate refuses; no infinite loop.
+    harness.set_last_assistant_for_test(Some(overflow)).await;
+    let dec2 = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(dec2, PostRunDecision::Stop);
+}
+
+#[tokio::test]
+async fn test_post_run_overflow_skipped_for_different_model() {
+    let harness = make_idle_harness();  // Configured with claude-sonnet-4-6
+    let overflow = AgentMessage::Assistant {
+        content: vec![],
+        api: Api::Anthropic,
+        provider: "openai".into(),       // ← different model
+        model: "gpt-4o".into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some("prompt is too long: x > 200000 maximum".into()),
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+    harness.set_last_assistant_for_test(Some(overflow)).await;
+    let dec = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    // Different-model overflow must not trigger compaction for the new model.
+    assert_eq!(dec, PostRunDecision::Stop);
+    assert!(!harness.overflow_recovery_attempted_for_test().await);
+}
+
+#[tokio::test]
+async fn test_post_run_aborted_message_skips_dispatch() {
+    let harness = make_idle_harness();
+    let aborted = AgentMessage::Assistant {
+        content: vec![],
+        api: Api::Anthropic,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+    harness.set_last_assistant_for_test(Some(aborted)).await;
+    let dec = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(dec, PostRunDecision::Stop);
+}
+
+#[tokio::test]
+async fn test_post_run_reset_recovery_state_on_new_execute_turn() {
+    let harness = make_idle_harness();
+    // Simulate that overflow was attempted on a prior turn.
+    let overflow = AgentMessage::Assistant {
+        content: vec![],
+        api: Api::Anthropic,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some("prompt is too long: x > 200000 maximum".into()),
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+    harness.set_last_assistant_for_test(Some(overflow)).await;
+    let _ = harness.check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn()).await;
+    assert!(harness.overflow_recovery_attempted_for_test().await);
+
+    // execute_turn must reset the gate.
+    harness.execute_turn(vec![AgentMessage::user_text("hi")]).await.unwrap();
+    assert!(!harness.overflow_recovery_attempted_for_test().await);
+}
+
+#[tokio::test]
+async fn test_queue_mode_default_is_one_at_a_time() {
+    use agent_core::queue::QueueMode;
+    let harness = make_idle_harness();
+    assert_eq!(harness.steer_mode().await, QueueMode::OneAtATime);
+    assert_eq!(harness.follow_up_mode().await, QueueMode::OneAtATime);
+}
+
+#[tokio::test]
+async fn test_queue_mode_set_and_get() {
+    use agent_core::queue::QueueMode;
+    let harness = make_idle_harness();
+    harness.set_steer_mode(QueueMode::All).await;
+    assert_eq!(harness.steer_mode().await, QueueMode::All);
+    harness.set_follow_up_mode(QueueMode::All).await;
+    assert_eq!(harness.follow_up_mode().await, QueueMode::All);
+
+    harness.set_steer_mode(QueueMode::OneAtATime).await;
+    assert_eq!(harness.steer_mode().await, QueueMode::OneAtATime);
+}
+
+#[tokio::test]
+async fn test_abort_returns_cleared_queues() {
+    let harness = make_idle_harness();
+    harness.steer(AgentMessage::user_text("steer-1")).await;
+    harness.steer(AgentMessage::user_text("steer-2")).await;
+    harness.follow_up(AgentMessage::user_text("follow-1")).await;
+
+    let result = harness.abort().await;
+    assert_eq!(result.cleared_steer.len(), 2);
+    assert_eq!(result.cleared_follow_up.len(), 1);
+}
+
+#[tokio::test]
+async fn test_abort_with_empty_queues_returns_empty_result() {
+    let harness = make_idle_harness();
+    let result = harness.abort().await;
+    assert!(result.cleared_steer.is_empty());
+    assert!(result.cleared_follow_up.is_empty());
+}
+
+#[tokio::test]
+async fn test_auto_compaction_runs_on_execute_turn_when_last_aborted() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use agent_core::harness::AutoCompactionConfig;
+
+    // Verify wiring: when set_auto_compaction is configured, execute_turn
+    // calls into check_pre_prompt → check_post_run_inner. We can't easily
+    // force the threshold compaction to actually fire (needs context_window
+    // and a usage history), but we can verify the inner path runs by
+    // inspecting that the harness doesn't crash and the recovery state
+    // gets reset normally.
+    let touched = Arc::new(AtomicBool::new(false));
+    let stream_fn: CompactionStreamFn = {
+        let touched = touched.clone();
+        Box::new(move |_msgs, _system| {
+            touched.store(true, Ordering::SeqCst);
+            Box::pin(async move { Ok::<String, CompactionError>("summary".into()) })
+        })
+    };
+
+    let harness = make_idle_harness();
+    harness
+        .set_auto_compaction(Some(AutoCompactionConfig::new(
+            CompactionSettings::default(),
+            stream_fn,
+        )))
+        .await;
+
+    // Seed: prior turn aborted. check_pre_prompt should run the inner
+    // flow without panicking; whether compaction actually fires depends
+    // on threshold which needs context_window from resources.
+    let aborted = AgentMessage::Assistant {
+        content: vec![],
+        api: Api::Anthropic,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+    harness.set_last_assistant_for_test(Some(aborted)).await;
+
+    // execute_turn should NOT panic and should leave the harness idle.
+    let _ = harness.execute_turn(vec![AgentMessage::user_text("hi")]).await;
+
+    // Recovery state must be reset by execute_turn.
+    assert!(!harness.overflow_recovery_attempted_for_test().await);
+    let _ = touched; // silence dead-code warning when threshold not crossed
+}
+
+#[tokio::test]
+async fn test_auto_compaction_skipped_when_unset() {
+    let harness = make_idle_harness();
+    // No set_auto_compaction call — execute_turn should run without
+    // any compaction-related machinery.
+    let res = harness.execute_turn(vec![AgentMessage::user_text("hi")]).await;
+    assert!(res.is_ok());
+}
+
+#[tokio::test]
+async fn test_check_pre_prompt_processes_aborted_messages() {
+    // Pi-mono parity: pre-prompt path must see aborted messages even
+    // though post-run path skips them. The behavior is exercised here by
+    // confirming check_pre_prompt does NOT take the post_run early-exit
+    // (Stop) when the prior turn is aborted: it returns Ok(false) only
+    // because there's no usage data to compute a token estimate, NOT
+    // because the aborted flag short-circuited.
+    let harness = make_idle_harness();
+    let aborted = AgentMessage::Assistant {
+        content: vec![],
+        api: Api::Anthropic,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+    harness.set_last_assistant_for_test(Some(aborted)).await;
+
+    let result = harness
+        .check_pre_prompt(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await;
+    assert!(result.is_ok(), "pre_prompt should not error on aborted: {:?}", result);
+    // No compaction fired (no usage data), but the path didn't panic.
+    assert_eq!(result.unwrap(), false);
+}

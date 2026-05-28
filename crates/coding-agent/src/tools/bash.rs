@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::tools::output_accumulator::OutputAccumulator;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -297,7 +299,7 @@ impl AgentTool for BashTool {
         _tool_call_id: String,
         params: serde_json::Value,
         signal: Option<CancellationToken>,
-        _on_update: Option<AgentToolUpdateCallback>,
+        on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let command = params.get("command")
             .and_then(|v| v.as_str())
@@ -312,34 +314,46 @@ impl AgentTool for BashTool {
             command
         };
 
-        let temp_dir = std::env::temp_dir();
-        let temp_path = temp_dir.join(format!("bash-{}.log", uuid::Uuid::new_v4()));
-        let temp_path_str = temp_path.to_string_lossy().to_string();
+        let acc: Arc<Mutex<OutputAccumulator>> =
+            Arc::new(Mutex::new(OutputAccumulator::with_defaults()));
 
-        let chunks: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
-        let total_bytes: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-        let temp_file_written: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let on_update_arc: Option<Arc<AgentToolUpdateCallback>> = on_update.map(Arc::new);
 
         let on_data = {
-            let chunks = chunks.clone();
-            let total_bytes = total_bytes.clone();
-            let _temp_path = temp_path.clone();
-            let temp_file_written = temp_file_written.clone();
+            let acc = acc.clone();
+            let on_update = on_update_arc.clone();
             Arc::new(move |data: Vec<u8>| {
-                let mut t = total_bytes.lock().unwrap();
-                *t += data.len();
-                if *t > DEFAULT_MAX_BYTES && !*temp_file_written.lock().unwrap() {
-                    // Would write to temp file here
-                    *temp_file_written.lock().unwrap() = true;
+                let snap = {
+                    let mut a = acc.lock().unwrap();
+                    a.append(&data);
+                    a.snapshot(false)
+                };
+                if let Some(cb) = &on_update {
+                    let partial_text = if snap.content.is_empty() {
+                        String::new()
+                    } else {
+                        snap.content.clone()
+                    };
+                    let partial = AgentToolResult {
+                        content: vec![ContentBlock::Text { text: partial_text }],
+                        details: serde_json::to_value(BashToolDetails {
+                            truncation: if snap.truncation.truncated {
+                                Some(snap.truncation.clone())
+                            } else {
+                                None
+                            },
+                            full_output_path: snap.full_output_path.clone(),
+                        })
+                        .unwrap_or_default(),
+                        terminate: false,
+                    };
+                    cb(partial);
                 }
-                drop(t);
-
-                chunks.lock().unwrap().push(data);
             })
         };
 
         let options = BashExecOptions {
-            on_data: on_data.clone(),
+            on_data,
             signal: signal.clone(),
             timeout,
             env: None,
@@ -347,26 +361,28 @@ impl AgentTool for BashTool {
 
         let result = self.operations.exec(&resolved_command, &self.cwd, options).await;
 
-        let all_chunks: Vec<u8> = chunks.lock().unwrap().concat();
-        let full_output = String::from_utf8_lossy(&all_chunks).to_string();
+        let snap = {
+            let mut a = acc.lock().unwrap();
+            a.finish();
+            a.snapshot(true)
+        };
+
+        let full_output_path = snap.full_output_path.clone();
+        let truncation = snap.truncation.clone();
 
         match result {
             Ok(exec_result) => {
-                let truncation = truncate_tail(&full_output);
                 let mut output_text = if truncation.truncated {
-                    truncation.content.clone()
-                } else if full_output.is_empty() {
+                    let mut t = truncation.content.clone();
+                    if let Some(ref path) = full_output_path {
+                        t.push_str(&format!("\n\n[Output truncated. Full output: {}]", path));
+                    }
+                    t
+                } else if snap.content.is_empty() {
                     "(no output)".to_string()
                 } else {
-                    full_output.clone()
+                    snap.content.clone()
                 };
-
-                if truncation.truncated {
-                    output_text.push_str(&format!(
-                        "\n\n[Output truncated. Full output: {}]",
-                        temp_path_str
-                    ));
-                }
 
                 if let Some(code) = exec_result.exit_code {
                     if code != 0 {
@@ -382,20 +398,20 @@ impl AgentTool for BashTool {
                     content: vec![ContentBlock::Text { text: output_text }],
                     details: serde_json::to_value(BashToolDetails {
                         truncation: if truncation.truncated { Some(truncation) } else { None },
-                        full_output_path: Some(temp_path_str),
+                        full_output_path,
                     }).unwrap_or_default(),
                     terminate: false,
                 })
             }
             Err(e) => {
-                let mut output = full_output.clone();
                 let err_msg = e.to_string();
+                let mut output = snap.content.clone();
                 if err_msg.contains("aborted") {
                     if !output.is_empty() { output.push_str("\n\n"); }
                     output.push_str("Command aborted");
                 } else if err_msg.contains("timeout") {
                     if !output.is_empty() { output.push_str("\n\n"); }
-                    output.push_str(&format!("Command timed out"));
+                    output.push_str("Command timed out");
                 }
                 Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -444,5 +460,41 @@ mod tests {
         let tool = BashTool::new("/tmp".into(), BashToolOptions::default());
         let schema = tool.parameters();
         assert!(schema.get("required").unwrap().as_array().unwrap().contains(&serde_json::json!("command")));
+    }
+
+    #[tokio::test]
+    async fn streaming_callback_receives_partial_results() {
+        let tool = BashTool::new("/tmp".into(), BashToolOptions::default());
+        let updates: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let updates_clone = updates.clone();
+        let on_update: AgentToolUpdateCallback = Box::new(move |partial: AgentToolResult| {
+            for block in &partial.content {
+                if let ContentBlock::Text { text } = block {
+                    updates_clone.lock().unwrap().push(text.clone());
+                }
+            }
+        });
+
+        let params = serde_json::json!({
+            "command": "printf 'a\\nb\\nc\\n'"
+        });
+        let result = tool
+            .execute("test".into(), params, None, Some(on_update))
+            .await;
+        assert!(result.is_ok(), "bash should succeed: {:?}", result.err());
+
+        let collected = updates.lock().unwrap();
+        assert!(
+            !collected.is_empty(),
+            "expected at least one streaming partial update"
+        );
+        // Final partial should contain output from the command.
+        let last = collected.last().unwrap();
+        assert!(
+            last.contains('a') || last.contains('b') || last.contains('c'),
+            "expected partial to contain command output, got: {:?}",
+            last
+        );
     }
 }
