@@ -106,13 +106,11 @@ pub fn is_context_overflow(message: &AgentMessage, context_window: Option<u64>) 
     };
 
     // Case 1: error-message pattern.
-    if *stop_reason == StopReason::Error {
-        if let Some(msg) = error_message.as_deref() {
-            if !NON_OVERFLOW_SET.is_match(msg) && OVERFLOW_SET.is_match(msg) {
+    if *stop_reason == StopReason::Error
+        && let Some(msg) = error_message.as_deref()
+            && !NON_OVERFLOW_SET.is_match(msg) && OVERFLOW_SET.is_match(msg) {
                 return true;
             }
-        }
-    }
 
     let Some(window) = context_window else { return false };
 
@@ -127,7 +125,7 @@ pub fn is_context_overflow(message: &AgentMessage, context_window: Option<u64>) 
     // Case 3: length-stop overflow (truncated input + zero output + filled context).
     if *stop_reason == StopReason::MaxTokens && usage.output == 0 {
         let input_tokens = usage.input + usage.cache_read;
-        // Match pi-mono's 99% threshold so a small token-counting drift doesn't miss it.
+        // 99% threshold so a small token-counting drift doesn't miss it.
         if (input_tokens as f64) >= (window as f64) * 0.99 {
             return true;
         }

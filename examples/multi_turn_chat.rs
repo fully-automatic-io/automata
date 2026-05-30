@@ -40,7 +40,7 @@ async fn main() {
     let token = std::env::var("ANTHROPIC_AUTH_TOKEN")
         .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
         .expect("Set ANTHROPIC_AUTH_TOKEN (or DEEPSEEK_API_KEY)");
-    let model_id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
+    let model_id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into());
 
     let endpoint = format!("{}/v1/messages", base.trim_end_matches('/'));
     let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(

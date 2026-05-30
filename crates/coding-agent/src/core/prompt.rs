@@ -34,11 +34,10 @@ pub fn load_context_files(cwd: &Path) -> ContextFiles {
     while let Some(current) = dir {
         for name in &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"] {
             let path = current.join(name);
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&path) {
+            if path.exists()
+                && let Ok(content) = std::fs::read_to_string(&path) {
                     files.push(LoadedContextFile { path, content });
                 }
-            }
         }
         dir = current.parent().map(|p| p.to_path_buf());
     }
@@ -48,51 +47,14 @@ pub fn load_context_files(cwd: &Path) -> ContextFiles {
 
 // ── Skills ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-pub struct Skill {
-    pub name: String,
-    pub description: String,
-    pub content: String,
-    pub path: PathBuf,
-}
+// The canonical skill type lives in agent-core; re-export it so callers of
+// `build_system_prompt` use a single `Skill` across the workspace.
+pub use agent_core::harness::skills::{load_skills_from_dir, Skill};
 
+/// Load skills from a directory of `*.md` files (delegates to the canonical
+/// loader, which honors YAML frontmatter and `disable-model-invocation`).
 pub fn load_skills(dir: &Path) -> Vec<Skill> {
-    let mut skills = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return skills; };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let (name, description, body) = parse_frontmatter(&content);
-            let name = name.unwrap_or_else(|| {
-                path.file_stem().unwrap_or_default().to_string_lossy().to_string()
-            });
-            skills.push(Skill { name, description: description.unwrap_or_default(), content: body, path });
-        }
-    }
-    skills
-}
-
-fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>, String) {
-    if !content.starts_with("---") {
-        return (None, None, content.to_string());
-    }
-    let rest = &content[3..];
-    let Some(end) = rest.find("\n---") else {
-        return (None, None, content.to_string());
-    };
-    let frontmatter = &rest[..end];
-    let body = rest[end + 4..].trim_start_matches('\n').to_string();
-    let mut name = None;
-    let mut description = None;
-    for line in frontmatter.lines() {
-        if let Some(v) = line.strip_prefix("name:") {
-            name = Some(v.trim().trim_matches('"').to_string());
-        } else if let Some(v) = line.strip_prefix("description:") {
-            description = Some(v.trim().trim_matches('"').to_string());
-        }
-    }
-    (name, description, body)
+    load_skills_from_dir(dir)
 }
 
 pub fn discover_extension_paths(cwd: &Path, agent_dir: &Path) -> Vec<String> {
@@ -229,20 +191,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_frontmatter() {
-        let md = "---\nname: my-skill\ndescription: does stuff\n---\n# Body";
-        let (name, desc, body) = parse_frontmatter(md);
-        assert_eq!(name.as_deref(), Some("my-skill"));
-        assert_eq!(desc.as_deref(), Some("does stuff"));
-        assert!(body.contains("# Body"));
+    fn test_load_skills_parses_frontmatter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("my-skill.md"),
+            "---\nname: my-skill\ndescription: does stuff\n---\n# Body",
+        )
+        .unwrap();
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-skill");
+        assert_eq!(skills[0].description, "does stuff");
+        assert!(skills[0].content.contains("# Body"));
     }
 
     #[test]
-    fn test_parse_frontmatter_no_frontmatter() {
-        let md = "# Just content";
-        let (name, desc, body) = parse_frontmatter(md);
-        assert!(name.is_none());
-        assert!(desc.is_none());
-        assert_eq!(body, "# Just content");
+    fn test_load_skills_skips_files_without_description() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No frontmatter description -> the canonical loader skips it.
+        std::fs::write(dir.path().join("plain.md"), "# Just content").unwrap();
+        assert!(load_skills(dir.path()).is_empty());
     }
 }

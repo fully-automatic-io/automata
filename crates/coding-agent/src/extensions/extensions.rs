@@ -227,8 +227,7 @@ pub struct ProviderModelConfig {
     #[serde(skip_serializing_if = "Option::is_none")] pub headers: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelCost { pub input: f64, pub output: f64, #[serde(rename = "cacheRead")] pub cache_read: f64, #[serde(rename = "cacheWrite")] pub cache_write: f64 }
+pub use agent_core::types::ModelCost;
 
 // ── Loader ────────────────────────────────────────────────────────────────────
 
@@ -246,9 +245,9 @@ pub fn load_extensions(paths: &[String], cwd: &str) -> LoadExtensionsResult {
 }
 
 fn resolve_ext_path(ext_path: &str, cwd: &str) -> String {
-    let expanded = if ext_path.starts_with("~/") {
+    let expanded = if let Some(rest) = ext_path.strip_prefix("~/") {
         let home = dirs_next::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        format!("{}/{}", home, &ext_path[2..])
+        format!("{}/{}", home, rest)
     } else {
         ext_path.to_string()
     };
@@ -274,10 +273,10 @@ pub fn discover_and_load_extensions(configured_paths: &[String], cwd: &str, agen
     let mut all_paths = Vec::new();
     let mut seen = HashSet::new();
     let default_agent_dir = dirs_next::home_dir()
-        .map(|p| p.join(".pi").join("agent").to_string_lossy().to_string())
+        .map(|p| p.join(".automata").join("agent").to_string_lossy().to_string())
         .unwrap_or_default();
     let agent_dir = agent_dir.unwrap_or(&default_agent_dir);
-    discover_in_dir(&Path::new(cwd).join(".pi").join("extensions"), &mut all_paths, &mut seen);
+    discover_in_dir(&Path::new(cwd).join(".automata").join("extensions"), &mut all_paths, &mut seen);
     discover_in_dir(&Path::new(agent_dir).join("extensions"), &mut all_paths, &mut seen);
     for p in configured_paths {
         let resolved = resolve_ext_path(p, cwd);
@@ -338,11 +337,9 @@ impl ExtensionRunner {
         for ext in &self.extensions {
             if !ext.event_subscriptions.contains(event_type) { continue; }
             let Ok(mut plugin) = ext.plugin.lock() else { continue; };
-            if let Ok(raw) = plugin.call::<&str, &str>("on_event", &event_json) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                    if !v.is_null() { results.push((ext.path.clone(), v)); }
-                }
-            }
+            if let Ok(raw) = plugin.call::<&str, &str>("on_event", &event_json)
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(raw)
+                    && !v.is_null() { results.push((ext.path.clone(), v)); }
         }
         results
     }

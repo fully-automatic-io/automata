@@ -4,7 +4,9 @@ pub mod config;
 pub mod exec;
 pub mod models;
 pub mod prompt;
+pub mod provider;
 pub mod sdk;
+pub mod session;
 pub mod slash;
 
 pub use auth::AuthStorage;
@@ -24,7 +26,11 @@ pub use prompt::{
     build_system_prompt, discover_extension_paths, load_context_files, load_skills,
     BuildSystemPromptOptions, ContextFile, ContextFiles, LoadedContextFile, Skill,
 };
+pub use provider::{build_provider, Auth, ProviderBuild};
 pub use sdk::{create_agent_session, AgentSessionHandle, CreateAgentSessionOptions};
+pub use session::{
+    build_tools, CodingAgentSession, SessionOptions, DEFAULT_TOOL_NAMES,
+};
 pub use slash::{
     builtin_slash_commands, SlashCommandInfo, SlashCommandSource, SourceInfo, SourceOrigin,
     SourceScope,

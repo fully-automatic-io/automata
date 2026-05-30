@@ -9,6 +9,9 @@ repository = "https://github.com/yourusername/automata"
 keywords = ["ai", "agent", "coding", "automation"]
 categories = ["development-tools"]
 
+[lints]
+workspace = true
+
 [dependencies]
 agent-core = { path = "../agent-core" }
 llm-client = { path = "../llm-client" }
@@ -24,13 +27,9 @@ tokio-util = { version = "0.7", features = ["rt", "codec"] }
 tracing = "0.1"
 similar = "2"
 regex = "1"
-walkdir = "2"
 ignore = "0.4"
 globset = "0.4"
-fs2 = "0.4"
 tempfile = "3"
-tarpc = { version = "0.34", features = ["full"] }
-tokio-serde = { version = "0.9", features = ["bincode"] }
 lazy_static = "1.5"
 unicode-normalization = "0.1"
 dirs-next = "2"
@@ -48,6 +47,10 @@ tokio-test = "0.4"
 [[example]]
 name = "coding_agent"
 path = "../../examples/coding_agent.rs"
+
+[[example]]
+name = "coding_session"
+path = "../../examples/coding_session.rs"
 
 [[example]]
 name = "deepseek_coding_agent"

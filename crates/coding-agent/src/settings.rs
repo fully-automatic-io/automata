@@ -1,4 +1,7 @@
-use agent_core::types::ThinkingLevel;
+use agent_core::auto_retry::RetrySettings;
+use agent_core::harness::CompactionSettings;
+use agent_core::queue::QueueMode;
+use agent_core::types::{ThinkingLevel, Transport};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
@@ -22,11 +25,11 @@ pub struct Settings {
     #[serde(default)]
     pub thinking_level: Option<ThinkingLevel>,
     #[serde(default)]
-    pub transport: Option<String>, // "sse" | "json"
+    pub transport: Option<Transport>,
     #[serde(default)]
-    pub steering_mode: Option<String>, // "all" | "one-at-a-time"
+    pub steering_mode: Option<QueueMode>,
     #[serde(default)]
-    pub follow_up_mode: Option<String>,
+    pub follow_up_mode: Option<QueueMode>,
     #[serde(default)]
     pub shell_path: Option<String>,
     #[serde(default)]
@@ -45,38 +48,12 @@ impl Settings {
         if other.max_tokens.is_some() { self.max_tokens = other.max_tokens; }
         if other.temperature.is_some() { self.temperature = other.temperature; }
         if other.working_directory.is_some() { self.working_directory = other.working_directory.clone(); }
-        if other.thinking_level.is_some() { self.thinking_level = other.thinking_level.clone(); }
-        if other.transport.is_some() { self.transport = other.transport.clone(); }
-        if other.steering_mode.is_some() { self.steering_mode = other.steering_mode.clone(); }
-        if other.follow_up_mode.is_some() { self.follow_up_mode = other.follow_up_mode.clone(); }
+        if other.thinking_level.is_some() { self.thinking_level = other.thinking_level; }
+        if other.transport.is_some() { self.transport = other.transport; }
+        if other.steering_mode.is_some() { self.steering_mode = other.steering_mode; }
+        if other.follow_up_mode.is_some() { self.follow_up_mode = other.follow_up_mode; }
         if other.shell_path.is_some() { self.shell_path = other.shell_path.clone(); }
         if !other.extensions.is_empty() { self.extensions = other.extensions.clone(); }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactionSettings {
-    pub enabled: bool,
-    pub threshold_tokens: u64,
-    pub target_tokens: u64,
-}
-
-impl Default for CompactionSettings {
-    fn default() -> Self {
-        Self { enabled: true, threshold_tokens: 150_000, target_tokens: 50_000 }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetrySettings {
-    pub max_retries: u32,
-    pub initial_delay_ms: u64,
-    pub max_delay_ms: u64,
-}
-
-impl Default for RetrySettings {
-    fn default() -> Self {
-        Self { max_retries: 3, initial_delay_ms: 500, max_delay_ms: 30_000 }
     }
 }
 
@@ -112,15 +89,14 @@ impl SettingsManager {
             settings.merge(&global);
         }
 
-        if let Some(ref project_path) = self.project_path {
-            if project_path.exists() {
+        if let Some(ref project_path) = self.project_path
+            && project_path.exists() {
                 let content = fs::read_to_string(project_path).await
                     .map_err(|e| SettingsError::Io(e.to_string()))?;
                 let project: Settings = serde_json::from_str(&content)
                     .map_err(|e| SettingsError::Parse(e.to_string()))?;
                 settings.merge(&project);
             }
-        }
 
         // Resolve API key from environment if not set
         if settings.api_key.is_none() {

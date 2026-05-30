@@ -150,15 +150,11 @@ impl ReadOperations for LocalReadOperations {
     }
 }
 
+#[derive(Default)]
 pub struct ReadToolOptions {
     pub operations: Option<Arc<dyn ReadOperations>>,
 }
 
-impl Default for ReadToolOptions {
-    fn default() -> Self {
-        Self { operations: None }
-    }
-}
 
 pub struct ReadTool {
     cwd: String,
@@ -273,7 +269,7 @@ impl ReadTool {
     /// Read text file with offset/limit support
     async fn read_text(&self, absolute_path: &str, offset: usize, limit: Option<u64>) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let buffer = self.operations.read_file(absolute_path).await
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<_>)?;
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<_>)?;
 
         let text = String::from_utf8_lossy(&buffer).to_string();
         let all_lines: Vec<&str> = agent_core::harness::utils::split_lines_for_counting(&text);

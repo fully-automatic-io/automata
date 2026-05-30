@@ -12,8 +12,8 @@ use crate::types::{AgentMessage, StopReason};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-/// Patterns that indicate transient failures worth retrying. Matches
-/// pi-mono's `_isRetryableError` regex (`agent-session.ts:2438`).
+/// Patterns that indicate transient failures worth retrying (overloaded
+/// providers, rate limits, 5xx, network / connection / websocket drops, ...).
 static RETRYABLE_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay",
@@ -21,8 +21,11 @@ static RETRYABLE_PATTERN: Lazy<Regex> = Lazy::new(|| {
     .expect("retryable pattern must compile")
 });
 
-/// Settings for the retry state machine. Mirrors pi-mono's `RetrySettings`.
-#[derive(Debug, Clone, Copy)]
+/// Settings for the retry state machine. Serde-friendly (camelCase, missing
+/// fields fall back to [`Default`]) so it can be embedded directly in
+/// persisted config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct RetrySettings {
     pub enabled: bool,
     pub max_retries: u32,

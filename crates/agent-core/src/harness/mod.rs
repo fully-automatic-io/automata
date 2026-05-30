@@ -8,8 +8,9 @@ pub mod skills;
 pub mod utils;
 
 pub use agent_harness::{
-    AbortResult, AgentHarness, AutoCompactionConfig, CompactionReason, HarnessConfig,
-    HarnessError, HarnessEvent, HarnessPhase, PostRunDecision,
+    AbortResult, AgentHarness, AgentHarnessOptions, AutoCompactionConfig, CompactionReason,
+    HarnessConfig, HarnessError, HarnessEvent, HarnessPhase, HarnessResources, PostRunDecision,
+    StreamOptions, StreamOptionsPatch,
 };
 pub use compaction::{
     compact, estimate_context_tokens, estimate_tokens, prepare_compaction,

@@ -233,21 +233,13 @@ impl BashOperations for LocalBashOperations {
 // ============================================================================
 
 #[derive(Clone)]
+#[derive(Default)]
 pub struct BashToolOptions {
     pub operations: Option<Arc<dyn BashOperations>>,
     pub command_prefix: Option<String>,
     pub shell_path: Option<String>,
 }
 
-impl Default for BashToolOptions {
-    fn default() -> Self {
-        Self {
-            operations: None,
-            command_prefix: None,
-            shell_path: None,
-        }
-    }
-}
 
 // ============================================================================
 // Bash Tool
@@ -384,15 +376,13 @@ impl AgentTool for BashTool {
                     snap.content.clone()
                 };
 
-                if let Some(code) = exec_result.exit_code {
-                    if code != 0 {
+                if let Some(code) = exec_result.exit_code
+                    && code != 0 {
                         output_text.push_str(&format!("\n\nCommand exited with code {}", code));
-                        return Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(Box::new(std::io::Error::other(
                             output_text,
                         )));
                     }
-                }
 
                 Ok(AgentToolResult {
                     content: vec![ContentBlock::Text { text: output_text }],
@@ -413,8 +403,7 @@ impl AgentTool for BashTool {
                     if !output.is_empty() { output.push_str("\n\n"); }
                     output.push_str("Command timed out");
                 }
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Err(Box::new(std::io::Error::other(
                     output,
                 )))
             }

@@ -269,11 +269,10 @@ impl JsonlSessionRepo {
             if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                        if let Ok(storage) = JsonlSessionStorage::open(&p).await {
+                    if p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                        && let Ok(storage) = JsonlSessionStorage::open(&p).await {
                             sessions.push(storage.metadata.clone());
                         }
-                    }
                 }
             }
         }

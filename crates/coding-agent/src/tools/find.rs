@@ -150,7 +150,7 @@ impl AgentTool for FindTool {
 
         for entry in walker.build() {
             // Check for cancellation
-            if signal.as_ref().map_or(false, |s| s.is_cancelled()) {
+            if signal.as_ref().is_some_and(|s| s.is_cancelled()) {
                 return Ok(AgentToolResult {
                     content: vec![ContentBlock::Text {
                         text: "Search cancelled".to_string(),
@@ -182,7 +182,7 @@ impl AgentTool for FindTool {
                 .replace('\\', "/");
 
             // Add trailing slash for directories
-            let display_path = if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            let display_path = if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 format!("{}/", path_str)
             } else {
                 path_str.clone()

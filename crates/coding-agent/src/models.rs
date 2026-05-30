@@ -1,21 +1,17 @@
+use agent_core::types::{Api, Model, ModelCost};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Model {
-    pub id: String,
-    pub name: String,
-    pub provider: String,
-    pub context_window: u32,
-    pub max_output_tokens: u32,
-}
-
+/// Provider credentials/endpoint registered for a model's `provider` name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub api_key: String,
     pub base_url: Option<String>,
 }
 
+/// In-memory registry of available models plus per-provider credentials and
+/// id aliases. Models are the canonical [`agent_core::types::Model`] so they
+/// flow directly into [`crate::SessionOptions`] / `build_provider`.
 pub struct ModelRegistry {
     models: HashMap<String, Model>,
     providers: HashMap<String, ProviderConfig>,
@@ -34,17 +30,41 @@ impl ModelRegistry {
     }
 
     fn load_defaults(&mut self) {
+        let anthropic = |id: &str, name: &str, ctx: u64, max: u64| Model {
+            id: id.into(),
+            name: name.into(),
+            api: Api::Anthropic,
+            provider: "anthropic".into(),
+            base_url: String::new(),
+            reasoning: true,
+            input: vec!["text".into()],
+            cost: ModelCost::default(),
+            context_window: ctx,
+            max_tokens: max,
+        };
+        let openai = |id: &str, name: &str, ctx: u64, max: u64| Model {
+            id: id.into(),
+            name: name.into(),
+            api: Api::Openai,
+            provider: "openai".into(),
+            base_url: String::new(),
+            reasoning: false,
+            input: vec!["text".into()],
+            cost: ModelCost::default(),
+            context_window: ctx,
+            max_tokens: max,
+        };
         for model in [
-            Model { id: "claude-opus-4-7".into(), name: "Claude Opus 4.7".into(), provider: "anthropic".into(), context_window: 1_000_000, max_output_tokens: 32_000 },
-            Model { id: "claude-sonnet-4-6".into(), name: "Claude Sonnet 4.6".into(), provider: "anthropic".into(), context_window: 200_000, max_output_tokens: 16_000 },
-            Model { id: "claude-haiku-4-5".into(), name: "Claude Haiku 4.5".into(), provider: "anthropic".into(), context_window: 200_000, max_output_tokens: 8_000 },
-            Model { id: "gpt-4o".into(), name: "GPT-4o".into(), provider: "openai".into(), context_window: 128_000, max_output_tokens: 16_384 },
+            anthropic("claude-opus-4-7", "Claude Opus 4.7", 1_000_000, 32_000),
+            anthropic("claude-sonnet-4-6", "Claude Sonnet 4.6", 200_000, 16_000),
+            anthropic("claude-haiku-4-5", "Claude Haiku 4.5", 200_000, 8_000),
+            openai("gpt-4o", "GPT-4o", 128_000, 16_384),
         ] {
             self.models.insert(model.id.clone(), model);
         }
     }
 
-    /// Load additional models from a JSON config file
+    /// Load additional models from a JSON config file.
     pub fn load_from_file(&mut self, path: &std::path::Path) -> Result<(), String> {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let models: Vec<Model> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
@@ -54,7 +74,7 @@ impl ModelRegistry {
         Ok(())
     }
 
-    /// Register a model directly
+    /// Register a model directly.
     pub fn register_model(&mut self, model: Model) {
         self.models.insert(model.id.clone(), model);
     }
@@ -68,7 +88,7 @@ impl ModelRegistry {
     }
 
     pub fn get_model(&self, id: &str) -> Option<&Model> {
-        let resolved = self.overrides.get(id).map(|s| s.as_str()).unwrap_or(id);
+        let resolved = self.overrides.get(id).map(String::as_str).unwrap_or(id);
         self.models.get(resolved)
     }
 
@@ -86,32 +106,28 @@ impl ModelRegistry {
 
     pub fn get_api_key(&self, model_id: &str) -> Option<&str> {
         let model = self.get_model(model_id)?;
-        // Check provider config first, then environment
-        if let Some(key) = self.providers.get(&model.provider).map(|p| p.api_key.as_str()) {
-            return Some(key);
-        }
-        None
+        self.providers.get(&model.provider).map(|p| p.api_key.as_str())
     }
 
-    /// Resolve API key: provider config → environment variable
+    /// Resolve API key: provider config first, then environment variable.
     pub fn resolve_api_key(&self, model_id: &str) -> Option<String> {
         let model = self.get_model(model_id)?;
-        if let Some(p) = self.providers.get(&model.provider) {
-            if !p.api_key.is_empty() {
+        if let Some(p) = self.providers.get(&model.provider)
+            && !p.api_key.is_empty() {
                 return Some(p.api_key.clone());
             }
-        }
-        // Fall back to environment variables
         match model.provider.as_str() {
             "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
             "openai" => std::env::var("OPENAI_API_KEY").ok(),
-            _ => std::env::var(format!("{}_API_KEY", model.provider.to_uppercase())).ok(),
+            other => std::env::var(format!("{}_API_KEY", other.to_uppercase())).ok(),
         }
     }
 }
 
 impl Default for ModelRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -129,7 +145,12 @@ mod tests {
     #[test]
     fn test_register_model() {
         let mut r = ModelRegistry::new();
-        r.register_model(Model { id: "custom-model".into(), name: "Custom".into(), provider: "custom".into(), context_window: 8000, max_output_tokens: 2000 });
+        r.register_model(Model {
+            id: "custom-model".into(),
+            name: "Custom".into(),
+            provider: "custom".into(),
+            ..Model::default()
+        });
         assert!(r.get_model("custom-model").is_some());
     }
 
@@ -143,7 +164,10 @@ mod tests {
     #[test]
     fn test_provider_api_key() {
         let mut r = ModelRegistry::new();
-        r.register_provider("anthropic".into(), ProviderConfig { api_key: "sk-test".into(), base_url: None });
+        r.register_provider(
+            "anthropic".into(),
+            ProviderConfig { api_key: "sk-test".into(), base_url: None },
+        );
         assert_eq!(r.get_api_key("claude-opus-4-7"), Some("sk-test"));
     }
 }

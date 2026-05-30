@@ -5,6 +5,10 @@ pub mod settings;
 pub mod stream_bridge;
 pub mod tools;
 
+// End-to-end session entry point.
+pub use core::session::{build_tools, CodingAgentSession, SessionOptions, DEFAULT_TOOL_NAMES};
+pub use core::provider::{build_provider, Auth, ProviderBuild};
+
 // Custom message types and conversion now live in agent-core.
 pub use agent_core::harness::messages::{
     bash_execution_to_text, convert_to_llm,
@@ -12,7 +16,8 @@ pub use agent_core::harness::messages::{
     BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
 };
-pub use models::{Model, ModelRegistry};
+pub use agent_core::types::Model;
+pub use models::ModelRegistry;
 pub use settings::{Settings, SettingsManager};
 pub use tools::{
     BashTool, BashToolOptions, BashOperations, LocalBashOperations, BashToolDetails, BashExecOptions,

@@ -59,6 +59,27 @@ pub trait AgentTool: Send + Sync {
 // Tool definition for extension-registered tools
 // ============================================================================
 
+/// Closure that normalizes raw tool arguments before validation.
+pub type PrepareArgumentsFn = Arc<dyn Fn(serde_json::Value) -> serde_json::Value + Send + Sync>;
+
+/// Closure that executes a wrapped tool: `(call_id, args, signal, on_update) ->
+/// future<Result>`.
+pub type ToolExecuteFn = Arc<
+    dyn Fn(
+            String,
+            serde_json::Value,
+            Option<CancellationToken>,
+            Option<AgentToolUpdateCallback>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// Wraps a ToolDefinition into the AgentTool trait.
 pub struct ToolDefinitionWrapper {
     pub name: String,
@@ -67,24 +88,8 @@ pub struct ToolDefinitionWrapper {
     /// JSON Schema for the tool's input parameters.
     pub parameters_schema: serde_json::Value,
     pub execution_mode_override: Option<ToolExecutionMode>,
-    pub prepare_arguments_fn: Option<
-        Arc<dyn Fn(serde_json::Value) -> serde_json::Value + Send + Sync>,
-    >,
-    pub execute_fn: Arc<
-        dyn Fn(
-                String,
-                serde_json::Value,
-                Option<CancellationToken>,
-                Option<AgentToolUpdateCallback>,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>>,
-                        > + Send,
-                >,
-            > + Send
-            + Sync,
-    >,
+    pub prepare_arguments_fn: Option<PrepareArgumentsFn>,
+    pub execute_fn: ToolExecuteFn,
 }
 
 #[async_trait]
@@ -171,7 +176,7 @@ pub fn validate_tool_arguments(
     let schema = tool.parameters();
 
     // If schema has no properties or is empty, skip validation
-    if schema.get("properties").and_then(|p| p.as_object()).map_or(true, |o| o.is_empty()) {
+    if schema.get("properties").and_then(|p| p.as_object()).is_none_or(|o| o.is_empty()) {
         return Ok(prepared_args);
     }
 

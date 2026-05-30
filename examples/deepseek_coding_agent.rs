@@ -10,11 +10,11 @@ use agent_core::agent_loop::{AgentEventSink, AgentLoop};
 use agent_core::event::AgentEvent;
 use agent_core::harness::messages::default_convert_to_llm;
 use agent_core::tool::AgentTool;
+use agent_core::types::Model;
 use agent_core::types::{
     AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, MessageContent, ModelInfo,
     ToolExecutionMode, Transport,
 };
-use agent_core::types::Model;
 use coding_agent::stream_bridge::create_stream_fn;
 use coding_agent::tools::{
     BashTool, BashToolOptions, LsTool, ReadTool, ReadToolOptions, WriteTool, WriteToolOptions,
@@ -38,7 +38,7 @@ async fn main() {
     let token = std::env::var("ANTHROPIC_AUTH_TOKEN")
         .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
         .expect("Set ANTHROPIC_AUTH_TOKEN (or DEEPSEEK_API_KEY)");
-    let model_id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into());
+    let model_id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into());
 
     let endpoint = format!("{}/v1/messages", base.trim_end_matches('/'));
     let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(
@@ -81,10 +81,22 @@ async fn main() {
                     }
                 }
                 AgentEvent::ToolExecutionEnd { tool_name, result, is_error, .. } => {
-                    let summary = result.content.iter().find_map(|b| {
-                        if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
-                    }).unwrap_or("(no text)");
-                    let prefix = if *is_error { "[tool_error]" } else { "[tool_result]" };
+                    let summary = result
+                        .content
+                        .iter()
+                        .find_map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or("(no text)");
+                    let prefix = if *is_error {
+                        "[tool_error]"
+                    } else {
+                        "[tool_result]"
+                    };
                     println!("{} {}: {}", prefix, tool_name, truncate(summary, 400));
                 }
                 _ => {}
@@ -111,10 +123,7 @@ async fn main() {
         temperature: Some(0.0),
         tool_execution: ToolExecutionMode::Sequential,
         transport: Transport::Sse,
-        ..AgentLoopConfig::new(
-            model_info,
-            Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs))),
-        )
+        ..AgentLoopConfig::new(model_info, Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs))))
     };
 
     let context = AgentContext {

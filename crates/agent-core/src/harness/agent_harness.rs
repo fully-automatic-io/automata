@@ -67,6 +67,9 @@ pub enum HarnessError {
 /// events plus harness-specific lifecycle events (save_point, compaction,
 /// branch_summary).
 #[derive(Debug, Clone)]
+// The `Agent` variant wraps the (intentionally unboxed) `AgentEvent`; boxing
+// here would just push the indirection onto every consumer's match arm.
+#[allow(clippy::large_enum_variant)]
 pub enum HarnessEvent {
     Agent(AgentEvent),
     Compaction { result: CompactionResult },
@@ -300,8 +303,8 @@ pub struct AgentHarness {
     last_assistant_message: Arc<Mutex<Option<AgentMessage>>>,
 
     /// When `Some`, `execute_turn` automatically runs `check_pre_prompt`
-    /// using the stored settings + stream fn. Mirrors pi-mono
-    /// `agent-session.ts:1041-1052` behavior. Caller opts in via
+    /// using the stored settings + stream fn so an aborted / errored prior
+    /// turn doesn't bleed into the new context. Caller opts in via
     /// [`AgentHarness::set_auto_compaction`].
     auto_compaction: Arc<Mutex<Option<AutoCompactionConfig>>>,
 
@@ -378,7 +381,7 @@ impl AgentHarness {
     /// Cancel the in-flight turn (if any) and clear the steer / follow-up
     /// queues. Returns the messages that were discarded so callers can
     /// surface them to the user (e.g. "you had 3 queued steers, none
-    /// reached the model"). Mirrors pi-mono `agent-harness.ts:936-963`.
+    /// reached the model").
     pub async fn abort(&self) -> AbortResult {
         let cleared_steer = std::mem::take(&mut *self.steer_queue.lock().await);
         let cleared_follow_up = std::mem::take(&mut *self.follow_up_queue.lock().await);
@@ -763,8 +766,8 @@ impl AgentHarness {
     }
 
     // -----------------------------------------------------------------------
-    // Auto-compaction trigger + retry decision (the `_handlePostAgentRun`
-    // state machine, in pi-mono terms).
+    // Auto-compaction trigger + retry decision (the post-agent-run state
+    // machine).
     // -----------------------------------------------------------------------
 
     /// Cached last assistant message from the just-completed turn. Returns
@@ -807,10 +810,10 @@ impl AgentHarness {
     /// message. Returns a `PostRunDecision` describing whether the caller
     /// should re-run the turn (compact-and-retry / auto-retry) or stop.
     ///
-    /// Mirrors pi-mono's `_handlePostAgentRun` + `_checkCompaction` +
-    /// `_isRetryableError` + `_prepareRetry` flow. The harness itself does
-    /// not loop — callers (or a higher-level wrapper) decide whether to
-    /// continue based on the returned decision.
+    /// Combines the auto-retry, context-overflow recovery, and threshold
+    /// compaction checks. The harness itself does not loop — callers (or a
+    /// higher-level wrapper) decide whether to continue based on the returned
+    /// decision.
     pub async fn check_post_run(
         &self,
         compaction_settings: &CompactionSettings,
@@ -823,8 +826,7 @@ impl AgentHarness {
     /// `check_pre_prompt` (pre-prompt). When `skip_aborted` is true, an
     /// aborted prior turn short-circuits to `Stop`. When false, aborted
     /// turns still flow into the threshold-compaction path so the
-    /// follow-up prompt sees a clean context. Mirrors pi-mono
-    /// `_checkCompaction(_, skipAbortedCheck)`.
+    /// follow-up prompt sees a clean context.
     async fn check_post_run_inner(
         &self,
         compaction_settings: &CompactionSettings,
@@ -863,11 +865,10 @@ impl AgentHarness {
 
         // Stale-message protection: a pre-compaction usage record must not
         // re-trigger compaction on the next prompt. Compare timestamps.
-        if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await {
-            if (*msg_timestamp as i64) <= latest_compaction_ts {
+        if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await
+            && (*msg_timestamp as i64) <= latest_compaction_ts {
                 return Ok(PostRunDecision::Stop);
             }
-        }
 
         let same_model = msg_provider == &cur_provider && msg_model == &cur_model_id;
 
@@ -945,13 +946,11 @@ impl AgentHarness {
                 return Ok(PostRunDecision::Stop);  // No usage data anywhere.
             };
             // Verify the source isn't pre-compaction either.
-            if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await {
-                if let Some(AgentMessage::Assistant { timestamp, .. }) = session_ctx.messages.get(idx) {
-                    if (*timestamp as i64) <= latest_compaction_ts {
+            if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await
+                && let Some(AgentMessage::Assistant { timestamp, .. }) = session_ctx.messages.get(idx)
+                    && (*timestamp as i64) <= latest_compaction_ts {
                         return Ok(PostRunDecision::Stop);
                     }
-                }
-            }
             est.tokens
         } else {
             // Successful response — use the message's own usage.
@@ -1023,19 +1022,18 @@ impl AgentHarness {
     /// error message on the re-run.
     async fn drop_last_assistant_from_session(&self) {
         // The session model is append-only; we add a leaf-move write that
-        // reverts to the parent of the last entry. This mirrors pi-mono's
-        // `agent.state.messages.slice(0, -1)`.
+        // reverts to the parent of the last entry (equivalent to dropping the
+        // last message from the in-memory transcript).
         let branch = match self.session.lock().await.get_branch().await {
             Ok(b) => b,
             Err(_) => return,
         };
         // Find the last assistant message entry.
         let target_parent = branch.iter().rev().find_map(|e| {
-            if let SessionTreeEntry::Message { message, parent_id, .. } = e {
-                if matches!(message, AgentMessage::Assistant { .. }) {
+            if let SessionTreeEntry::Message { message, parent_id, .. } = e
+                && matches!(message, AgentMessage::Assistant { .. }) {
                     return Some(parent_id.clone());
                 }
-            }
             None
         });
         if let Some(parent) = target_parent.flatten() {
@@ -1065,9 +1063,8 @@ fn should_compact_at_threshold(
     if !settings.enabled || context_window == 0 {
         return false;
     }
-    // Pi-mono uses `(context_window - reserve_tokens)` as the soft cap;
-    // we approximate by triggering when free space drops below
-    // `keep_recent_tokens` plus a small buffer.
+    // Soft cap is `(context_window - reserve_tokens)`: trigger compaction once
+    // the estimated context tokens cross it.
     let cap = context_window.saturating_sub(settings.reserve_tokens);
     context_tokens >= cap
 }
@@ -1084,10 +1081,9 @@ impl AgentHarness {
         // Reset overflow + retry state at the start of every fresh user turn.
         self.reset_recovery_state().await;
 
-        // Pre-prompt compaction check (pi-mono parity): if an
-        // auto-compaction strategy was installed, check whether the prior
-        // turn left aborted / error state and, if so, compact before the
-        // new prompt arrives.
+        // Pre-prompt compaction check: if an auto-compaction strategy was
+        // installed, check whether the prior turn left aborted / error state
+        // and, if so, compact before the new prompt arrives.
         if let Some(cfg) = self.auto_compaction.lock().await.clone() {
             // `check_pre_prompt` does its own no-op early-exit when there's
             // nothing to clean up, so this is cheap on the happy path.
@@ -1103,7 +1099,7 @@ impl AgentHarness {
     ///
     /// Also accepts an optional compaction stream fn for the pre-prompt check:
     /// if the last assistant message is an aborted / overflow response, compact
-    /// before running the new turn (pi-mono `agent-session.ts:1041-1052`).
+    /// before running the new turn.
     pub async fn continue_turn(
         &self,
         prompts: Vec<AgentMessage>,
@@ -1127,8 +1123,6 @@ impl AgentHarness {
     /// aborted / overflow response, compact before the new turn so the
     /// context is clean. Returns `true` if compaction ran (caller may want
     /// to `continue_turn` with empty prompts to let the model re-run).
-    ///
-    /// Mirrors pi-mono `agent-session.ts:1041-1052`.
     pub async fn check_pre_prompt(
         &self,
         compaction_settings: &CompactionSettings,
@@ -1251,7 +1245,7 @@ impl AgentHarness {
             max_retries: opts.max_retries,
             headers: opts.headers.clone(),
             metadata: None,
-            reasoning: opts.reasoning.clone(),
+            reasoning: opts.reasoning,
             temperature: opts.temperature,
             max_tokens: opts.max_tokens,
             provider_options: opts.provider_options.clone(),

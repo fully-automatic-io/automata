@@ -61,8 +61,8 @@ pub fn prepare_branch_entries(entries: &[SessionTreeEntry], token_budget: usize)
 
     // Collect file ops from branch_summary details first
     for entry in entries {
-        if let SessionTreeEntry::BranchSummary { details: Some(details), from_hook, .. } = entry {
-            if from_hook != &Some(true) {
+        if let SessionTreeEntry::BranchSummary { details: Some(details), from_hook, .. } = entry
+            && from_hook != &Some(true) {
                 if let Some(read) = details.get("readFiles").and_then(|r| r.as_array()) {
                     for f in read { if let Some(s) = f.as_str() { file_ops.read.insert(s.to_string()); } }
                 }
@@ -70,7 +70,6 @@ pub fn prepare_branch_entries(entries: &[SessionTreeEntry], token_budget: usize)
                     for f in modified { if let Some(s) = f.as_str() { file_ops.edited.insert(s.to_string()); } }
                 }
             }
-        }
     }
 
     let mut messages: Vec<AgentMessage> = vec![];
@@ -82,11 +81,10 @@ pub fn prepare_branch_entries(entries: &[SessionTreeEntry], token_budget: usize)
         let tokens = estimate_tokens(&msg);
 
         if token_budget > 0 && total_tokens + tokens > token_budget {
-            if matches!(entry, SessionTreeEntry::Compaction { .. } | SessionTreeEntry::BranchSummary { .. }) {
-                if total_tokens < (token_budget as f64 * 0.9) as usize {
+            if matches!(entry, SessionTreeEntry::Compaction { .. } | SessionTreeEntry::BranchSummary { .. })
+                && total_tokens < (token_budget as f64 * 0.9) as usize {
                     messages.insert(0, msg);
                 }
-            }
             break;
         }
         messages.insert(0, msg);
@@ -118,12 +116,10 @@ pub async fn generate_branch_summary(
     let llm_messages = convert_to_llm(&messages);
     let conversation_text = serialize_conversation(&llm_messages);
 
-    let instructions = if replace_instructions && custom_instructions.is_some() {
-        custom_instructions.unwrap().to_string()
-    } else if let Some(ci) = custom_instructions {
-        format!("{}\n\nAdditional focus: {}", BRANCH_SUMMARY_PROMPT, ci)
-    } else {
-        BRANCH_SUMMARY_PROMPT.to_string()
+    let instructions = match custom_instructions {
+        Some(ci) if replace_instructions => ci.to_string(),
+        Some(ci) => format!("{}\n\nAdditional focus: {}", BRANCH_SUMMARY_PROMPT, ci),
+        None => BRANCH_SUMMARY_PROMPT.to_string(),
     };
 
     let prompt_text = format!("<conversation>\n{}\n</conversation>\n\n{}", conversation_text, instructions);

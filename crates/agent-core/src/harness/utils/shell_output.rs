@@ -29,24 +29,24 @@ pub async fn execute_shell_with_capture(
 
     match result {
         Err(EnvError::Aborted) => {
-            return Ok(ShellCaptureResult {
+            Ok(ShellCaptureResult {
                 output: String::new(),
                 exit_code: None,
                 cancelled: true,
                 truncated: false,
                 full_output_path: None,
-            });
+            })
         }
         Err(EnvError::Timeout(_)) => {
-            return Ok(ShellCaptureResult {
+            Ok(ShellCaptureResult {
                 output: String::new(),
                 exit_code: None,
                 cancelled: true,
                 truncated: false,
                 full_output_path: None,
-            });
+            })
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
         Ok(exec_result) => {
             let combined = sanitize_binary_output(&format!("{}{}", exec_result.stdout, exec_result.stderr))
                 .replace('\r', "");

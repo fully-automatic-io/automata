@@ -332,15 +332,14 @@ async fn translate_event(
             }
         }
         "response.function_call_arguments.done" => {
-            if let Some(full) = payload.get("arguments").and_then(|v| v.as_str()) {
-                if full.starts_with(&s.tool_buf) && full.len() > s.tool_buf.len() {
+            if let Some(full) = payload.get("arguments").and_then(|v| v.as_str())
+                && full.starts_with(&s.tool_buf) && full.len() > s.tool_buf.len() {
                     let tail = full[s.tool_buf.len()..].to_string();
                     out.push(Ok(LlmEvent::ContentBlockDelta {
                         index: s.current_index,
                         delta: Delta::InputJsonDelta { partial_json: tail },
                     }));
                 }
-            }
         }
         "response.output_item.done" => {
             out.push(Ok(LlmEvent::ContentBlockStop { index: s.current_index }));
@@ -497,11 +496,10 @@ fn parse_output_item(item: &serde_json::Value) -> Vec<ContentPart> {
             if let Some(arr) = item.get("content").and_then(|c| c.as_array()) {
                 for c in arr {
                     let ctype = c.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if ctype == "output_text" {
-                        if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
+                    if ctype == "output_text"
+                        && let Some(text) = c.get("text").and_then(|t| t.as_str()) {
                             out.push(ContentPart::Text { text: text.to_string() });
                         }
-                    }
                 }
             }
             out

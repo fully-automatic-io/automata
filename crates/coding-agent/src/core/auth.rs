@@ -25,11 +25,10 @@ impl AuthStorage {
 
     pub fn get_api_key(&self, provider: &str) -> Option<String> {
         let env_key = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
-        if let Ok(v) = std::env::var(&env_key) {
-            if !v.is_empty() {
+        if let Ok(v) = std::env::var(&env_key)
+            && !v.is_empty() {
                 return Some(v);
             }
-        }
         self.credentials.iter().find_map(|c| match c {
             Credential::ApiKey { provider: p, key } if p == provider => Some(key.clone()),
             _ => None,

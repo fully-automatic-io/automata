@@ -24,3 +24,9 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 eventsource-stream = "0.2"
 uuid = { version = "1", features = ["v4", "v7"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# Lint gate — clippy's default `all` group at warn, inherited by every crate
+# via `[lints] workspace = true`. The tree is clippy-clean; keep it that way.
+[workspace.lints.clippy]
+all = "warn"
+

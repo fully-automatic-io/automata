@@ -205,7 +205,7 @@ pub fn kill_process_tree(pid: u32) -> Result<(), std::io::Error> {
 #[cfg(unix)]
 fn get_child_pids(parent_pid: u32) -> Vec<u32> {
     std::process::Command::new("pgrep")
-        .args(&["-P", &parent_pid.to_string()])
+        .args(["-P", &parent_pid.to_string()])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout)
             .lines()

@@ -31,9 +31,8 @@ pub fn retry_delay(
     } else {
         initial_ms.saturating_mul(2u64.saturating_pow(attempt))
     };
-    if let Some(cap) = max_delay_ms {
-        if ms > cap { ms = cap; }
-    }
+    if let Some(cap) = max_delay_ms
+        && ms > cap { ms = cap; }
     Duration::from_millis(ms)
 }
 

@@ -523,8 +523,8 @@ async fn test_auto_compaction_skipped_when_unset() {
 
 #[tokio::test]
 async fn test_check_pre_prompt_processes_aborted_messages() {
-    // Pi-mono parity: pre-prompt path must see aborted messages even
-    // though post-run path skips them. The behavior is exercised here by
+    // The pre-prompt path must see aborted messages even though the post-run
+    // path skips them. The behavior is exercised here by
     // confirming check_pre_prompt does NOT take the post_run early-exit
     // (Stop) when the prior turn is aborted: it returns Ok(false) only
     // because there's no usage data to compute a token estimate, NOT
@@ -547,5 +547,5 @@ async fn test_check_pre_prompt_processes_aborted_messages() {
         .await;
     assert!(result.is_ok(), "pre_prompt should not error on aborted: {:?}", result);
     // No compaction fired (no usage data), but the path didn't panic.
-    assert_eq!(result.unwrap(), false);
+    assert!(!result.unwrap());
 }

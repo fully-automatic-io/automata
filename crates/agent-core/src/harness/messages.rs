@@ -88,16 +88,14 @@ pub fn bash_execution_to_text(
     }
     if cancelled {
         text.push_str("\n\n(command cancelled)");
-    } else if let Some(code) = exit_code {
-        if code != 0 {
+    } else if let Some(code) = exit_code
+        && code != 0 {
             text.push_str(&format!("\n\nCommand exited with code {}", code));
         }
-    }
-    if truncated {
-        if let Some(path) = full_output_path {
+    if truncated
+        && let Some(path) = full_output_path {
             text.push_str(&format!("\n\n[Output truncated. Full output: {}]", path));
         }
-    }
     text
 }
 

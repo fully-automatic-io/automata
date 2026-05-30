@@ -170,12 +170,11 @@ impl AgentLoop<'_> {
             let mut has_more_tool_calls = true;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
-                if let Some(ref token) = signal {
-                    if token.is_cancelled() {
+                if let Some(ref token) = signal
+                    && token.is_cancelled() {
                         self.emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
                         return;
                     }
-                }
 
                 if !first_turn {
                     self.emit(AgentEvent::TurnStart).await;
@@ -234,8 +233,8 @@ impl AgentLoop<'_> {
                     }
                 }
 
-                if has_more_tool_calls {
-                    if let Some(ref hook) = self.config.prepare_next_turn {
+                if has_more_tool_calls
+                    && let Some(ref hook) = self.config.prepare_next_turn {
                         let ctx = PrepareNextTurnContext {
                             last_assistant_message: assistant.clone(),
                             tool_results: tool_results.clone(),
@@ -244,7 +243,6 @@ impl AgentLoop<'_> {
                         let extras = hook(ctx, signal.clone()).await;
                         pending_messages.extend(extras);
                     }
-                }
 
                 self.emit(AgentEvent::TurnEnd { message: assistant, tool_results }).await;
                 pending_messages.extend(self.drain_steer().await);
@@ -297,7 +295,7 @@ impl AgentLoop<'_> {
             thinking_budgets: self.config.thinking_budgets.clone(),
             transport: self.config.transport,
             max_retry_delay_ms: self.config.max_retry_delay_ms,
-            reasoning: self.config.reasoning.clone(),
+            reasoning: self.config.reasoning,
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             provider_options: self.config.provider_options.clone(),
@@ -332,7 +330,7 @@ impl AgentLoop<'_> {
 
             if events.is_empty() {
                 if is_done {
-                    let final_message = match response.wait_for_result_try().ok().flatten() {
+                    let final_message = match response.try_result() {
                         Some(m) => m,
                         None => make_failure_message(
                             &self.config.model,
@@ -626,8 +624,8 @@ impl AgentLoop<'_> {
                 args: validated.clone(),
                 context: current_context.clone(),
             };
-            if let Some(result) = before(ctx, signal.clone()).await {
-                if result.block {
+            if let Some(result) = before(ctx, signal.clone()).await
+                && result.block {
                     return PreparedToolCall::Immediate {
                         tool_call: tool_call.clone(),
                         result: AgentToolResult::error_text(
@@ -636,7 +634,6 @@ impl AgentLoop<'_> {
                         is_error: true,
                     };
                 }
-            }
         }
 
         PreparedToolCall::Ready { tool_call: tool_call.clone(), tool, args: validated }
@@ -746,7 +743,7 @@ async fn emit_tool_result_msg(m: &AgentMessage, emit: &AgentEventSink) {
 fn make_failure_message(model: &ModelInfo, stop_reason: StopReason, error_message: Option<&str>) -> AgentMessage {
     AgentMessage::Assistant {
         content: vec![ContentBlock::Text { text: String::new() }],
-        api: model.api.clone(),
+        api: model.api,
         provider: model.provider.clone(),
         model: model.id.clone(),
         usage: Usage::default(),

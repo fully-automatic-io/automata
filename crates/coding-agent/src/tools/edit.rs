@@ -108,10 +108,9 @@ pub fn detect_line_ending(content: &str) -> &str {
 
 /// Strip UTF-8 BOM if present
 pub fn strip_bom(content: &str) -> (&str, &str) {
-    if content.starts_with('\u{FEFF}') {
-        ("\u{FEFF}", &content[3..])
-    } else {
-        ("", content)
+    match content.strip_prefix('\u{FEFF}') {
+        Some(rest) => ("\u{FEFF}", rest),
+        None => ("", content),
     }
 }
 
@@ -129,8 +128,7 @@ pub fn restore_line_endings(content: &str, ending: &str) -> String {
     }
 }
 
-/// Normalize text for fuzzy matching. Mirrors pi-mono's
-/// `normalizeForFuzzyMatch` (edit-diff.ts):
+/// Normalize text for fuzzy matching:
 ///
 /// 1. NFKC compatibility composition
 /// 2. Strip trailing whitespace from each line
@@ -169,13 +167,13 @@ fn fuzzy_normalize(text: &str) -> String {
 ///
 /// When `used_fuzzy` is `true`, `content_for_replacement` is the
 /// fuzzy-normalized version of `content` and the edit must be applied
-/// against that string (matching pi-mono semantics: minor formatting
-/// differences get normalized into the file).
+/// against that string (minor formatting differences get normalized into
+/// the file).
 struct FuzzyMatch {
     range: std::ops::Range<usize>,
     /// `true` if the exact-match path failed and the fuzzy normalization
     /// path produced the hit. Exposed so callers can surface a soft
-    /// warning (matches pi-mono `usedFuzzyMatch`); not consumed yet.
+    /// warning; not consumed yet.
     #[allow(dead_code)]
     used_fuzzy: bool,
     content_for_replacement: String,
@@ -270,8 +268,7 @@ pub fn apply_edits_to_normalized_content(
         if let Some(m) = fuzzy_find_text(&result, &edit.old_text) {
             // When fuzzy matching, work in the normalized space — minor
             // formatting differences (smart quotes, special spaces) are
-            // intentionally normalized into the resulting file. Mirrors
-            // pi-mono's `contentForReplacement` semantics.
+            // intentionally normalized into the resulting file.
             let base = m.content_for_replacement;
             let before = &base[..m.range.start];
             let after = &base[m.range.end..];
@@ -392,15 +389,11 @@ pub async fn compute_edit_diff<O: EditOperations>(
 // Edit Tool
 // ============================================================================
 
+#[derive(Default)]
 pub struct EditToolOptions {
     pub operations: Option<Arc<dyn EditOperations>>,
 }
 
-impl Default for EditToolOptions {
-    fn default() -> Self {
-        Self { operations: None }
-    }
-}
 
 pub struct EditTool {
     cwd: String,
@@ -505,13 +498,11 @@ impl AgentTool for EditTool {
         }
 
         // Handle edits as JSON string
-        if let Some(edits_str) = args.get("edits").and_then(|v| v.as_str()) {
-            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(edits_str) {
-                if let Some(obj) = args.as_object_mut() {
+        if let Some(edits_str) = args.get("edits").and_then(|v| v.as_str())
+            && let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(edits_str)
+                && let Some(obj) = args.as_object_mut() {
                     obj.insert("edits".to_string(), serde_json::Value::Array(parsed));
                 }
-            }
-        }
 
         args
     }
@@ -549,7 +540,7 @@ impl AgentTool for EditTool {
         }
 
         // Check for cancellation
-        if signal.as_ref().map_or(false, |s| s.is_cancelled()) {
+        if signal.as_ref().is_some_and(|s| s.is_cancelled()) {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "Operation cancelled",
@@ -561,7 +552,9 @@ impl AgentTool for EditTool {
         let on_update_arc: Option<Arc<AgentToolUpdateCallback>> = on_update.map(Arc::new);
 
         // Use file mutation queue to prevent concurrent edits
-        let result = with_file_mutation_queue(&absolute_path, async {
+        
+
+        with_file_mutation_queue(&absolute_path, async {
             // Check file exists and is accessible
             self.operations
                 .access(&absolute_path)
@@ -577,7 +570,7 @@ impl AgentTool for EditTool {
                 .read_file(&absolute_path)
                 .await
                 .map_err(|e| {
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    Box::new(std::io::Error::other(e))
                         as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
@@ -591,7 +584,7 @@ impl AgentTool for EditTool {
             // Apply edits
             let (base, new) = apply_edits_to_normalized_content(&normalized, &edits, path)
                 .map_err(|e| {
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    Box::new(std::io::Error::other(e))
                         as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
@@ -612,7 +605,7 @@ impl AgentTool for EditTool {
             // Generate diff (display) + unified patch (git-applyable) early so we
             // can stream a preview before writing.
             let (diff, first_changed_line) = generate_diff_string(&base, &new);
-            let patch = generate_unified_patch(&path, &base, &new, 4);
+            let patch = generate_unified_patch(path, &base, &new, 4);
 
             // Emit streaming partial: diff preview before disk write hits.
             if let Some(cb) = &on_update_arc {
@@ -637,7 +630,7 @@ impl AgentTool for EditTool {
                 .write_file(&absolute_path, &final_content)
                 .await
                 .map_err(|e| {
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    Box::new(std::io::Error::other(e))
                         as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
@@ -658,9 +651,7 @@ impl AgentTool for EditTool {
                 terminate: false,
             })
         })
-        .await;
-
-        result
+        .await
     }
 }
 
@@ -756,7 +747,7 @@ mod tests {
     #[test]
     fn test_apply_edits_fuzzy_normalizes_into_file() {
         // Source has smart quotes; oldText uses ASCII. The post-edit content
-        // should carry ASCII quotes everywhere — matches pi-mono semantics.
+        // should carry ASCII quotes everywhere.
         let src = "let s = \u{201C}hello\u{201D};\nlet t = \u{201C}world\u{201D};\n";
         let edits = vec![Edit {
             old_text: "let s = \"hello\";".into(),
@@ -766,7 +757,7 @@ mod tests {
             apply_edits_to_normalized_content(src, &edits, "/x.rs").expect("apply");
         assert!(new.contains("let s = \"HELLO\";"));
         // The other line should also have been normalized (fuzzy rewrite of
-        // entire file — a deliberate choice mirroring pi-mono).
+        // the entire file is deliberate).
         assert!(new.contains("let t = \"world\";"));
         assert!(!new.contains('\u{201C}'));
         assert!(!new.contains('\u{201D}'));

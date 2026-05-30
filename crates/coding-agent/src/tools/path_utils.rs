@@ -4,9 +4,6 @@
 //! characters in screenshot names (narrow no-break space before AM/PM,
 //! right single quotation mark in French locale). Users typically type the
 //! NFC / ASCII equivalents, so we try several variants before giving up.
-//!
-//! Mirrors pi-mono's `resolveReadPath` / `resolveReadPathAsync`
-//! (`path-utils.ts`).
 
 use std::path::{Path, PathBuf};
 
@@ -125,7 +122,7 @@ mod tests {
     fn ampm_variant_tried_when_canonical_missing() {
         let dir = tempfile::TempDir::new().unwrap();
         // Create a file with the narrow no-break space variant.
-        let narrow = format!("screenshot\u{202F}AM.png");
+        let narrow = "screenshot\u{202F}AM.png".to_string();
         let file = dir.path().join(&narrow);
         std::fs::write(&file, b"img").unwrap();
 

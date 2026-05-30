@@ -13,7 +13,8 @@ const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversati
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct CompactionSettings {
     pub enabled: bool,
     pub reserve_tokens: usize,
@@ -104,13 +105,12 @@ pub fn estimate_tokens(message: &AgentMessage) -> usize {
 pub fn estimate_context_tokens(messages: &[AgentMessage]) -> usize {
     // Use last assistant usage if available
     for msg in messages.iter().rev() {
-        if let AgentMessage::Assistant { stop_reason, usage, .. } = msg {
-            if !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
+        if let AgentMessage::Assistant { stop_reason, usage, .. } = msg
+            && !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
                 if usage.total_tokens > 0 { return usage.total_tokens as usize; }
                 let total = usage.input + usage.output + usage.cache_read + usage.cache_write;
                 return total as usize;
             }
-        }
     }
     messages.iter().map(estimate_tokens).sum()
 }
@@ -125,8 +125,8 @@ pub struct ContextTokenEstimate {
 
 pub fn estimate_context_tokens_with_source(messages: &[AgentMessage]) -> ContextTokenEstimate {
     for (i, msg) in messages.iter().enumerate().rev() {
-        if let AgentMessage::Assistant { stop_reason, usage, .. } = msg {
-            if !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
+        if let AgentMessage::Assistant { stop_reason, usage, .. } = msg
+            && !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
                 let tokens = if usage.total_tokens > 0 {
                     usage.total_tokens as usize
                 } else {
@@ -134,7 +134,6 @@ pub fn estimate_context_tokens_with_source(messages: &[AgentMessage]) -> Context
                 };
                 return ContextTokenEstimate { tokens, last_usage_index: Some(i) };
             }
-        }
     }
     ContextTokenEstimate {
         tokens: messages.iter().map(estimate_tokens).sum(),
@@ -185,15 +184,13 @@ fn get_message_from_entry_for_compaction(entry: &SessionTreeEntry) -> Option<Age
 
 fn find_valid_cut_points(entries: &[SessionTreeEntry], start: usize, end: usize) -> Vec<usize> {
     let mut cut_points = vec![];
-    for i in start..end {
-        let entry = &entries[i];
+    for (i, entry) in entries.iter().enumerate().take(end).skip(start) {
         match entry {
-            SessionTreeEntry::Message { message, .. } => {
+            SessionTreeEntry::Message { message, .. }
                 // Tool results aren't valid cut points (they're attached to a turn).
-                if !matches!(message, AgentMessage::ToolResult { .. }) {
+                if !matches!(message, AgentMessage::ToolResult { .. }) => {
                     cut_points.push(i);
                 }
-            }
             SessionTreeEntry::BranchSummary { .. } | SessionTreeEntry::CustomMessage { .. } => {
                 cut_points.push(i);
             }
@@ -209,10 +206,10 @@ pub fn find_turn_start_index(entries: &[SessionTreeEntry], entry_index: usize, s
         let entry = &entries[i as usize];
         match entry {
             SessionTreeEntry::BranchSummary { .. } | SessionTreeEntry::CustomMessage { .. } => return Some(i as usize),
-            SessionTreeEntry::Message { message, .. } => match message {
-                AgentMessage::User { .. } | AgentMessage::BashExecution { .. } => return Some(i as usize),
-                _ => {}
-            },
+            SessionTreeEntry::Message {
+                message: AgentMessage::User { .. } | AgentMessage::BashExecution { .. },
+                ..
+            } => return Some(i as usize),
             _ => {}
         }
         i -= 1;
@@ -272,9 +269,9 @@ fn find_cut_point(entries: &[SessionTreeEntry], start: usize, end: usize, keep_r
 
 fn extract_file_operations(messages: &[AgentMessage], entries: &[SessionTreeEntry], prev_compaction_index: Option<usize>) -> FileOperations {
     let mut file_ops = create_file_ops();
-    if let Some(idx) = prev_compaction_index {
-        if let SessionTreeEntry::Compaction { details: Some(details), from_hook, .. } = &entries[idx] {
-            if from_hook != &Some(true) {
+    if let Some(idx) = prev_compaction_index
+        && let SessionTreeEntry::Compaction { details: Some(details), from_hook, .. } = &entries[idx]
+            && from_hook != &Some(true) {
                 if let Some(read) = details.get("readFiles").and_then(|r| r.as_array()) {
                     for f in read { if let Some(s) = f.as_str() { file_ops.read.insert(s.to_string()); } }
                 }
@@ -282,8 +279,6 @@ fn extract_file_operations(messages: &[AgentMessage], entries: &[SessionTreeEntr
                     for f in modified { if let Some(s) = f.as_str() { file_ops.edited.insert(s.to_string()); } }
                 }
             }
-        }
-    }
     for msg in messages {
         extract_file_ops_from_message(msg, &mut file_ops);
     }
@@ -302,13 +297,12 @@ pub fn prepare_compaction(path_entries: &[SessionTreeEntry], settings: &Compacti
 
     let mut previous_summary: Option<String> = None;
     let mut boundary_start = 0usize;
-    if let Some(cidx) = prev_compaction_index {
-        if let SessionTreeEntry::Compaction { summary, first_kept_entry_id, .. } = &path_entries[cidx] {
+    if let Some(cidx) = prev_compaction_index
+        && let SessionTreeEntry::Compaction { summary, first_kept_entry_id, .. } = &path_entries[cidx] {
             previous_summary = Some(summary.clone());
             let first_kept_pos = path_entries.iter().position(|e| e.id() == first_kept_entry_id);
             boundary_start = first_kept_pos.unwrap_or(cidx + 1);
         }
-    }
 
     let ctx = build_session_context(path_entries);
     let tokens_before = estimate_context_tokens(&ctx.messages);

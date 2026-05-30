@@ -5,16 +5,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum QueueMode {
     /// Drain all queued messages on each `drain()` call.
     All,
     /// Drain a single message per `drain()` call.
+    #[default]
     OneAtATime,
 }
 
-impl Default for QueueMode {
-    fn default() -> Self { Self::OneAtATime }
-}
 
 #[derive(Debug)]
 pub struct MessageQueue {

@@ -146,6 +146,22 @@ impl SessionTreeEntry {
         }
     }
 
+    /// The wire `type` discriminant for this entry (matches the JSONL `type` tag).
+    pub fn entry_type(&self) -> &'static str {
+        match self {
+            Self::Message { .. } => "message",
+            Self::ThinkingLevelChange { .. } => "thinking_level_change",
+            Self::ModelChange { .. } => "model_change",
+            Self::Compaction { .. } => "compaction",
+            Self::BranchSummary { .. } => "branch_summary",
+            Self::Custom { .. } => "custom",
+            Self::CustomMessage { .. } => "custom_message",
+            Self::Label { .. } => "label",
+            Self::SessionInfo { .. } => "session_info",
+            Self::Leaf { .. } => "leaf",
+        }
+    }
+
     pub fn parent_id(&self) -> Option<&str> {
         match self {
             Self::Message { parent_id, .. } => parent_id.as_deref(),
@@ -229,10 +245,11 @@ pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContex
             SessionTreeEntry::ModelChange { provider, model_id, .. } => {
                 model = Some(ModelRef { provider: provider.clone(), model_id: model_id.clone() });
             }
-            SessionTreeEntry::Message { message, .. } => {
-                if let AgentMessage::Assistant { provider, model: model_id, .. } = message {
-                    model = Some(ModelRef { provider: provider.clone(), model_id: model_id.clone() });
-                }
+            SessionTreeEntry::Message {
+                message: AgentMessage::Assistant { provider, model: model_id, .. },
+                ..
+            } => {
+                model = Some(ModelRef { provider: provider.clone(), model_id: model_id.clone() });
             }
             SessionTreeEntry::Compaction { summary, tokens_before, first_kept_entry_id, timestamp, .. } => {
                 compaction_idx = Some(i);
@@ -548,11 +565,10 @@ impl Session {
         entry_id: Option<&str>,
         summary: Option<BranchSummaryOptions>,
     ) -> Result<Option<String>, SessionError> {
-        if let Some(id) = entry_id {
-            if self.storage.get_entry(id).await.is_none() {
+        if let Some(id) = entry_id
+            && self.storage.get_entry(id).await.is_none() {
                 return Err(SessionError::NotFound(format!("Entry {} not found", id)));
             }
-        }
         self.storage.set_leaf_id(entry_id.map(|s| s.to_string())).await?;
         if let Some(opts) = summary {
             let sid = self.storage.create_entry_id().await;
@@ -658,11 +674,10 @@ impl SessionStorage for InMemorySessionStorage {
     }
 
     async fn set_leaf_id(&mut self, leaf_id: Option<String>) -> Result<(), SessionError> {
-        if let Some(ref id) = leaf_id {
-            if !self.by_id.contains_key(id) {
+        if let Some(ref id) = leaf_id
+            && !self.by_id.contains_key(id) {
                 return Err(SessionError::NotFound(format!("Entry {} not found", id)));
             }
-        }
         let entry_id = generate_entry_id(&self.by_id);
         let entry = SessionTreeEntry::Leaf {
             id: entry_id.clone(),
@@ -701,19 +716,7 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn find_entries_by_type(&self, entry_type: &str) -> Vec<SessionTreeEntry> {
         self.entries.iter()
-            .filter(|e| match (entry_type, e) {
-                ("message", SessionTreeEntry::Message { .. }) => true,
-                ("compaction", SessionTreeEntry::Compaction { .. }) => true,
-                ("branch_summary", SessionTreeEntry::BranchSummary { .. }) => true,
-                ("session_info", SessionTreeEntry::SessionInfo { .. }) => true,
-                ("label", SessionTreeEntry::Label { .. }) => true,
-                ("leaf", SessionTreeEntry::Leaf { .. }) => true,
-                ("custom", SessionTreeEntry::Custom { .. }) => true,
-                ("custom_message", SessionTreeEntry::CustomMessage { .. }) => true,
-                ("thinking_level_change", SessionTreeEntry::ThinkingLevelChange { .. }) => true,
-                ("model_change", SessionTreeEntry::ModelChange { .. }) => true,
-                _ => false,
-            })
+            .filter(|e| e.entry_type() == entry_type)
             .cloned()
             .collect()
     }

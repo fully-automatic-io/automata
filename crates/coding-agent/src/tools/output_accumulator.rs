@@ -1,8 +1,7 @@
 //! Streaming output accumulator with bounded memory and temp-file fallback.
 //!
-//! Mirrors pi-mono's `OutputAccumulator` (`output-accumulator.ts`). Appends
-//! decoded chunks, keeps a rolling tail for display snapshots, and spills to a
-//! temp file when the full output exceeds the configured limits.
+//! Appends decoded chunks, keeps a rolling tail for display snapshots, and
+//! spills to a temp file when the full output exceeds the configured limits.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -80,11 +79,10 @@ impl OutputAccumulator {
 
         if self.should_use_temp_file() {
             self.ensure_temp_file();
-            if let Some(ref path) = self.temp_path {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            if let Some(ref path) = self.temp_path
+                && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                     let _ = f.write_all(data);
                 }
-            }
         } else if !data.is_empty() {
             self.raw_chunks.push(data.to_vec());
         }

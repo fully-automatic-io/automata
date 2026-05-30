@@ -332,7 +332,7 @@ impl From<&Model> for ModelInfo {
         Self {
             id: m.id.clone(),
             name: m.name.clone(),
-            api: m.api.clone(),
+            api: m.api,
             provider: m.provider.clone(),
             base_url: m.base_url.clone(),
             reasoning: m.reasoning,

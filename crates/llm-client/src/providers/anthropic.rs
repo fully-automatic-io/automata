@@ -113,8 +113,8 @@ impl AnthropicProvider {
         //     { type: "adaptive", display: "summarized" } + output_config.effort
         //   - Budget (older Claude 4) → { type: "enabled", budget_tokens: N }
         //   - None → no thinking field
-        if let Some(level) = request.reasoning_effort {
-            if level != ThinkingLevel::Off {
+        if let Some(level) = request.reasoning_effort
+            && level != ThinkingLevel::Off {
                 let force = request.anthropic_options()
                     .and_then(|o| o.force_adaptive_thinking);
                 if resolve_adaptive_thinking(&request.model, force) {
@@ -126,7 +126,6 @@ impl AnthropicProvider {
                     body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
                 }
             }
-        }
 
         body
     }

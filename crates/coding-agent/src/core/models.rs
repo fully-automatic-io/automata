@@ -1,8 +1,9 @@
+use agent_core::types::ThinkingLevel;
 use serde::{Deserialize, Serialize};
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
-pub const DEFAULT_THINKING_LEVEL: &str = "medium";
+pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 pub const DEFAULT_AGENT_DIR: &str = ".automata";
 pub const DEFAULT_SESSIONS_DIR: &str = ".automata/sessions";
 pub const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16384;
@@ -18,11 +19,13 @@ pub fn default_model_for_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
-pub fn clamp_thinking_level(level: &str, model_supports_reasoning: bool) -> &str {
-    if !model_supports_reasoning { return "off"; }
-    match level {
-        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" => level,
-        _ => "medium",
+/// Clamp a thinking level to what the model can do: models without reasoning
+/// always collapse to [`ThinkingLevel::Off`].
+pub fn clamp_thinking_level(level: ThinkingLevel, model_supports_reasoning: bool) -> ThinkingLevel {
+    if model_supports_reasoning {
+        level
+    } else {
+        ThinkingLevel::Off
     }
 }
 

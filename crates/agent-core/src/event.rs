@@ -119,6 +119,10 @@ impl PartialContentBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Every meaningful variant carries a full `AgentMessage`; only the lifecycle
+// markers (AgentStart/TurnStart) are small. Boxing the payloads would ripple
+// through every match site for no real win on a short-lived event value.
+#[allow(clippy::large_enum_variant)]
 pub enum AgentEvent {
     #[serde(rename = "agent_start")]
     AgentStart,
@@ -326,21 +330,22 @@ impl<T: Clone, R: Clone> EventStream<T, R> {
         }
     }
 
-    pub fn wait_for_result_try(&self) -> Result<Option<R>, ()> {
+    /// The final result if the stream has completed, else `None`. A completed
+    /// stream that produced no result also yields `None`.
+    pub fn try_result(&self) -> Option<R> {
         if *self.is_complete.lock().unwrap() {
-            Ok(self.result.lock().unwrap().clone())
+            self.result.lock().unwrap().clone()
         } else {
-            Err(())
+            None
         }
     }
 
     pub async fn wait_for_result(&self) -> R {
         loop {
-            if *self.is_complete.lock().unwrap() {
-                if let Some(r) = self.result.lock().unwrap().clone() {
+            if *self.is_complete.lock().unwrap()
+                && let Some(r) = self.result.lock().unwrap().clone() {
                     return r;
                 }
-            }
             self.is_done.notified().await;
         }
     }

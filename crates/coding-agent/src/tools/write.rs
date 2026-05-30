@@ -104,15 +104,11 @@ fn contains_emojis(content: &str) -> bool {
 // Write Tool
 // ============================================================================
 
+#[derive(Default)]
 pub struct WriteToolOptions {
     pub operations: Option<Arc<dyn WriteOperations>>,
 }
 
-impl Default for WriteToolOptions {
-    fn default() -> Self {
-        Self { operations: None }
-    }
-}
 
 pub struct WriteTool {
     cwd: String,
@@ -218,10 +214,8 @@ impl AgentTool for WriteTool {
         if contains_emojis(content) {
             let filtered = filter_emojis(content);
             if filtered != content {
-                warnings.push(format!(
-                    "Note: Emojis were filtered from the content. \
-                    If you need emojis, please explicitly mention it in your request."
-                ));
+                warnings.push("Note: Emojis were filtered from the content. \
+                    If you need emojis, please explicitly mention it in your request.".to_string());
                 final_content = filtered;
             }
         }
@@ -259,7 +253,7 @@ impl AgentTool for WriteTool {
                 .mkdir(&parent.to_string_lossy())
                 .await
                 .map_err(|e| {
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<_>
+                    Box::new(std::io::Error::other(e)) as Box<_>
                 })?;
         }
 
@@ -268,7 +262,7 @@ impl AgentTool for WriteTool {
             .write_file(&absolute_path, &final_content)
             .await
             .map_err(|e| {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<_>
+                Box::new(std::io::Error::other(e)) as Box<_>
             })?;
 
         // Build result message

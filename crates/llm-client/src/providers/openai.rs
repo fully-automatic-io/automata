@@ -86,8 +86,8 @@ impl OpenAIProvider {
         //   - Anthropic-compat aliases (set via OpenaiOptions): inject inline
         //     `cache_control: {type: "ephemeral", ttl?: "1h"}` on system / last
         //     tool / last user message
-        if let Some(retention) = request.cache_retention {
-            if retention != CacheRetention::None {
+        if let Some(retention) = request.cache_retention
+            && retention != CacheRetention::None {
                 let use_anthropic_style = request
                     .openai_options()
                     .and_then(|o| o.anthropic_cache_control)
@@ -103,7 +103,6 @@ impl OpenAIProvider {
                     body["prompt_cache_retention"] = json!("24h");
                 }
             }
-        }
 
         body
     }
@@ -163,8 +162,7 @@ impl OpenAIProvider {
 
 /// Apply Anthropic-style `cache_control` hints to an OpenAI Chat Completions
 /// request body. Inserts on the system message (text content), the last tool
-/// definition, and the last user / assistant turn — matching pi-mono's
-/// `applyAnthropicCacheControl`.
+/// definition, and the last user / assistant turn.
 fn apply_anthropic_cache_control(body: &mut serde_json::Value, cache_control: &serde_json::Value) {
     // 1. System (or developer) message — promote string content to an array
     //    of `{type: "text", text, cache_control}` parts.
@@ -186,13 +184,11 @@ fn apply_anthropic_cache_control(body: &mut serde_json::Value, cache_control: &s
         }
     }
     // 3. Last tool definition.
-    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
-        if let Some(last) = tools.last_mut() {
-            if let Some(obj) = last.as_object_mut() {
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut())
+        && let Some(last) = tools.last_mut()
+            && let Some(obj) = last.as_object_mut() {
                 obj.insert("cache_control".into(), cache_control.clone());
             }
-        }
-    }
 }
 
 /// Attach `cache_control` to the last text part of a message, promoting flat
@@ -213,11 +209,10 @@ fn attach_cache_to_text_content(msg: &mut serde_json::Value, cache_control: &ser
             matches!(p.get("type").and_then(|t| t.as_str()), Some("text") | Some("input_text"))
         });
         let idx = last_text_idx.or_else(|| arr.len().checked_sub(1));
-        if let Some(i) = idx {
-            if let Some(obj) = arr[i].as_object_mut() {
+        if let Some(i) = idx
+            && let Some(obj) = arr[i].as_object_mut() {
                 obj.insert("cache_control".into(), cache_control.clone());
             }
-        }
     }
 }
 
@@ -324,11 +319,10 @@ impl LlmProvider for OpenAIProvider {
             .ok_or_else(|| LlmError::InvalidRequest("No choices".to_string()))?;
 
         let mut content = vec![];
-        if let Some(text) = choice.message.content {
-            if !text.is_empty() {
+        if let Some(text) = choice.message.content
+            && !text.is_empty() {
                 content.push(ContentPart::Text { text });
             }
-        }
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in tool_calls {
                 let input = serde_json::from_str(&tc.function.arguments)

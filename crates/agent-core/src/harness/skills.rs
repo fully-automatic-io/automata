@@ -74,11 +74,10 @@ pub fn load_skills_from_dir(dir: &std::path::Path) -> Vec<Skill> {
         .collect();
     paths.sort();
     for path in paths {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Some(skill) = parse_skill_file(&content, &path.to_string_lossy()) {
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Some(skill) = parse_skill_file(&content, &path.to_string_lossy()) {
                 skills.push(skill);
             }
-        }
     }
     skills
 }

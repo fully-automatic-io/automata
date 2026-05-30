@@ -9,6 +9,9 @@ repository = "https://github.com/yourusername/automata"
 keywords = ["ai", "agent", "llm", "framework"]
 categories = ["development-tools"]
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { workspace = true }
 futures = { workspace = true }
