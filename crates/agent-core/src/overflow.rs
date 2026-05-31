@@ -112,7 +112,9 @@ pub fn is_context_overflow(message: &AgentMessage, context_window: Option<u64>) 
                 return true;
             }
 
-    let Some(window) = context_window else { return false };
+    // A window of 0 means "unknown" (model info not supplied); the
+    // token-count cases below can't be evaluated meaningfully against it.
+    let Some(window) = context_window.filter(|w| *w > 0) else { return false };
 
     // Case 2: silent overflow.
     if *stop_reason == StopReason::EndTurn {

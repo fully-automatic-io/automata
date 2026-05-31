@@ -41,5 +41,5 @@ pub use types::{
     OnPayloadFn, OnResponseFn, OpenaiOptions, PrepareNextTurnContext, PrepareNextTurnFn,
     ProviderOptions, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn,
     SimpleStreamOptions, StopReason, ThinkingBudgets, ThinkingLevel, ToolDefinition,
-    ToolExecutionMode, TransformContextFn, Transport, Usage, UsageCost,
+    ToolExecutionMode, TransformContextFn, Transport, TurnUpdate, Usage, UsageCost,
 };

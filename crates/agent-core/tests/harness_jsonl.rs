@@ -549,3 +549,51 @@ async fn test_check_pre_prompt_processes_aborted_messages() {
     // No compaction fired (no usage data), but the path didn't panic.
     assert!(!result.unwrap());
 }
+
+#[tokio::test]
+async fn test_check_post_run_drains_queued_followups() {
+    use agent_core::harness::PostRunDecision;
+
+    // A follow-up enqueued after a turn settled (e.g. by an agent_end listener)
+    // must surface as DrainQueues so the caller runs a continuation.
+    let harness = make_idle_harness();
+    // Give the harness a realistic context window so the small usage below is
+    // nowhere near the overflow / threshold trigger.
+    harness
+        .set_model_info(agent_core::types::ModelInfo {
+            id: "claude-sonnet-4-6".into(),
+            provider: "anthropic".into(),
+            context_window: 200_000,
+            ..Default::default()
+        })
+        .await;
+
+    // A successful assistant message with no overflow / threshold trigger:
+    // check_post_run would otherwise return Stop.
+    let done = AgentMessage::Assistant {
+        content: vec![agent_core::types::ContentBlock::Text { text: "ok".into() }],
+        api: Api::Anthropic,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        usage: Usage { input: 1, output: 1, total_tokens: 2, ..Default::default() },
+        stop_reason: StopReason::EndTurn,
+        error_message: None,
+        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+    };
+    harness.set_last_assistant_for_test(Some(done)).await;
+
+    // Without a queued message, the decision is Stop.
+    let decision = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(decision, PostRunDecision::Stop);
+
+    // Queue a follow-up (as an agent_end listener would), then re-check.
+    harness.follow_up(AgentMessage::user_text("more")).await;
+    let decision = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await
+        .unwrap();
+    assert_eq!(decision, PostRunDecision::DrainQueues);
+}

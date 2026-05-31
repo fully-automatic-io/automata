@@ -164,6 +164,13 @@ impl Agent {
         self.clear_follow_up_queue();
     }
 
+    /// Clear the transcript, runtime state (streaming / pending tool calls /
+    /// error), and both queues. Mirrors pi-mono `Agent.reset`.
+    pub fn reset(&self) {
+        self.state.lock().unwrap().reset_runtime();
+        self.clear_all_queues();
+    }
+
     pub fn has_queued_messages(&self) -> bool {
         self.steering_queue.lock().unwrap().has_items()
             || self.follow_up_queue.lock().unwrap().has_items()
@@ -339,11 +346,16 @@ impl Agent {
 
         let emit: AgentEventSink = {
             let listeners = self.listeners.clone();
+            let state = self.state.clone();
             let cancel = cancel.clone();
             Arc::new(move |event: AgentEvent| {
                 let listeners = listeners.clone();
+                let state = state.clone();
                 let cancel = cancel.clone();
                 Box::pin(async move {
+                    // Fold the event into the agent's own state before
+                    // dispatching, mirroring pi-mono's `processEvents`.
+                    state.lock().unwrap().apply_event(&event);
                     let list_copy: Vec<EventListener> = listeners.lock().unwrap().clone();
                     for listener in list_copy.iter() {
                         listener(event.clone(), Some(cancel.clone())).await;
@@ -433,5 +445,28 @@ mod tests {
             PromptInput::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("Expected Text variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_agent_accumulates_transcript_and_resets() {
+        let agent = make_agent();
+        // Prompt runs the dummy stream fn, which ends with an assistant message.
+        let _ = agent.prompt("hi".into()).await.unwrap();
+
+        // The agent's own state should now reflect the transcript via events:
+        // the user prompt plus the assistant reply.
+        let msgs = agent.snapshot().messages;
+        assert!(
+            msgs.iter().any(|m| matches!(m, AgentMessage::Assistant { .. })),
+            "agent state should contain the assistant reply after a run"
+        );
+        assert!(
+            msgs.iter().any(|m| m.role() == "user"),
+            "agent state should contain the user prompt"
+        );
+
+        agent.reset();
+        assert!(agent.snapshot().messages.is_empty(), "reset clears the transcript");
+        assert!(!agent.has_queued_messages());
     }
 }

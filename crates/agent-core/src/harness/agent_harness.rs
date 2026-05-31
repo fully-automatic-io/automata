@@ -464,6 +464,14 @@ impl AgentHarness {
         v
     }
 
+    /// Whether any steer / follow-up / next-turn message is queued. Used by the
+    /// post-run check to drain messages an `agent_end` listener enqueued.
+    pub async fn has_queued_messages(&self) -> bool {
+        !self.steer_queue.lock().await.is_empty()
+            || !self.follow_up_queue.lock().await.is_empty()
+            || !self.next_turn_queue.lock().await.is_empty()
+    }
+
     /// Current drain policy for the steering queue.
     pub async fn steer_mode(&self) -> crate::queue::QueueMode {
         *self.steer_mode.lock().await
@@ -819,7 +827,16 @@ impl AgentHarness {
         compaction_settings: &CompactionSettings,
         compaction_stream_fn: &CompactionStreamFn,
     ) -> Result<PostRunDecision, HarnessError> {
-        self.check_post_run_inner(compaction_settings, compaction_stream_fn, true).await
+        let decision = self
+            .check_post_run_inner(compaction_settings, compaction_stream_fn, true)
+            .await?;
+        // The agent loop drains both queues before emitting agent_end; any
+        // messages still queued here were enqueued by agent_end listeners and
+        // need a continuation to be processed. (pi-mono fix a29a7902.)
+        if decision == PostRunDecision::Stop && self.has_queued_messages().await {
+            return Ok(PostRunDecision::DrainQueues);
+        }
+        Ok(decision)
     }
 
     /// Inner check used by both `check_post_run` (post-turn) and
@@ -1051,6 +1068,9 @@ pub enum PostRunDecision {
     /// Caller should re-run the same turn — auto-retry triggered after a
     /// transient error, error message dropped, backoff slept.
     Retry { attempt: u32 },
+    /// Caller should run one more (empty-prompt) turn to drain steer /
+    /// follow-up / next-turn messages an `agent_end` listener enqueued.
+    DrainQueues,
     /// No further action; the turn is settled.
     Stop,
 }

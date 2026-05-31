@@ -267,10 +267,13 @@ impl CodingAgentSession {
                 .await?;
             match decision {
                 PostRunDecision::Stop => break,
-                // Both recovery paths re-run the same turn with no new prompt;
-                // the harness has already dropped the failed assistant message
-                // and (for overflow) compacted before we get here.
-                PostRunDecision::Retry { .. } | PostRunDecision::CompactedRetry => {
+                // All re-run paths continue the same turn with no new prompt;
+                // the loop drains steer / follow-up queues itself, and the
+                // harness has already dropped any failed assistant message
+                // (and, for overflow, compacted) before we get here.
+                PostRunDecision::Retry { .. }
+                | PostRunDecision::CompactedRetry
+                | PostRunDecision::DrainQueues => {
                     messages = self.harness.continue_turn(vec![]).await?;
                 }
             }

@@ -166,6 +166,12 @@ impl AgentLoop<'_> {
         let mut first_turn = true;
         let mut pending_messages: Vec<AgentMessage> = self.drain_steer().await;
 
+        // Per-turn config overrides that `prepare_next_turn` may mutate
+        // mid-run. They start at the loop config's values and shadow them in
+        // `stream_assistant_response`.
+        let mut effective_model = self.config.model.clone();
+        let mut effective_reasoning = self.config.reasoning;
+
         loop {
             let mut has_more_tool_calls = true;
 
@@ -193,7 +199,7 @@ impl AgentLoop<'_> {
                 }
 
                 let assistant = self
-                    .stream_assistant_response(current_context, signal.clone())
+                    .stream_assistant_response(current_context, &effective_model, effective_reasoning, signal.clone())
                     .await;
                 new_messages.push(assistant.clone());
 
@@ -221,6 +227,34 @@ impl AgentLoop<'_> {
                     has_more_tool_calls = !batch.terminate;
                 }
 
+                self.emit(AgentEvent::TurnEnd { message: assistant.clone(), tool_results: tool_results.clone() }).await;
+
+                // prepare_next_turn runs after turn_end and may swap the
+                // context / model / reasoning for the next turn and inject
+                // extra messages (pi-mono agent-loop.ts:220-239).
+                if let Some(ref hook) = self.config.prepare_next_turn {
+                    let ctx = PrepareNextTurnContext {
+                        last_assistant_message: assistant.clone(),
+                        tool_results: tool_results.clone(),
+                        context: current_context.clone(),
+                    };
+                    if let Some(update) = hook(ctx, signal.clone()).await {
+                        if let Some(new_ctx) = update.context {
+                            *current_context = new_ctx;
+                        }
+                        if let Some(model) = update.model {
+                            effective_model = model;
+                        }
+                        if let Some(level) = update.thinking_level {
+                            effective_reasoning = if level == ThinkingLevel::Off { None } else { Some(level) };
+                        }
+                        pending_messages.extend(update.messages);
+                    }
+                }
+
+                // should_stop_after_turn runs after prepare_next_turn; a true
+                // result exits immediately without draining steering
+                // (pi-mono agent-loop.ts:241-251).
                 if let Some(ref hook) = self.config.should_stop_after_turn {
                     let ctx = ShouldStopAfterTurnContext {
                         assistant_message: assistant.clone(),
@@ -229,22 +263,11 @@ impl AgentLoop<'_> {
                         has_more_tool_calls,
                     };
                     if hook(ctx, signal.clone()).await {
-                        has_more_tool_calls = false;
+                        self.emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+                        return;
                     }
                 }
 
-                if has_more_tool_calls
-                    && let Some(ref hook) = self.config.prepare_next_turn {
-                        let ctx = PrepareNextTurnContext {
-                            last_assistant_message: assistant.clone(),
-                            tool_results: tool_results.clone(),
-                            context: current_context.clone(),
-                        };
-                        let extras = hook(ctx, signal.clone()).await;
-                        pending_messages.extend(extras);
-                    }
-
-                self.emit(AgentEvent::TurnEnd { message: assistant, tool_results }).await;
                 pending_messages.extend(self.drain_steer().await);
             }
 
@@ -268,6 +291,8 @@ impl AgentLoop<'_> {
     async fn stream_assistant_response(
         &self,
         context: &mut AgentContext,
+        model: &ModelInfo,
+        reasoning: Option<ThinkingLevel>,
         signal: Option<CancellationToken>,
     ) -> AgentMessage {
         let mut messages = context.messages.clone();
@@ -277,7 +302,7 @@ impl AgentLoop<'_> {
         let llm_messages = (self.config.convert_to_llm)(messages).await;
 
         let resolved_api_key = if let Some(ref get_key) = self.config.get_api_key {
-            get_key(self.config.model.provider.clone())
+            get_key(model.provider.clone())
                 .await
                 .or(self.config.api_key.clone())
         } else {
@@ -285,7 +310,7 @@ impl AgentLoop<'_> {
         };
 
         let stream_input = StreamFnInput {
-            model: self.config.model.clone(),
+            model: model.clone(),
             system_prompt: context.system_prompt.clone(),
             messages: llm_messages,
             tools: context.tools.clone(),
@@ -295,7 +320,7 @@ impl AgentLoop<'_> {
             thinking_budgets: self.config.thinking_budgets.clone(),
             transport: self.config.transport,
             max_retry_delay_ms: self.config.max_retry_delay_ms,
-            reasoning: self.config.reasoning,
+            reasoning,
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             provider_options: self.config.provider_options.clone(),
@@ -314,7 +339,7 @@ impl AgentLoop<'_> {
         let response = match (self.stream_fn)(stream_input).await {
             Ok(stream) => stream,
             Err(err) => {
-                let failure = make_failure_message(&self.config.model, StopReason::Error, Some(&err));
+                let failure = make_failure_message(model, StopReason::Error, Some(&err));
                 context.messages.push(failure.clone());
                 self.emit(AgentEvent::MessageStart { message: failure.clone() }).await;
                 self.emit(AgentEvent::MessageEnd { message: failure.clone() }).await;
@@ -333,7 +358,7 @@ impl AgentLoop<'_> {
                     let final_message = match response.try_result() {
                         Some(m) => m,
                         None => make_failure_message(
-                            &self.config.model,
+                            model,
                             StopReason::Error,
                             Some("Stream ended without result"),
                         ),

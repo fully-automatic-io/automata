@@ -840,6 +840,23 @@ pub struct PrepareNextTurnContext {
     pub context: AgentContext,
 }
 
+/// Config snapshot returned by [`PrepareNextTurnFn`]. Any `Some` field
+/// overrides the loop's state for the next turn; `None` keeps the current
+/// value. `messages` are injected (as pending) before the next assistant
+/// response. Mirrors pi-mono's `AgentLoopTurnUpdate`.
+#[derive(Clone, Default)]
+pub struct TurnUpdate {
+    /// Replace the working context (messages + tools + system prompt).
+    pub context: Option<AgentContext>,
+    /// Switch the model for subsequent turns.
+    pub model: Option<ModelInfo>,
+    /// Switch the reasoning level. `Some(ThinkingLevel::Off)` disables it.
+    pub thinking_level: Option<ThinkingLevel>,
+    /// Extra messages to inject before the next assistant response.
+    pub messages: Vec<AgentMessage>,
+}
+
+
 // ============================================================================
 // Hook type aliases — small named closure types for AgentLoopConfig.
 // ============================================================================
@@ -879,7 +896,7 @@ pub type ShouldStopAfterTurnFn = Arc<
 >;
 pub type PrepareNextTurnFn = Arc<
     dyn Fn(PrepareNextTurnContext, Option<CancellationToken>)
-            -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+            -> Pin<Box<dyn Future<Output = Option<TurnUpdate>> + Send>>
         + Send + Sync,
 >;
 pub type OnPayloadFn = Arc<
@@ -1028,6 +1045,56 @@ impl AgentState {
     pub fn messages(&self) -> Vec<AgentMessage> { self.messages.clone() }
     pub fn set_messages(&mut self, messages: Vec<AgentMessage>) { self.messages = messages; }
     pub fn push_message(&mut self, message: AgentMessage) { self.messages.push(message); }
+
+    /// Fold an [`crate::event::AgentEvent`] into the running state. Mirrors
+    /// pi-mono's `Agent.processEvents`: tracks the streaming message, appends
+    /// finalized messages, maintains the pending-tool-call set, and captures
+    /// the last turn's error message.
+    pub fn apply_event(&mut self, event: &crate::event::AgentEvent) {
+        use crate::event::AgentEvent;
+        match event {
+            AgentEvent::MessageStart { message } => {
+                self.is_streaming = true;
+                self.streaming_message = Some(message.clone());
+            }
+            AgentEvent::MessageUpdate { partial, .. } => {
+                self.is_streaming = true;
+                self.streaming_message = Some(partial.clone().into_finalized());
+            }
+            AgentEvent::MessageEnd { message } => {
+                self.is_streaming = false;
+                self.streaming_message = None;
+                self.messages.push(message.clone());
+            }
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
+                self.pending_tool_calls.insert(tool_call_id.clone());
+            }
+            AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                self.pending_tool_calls.remove(tool_call_id);
+            }
+            AgentEvent::TurnEnd { message, .. } => {
+                if let Some(err) = message.assistant_error_message() {
+                    self.error_message = Some(err.to_string());
+                }
+            }
+            AgentEvent::AgentEnd { .. } => {
+                self.is_streaming = false;
+                self.streaming_message = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Clear transcript, streaming/runtime state, and error. Queue clearing is
+    /// the `Agent`'s responsibility (it owns the queues). Mirrors pi-mono
+    /// `Agent.reset`.
+    pub fn reset_runtime(&mut self) {
+        self.messages.clear();
+        self.is_streaming = false;
+        self.streaming_message = None;
+        self.pending_tool_calls.clear();
+        self.error_message = None;
+    }
 }
 
 impl std::fmt::Debug for AgentState {
