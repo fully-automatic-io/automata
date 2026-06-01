@@ -1,6 +1,9 @@
-use agent_core::types::{Api, Model, ModelCost};
+use agent_core::types::Model;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+// `builtin_models()` is generated at build time from `models.json` by build.rs.
+include!(concat!(env!("OUT_DIR"), "/models_generated.rs"));
 
 /// Provider credentials/endpoint registered for a model's `provider` name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,37 +32,9 @@ impl ModelRegistry {
         registry
     }
 
+    /// Seed the registry with the compile-time catalog (`models.json`).
     fn load_defaults(&mut self) {
-        let anthropic = |id: &str, name: &str, ctx: u64, max: u64| Model {
-            id: id.into(),
-            name: name.into(),
-            api: Api::Anthropic,
-            provider: "anthropic".into(),
-            base_url: String::new(),
-            reasoning: true,
-            input: vec!["text".into()],
-            cost: ModelCost::default(),
-            context_window: ctx,
-            max_tokens: max,
-        };
-        let openai = |id: &str, name: &str, ctx: u64, max: u64| Model {
-            id: id.into(),
-            name: name.into(),
-            api: Api::Openai,
-            provider: "openai".into(),
-            base_url: String::new(),
-            reasoning: false,
-            input: vec!["text".into()],
-            cost: ModelCost::default(),
-            context_window: ctx,
-            max_tokens: max,
-        };
-        for model in [
-            anthropic("claude-opus-4-7", "Claude Opus 4.7", 1_000_000, 32_000),
-            anthropic("claude-sonnet-4-6", "Claude Sonnet 4.6", 200_000, 16_000),
-            anthropic("claude-haiku-4-5", "Claude Haiku 4.5", 200_000, 8_000),
-            openai("gpt-4o", "GPT-4o", 128_000, 16_384),
-        ] {
+        for model in builtin_models() {
             self.models.insert(model.id.clone(), model);
         }
     }
@@ -169,5 +144,25 @@ mod tests {
             ProviderConfig { api_key: "sk-test".into(), base_url: None },
         );
         assert_eq!(r.get_api_key("claude-opus-4-7"), Some("sk-test"));
+    }
+
+    #[test]
+    fn test_generated_catalog_metadata() {
+        let r = ModelRegistry::new();
+        // Real pi-mono pricing/window flowed in from models.json via build.rs.
+        let opus = r.get_model("claude-opus-4-8").expect("opus-4-8 in catalog");
+        assert_eq!(opus.cost.input, 5.0);
+        assert_eq!(opus.context_window, 1_000_000);
+        assert_eq!(opus.compat.supports_temperature, Some(false));
+        assert_eq!(opus.compat.force_adaptive_thinking, Some(true));
+
+        // gpt-5.5 maps to the Responses API family.
+        let gpt = r.get_model("gpt-5.5").expect("gpt-5.5 in catalog");
+        assert_eq!(gpt.api, agent_core::types::Api::OpenaiResponses);
+        assert!(gpt.reasoning);
+
+        // Models without a compat block default to unset (substring fallback).
+        let haiku = r.get_model("claude-haiku-4-5").expect("haiku in catalog");
+        assert_eq!(haiku.compat.supports_temperature, None);
     }
 }

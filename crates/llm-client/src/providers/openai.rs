@@ -493,6 +493,7 @@ mod tests {
         r.cache_retention = Some(CacheRetention::Long);
         r.provider_options = Some(ProviderOptions::Anthropic(AnthropicOptions {
             force_adaptive_thinking: Some(true),
+            ..Default::default()
         }));
         let body = provider().build_body(&r, false);
         // Falls back to native cache (anthropic_cache_control is None).

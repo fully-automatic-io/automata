@@ -27,6 +27,15 @@ fn resolve_adaptive_thinking(model_id: &str, force: Option<bool>) -> bool {
         || m.contains("sonnet-4-6") || m.contains("sonnet-4.6")
 }
 
+/// Substring fallback for `supports_temperature` when a model carries no
+/// `compat` flag: Claude Opus 4.7+ reject non-default temperature values
+/// (mirrors pi-mono's `model.compat?.supportsTemperature ?? true`).
+fn substring_supports_temperature(model_id: &str) -> bool {
+    let m = model_id;
+    !(m.contains("opus-4-7") || m.contains("opus-4.7")
+        || m.contains("opus-4-8") || m.contains("opus-4.8"))
+}
+
 fn map_thinking_level_to_anthropic_effort(level: ThinkingLevel) -> &'static str {
     match level {
         ThinkingLevel::Off => "low",      // never reached (filtered by caller)
@@ -101,9 +110,6 @@ impl AnthropicProvider {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        if let Some(temp) = request.temperature {
-            body["temperature"] = json!(temp);
-        }
         if !request.stop_sequences.is_empty() {
             body["stop_sequences"] = json!(request.stop_sequences);
         }
@@ -113,6 +119,9 @@ impl AnthropicProvider {
         //     { type: "adaptive", display: "summarized" } + output_config.effort
         //   - Budget (older Claude 4) → { type: "enabled", budget_tokens: N }
         //   - None → no thinking field
+        // Track whether thinking actually ended up active, so temperature can
+        // be suppressed below (the two are mutually exclusive).
+        let mut thinking_active = false;
         if let Some(level) = request.reasoning_effort
             && level != ThinkingLevel::Off {
                 let force = request.anthropic_options()
@@ -122,9 +131,25 @@ impl AnthropicProvider {
                     body["output_config"] = json!({
                         "effort": map_thinking_level_to_anthropic_effort(level),
                     });
+                    thinking_active = true;
                 } else if let Some(budget) = pick_thinking_budget(level, request.thinking_budgets.as_ref()) {
                     body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+                    thinking_active = true;
                 }
+            }
+
+        // Temperature is incompatible with extended thinking and is rejected
+        // outright by Claude Opus 4.7+. Prefer the model's `supportsTemperature`
+        // compat flag (threaded via provider_options); fall back to substring
+        // matching for models that carry no flag.
+        let supports_temperature = request
+            .anthropic_options()
+            .and_then(|o| o.supports_temperature)
+            .unwrap_or_else(|| substring_supports_temperature(&request.model));
+        if let Some(temp) = request.temperature
+            && !thinking_active
+            && supports_temperature {
+                body["temperature"] = json!(temp);
             }
 
         body
@@ -499,6 +524,7 @@ mod tests {
         r.reasoning_effort = Some(ThinkingLevel::Medium);
         r.provider_options = Some(ProviderOptions::Anthropic(AnthropicOptions {
             force_adaptive_thinking: Some(true),
+            ..Default::default()
         }));
         let body = provider().build_body(&r, false);
         assert_eq!(body["thinking"]["type"], "adaptive");
@@ -515,9 +541,53 @@ mod tests {
         });
         r.provider_options = Some(ProviderOptions::Anthropic(AnthropicOptions {
             force_adaptive_thinking: Some(false),
+            ..Default::default()
         }));
         let body = provider().build_body(&r, false);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
+    }
+
+    #[test]
+    fn temperature_omitted_when_compat_says_unsupported() {
+        // Opus 4.8 carries supportsTemperature:false via provider_options.
+        let mut r = req("claude-opus-4-8");
+        r.temperature = Some(0.7);
+        r.provider_options = Some(ProviderOptions::Anthropic(AnthropicOptions {
+            supports_temperature: Some(false),
+            ..Default::default()
+        }));
+        let body = provider().build_body(&r, false);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn temperature_omitted_via_substring_fallback() {
+        // No compat flag → substring fallback suppresses it for opus-4-7+.
+        let mut r = req("claude-opus-4-7");
+        r.temperature = Some(0.7);
+        let body = provider().build_body(&r, false);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn temperature_included_for_supporting_model() {
+        // A temperature-supporting model with no thinking includes it.
+        let mut r = req("claude-haiku-4-5");
+        r.temperature = Some(0.7);
+        let body = provider().build_body(&r, false);
+        let temp = body["temperature"].as_f64().expect("temperature present");
+        assert!((temp - 0.7).abs() < 1e-4, "temperature ~= 0.7, got {temp}");
+    }
+
+    #[test]
+    fn temperature_omitted_when_thinking_active() {
+        // Even on a temperature-supporting model, extended thinking suppresses it.
+        let mut r = req("claude-sonnet-4-5");
+        r.temperature = Some(0.7);
+        r.reasoning_effort = Some(ThinkingLevel::High);
+        r.thinking_budgets = Some(ThinkingBudgets { high: Some(8192), ..Default::default() });
+        let body = provider().build_body(&r, false);
+        assert!(body.get("temperature").is_none());
     }
 }

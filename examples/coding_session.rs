@@ -47,6 +47,7 @@ async fn main() {
         cost: ModelCost::default(),
         context_window: 128_000,
         max_tokens: 8192,
+        ..Default::default()
     };
 
     println!("=== CodingAgentSession — Rust hello world ===");

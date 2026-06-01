@@ -115,6 +115,7 @@ async fn main() {
         cost: Default::default(),
         context_window: 128_000,
         max_tokens: 8192,
+        ..Default::default()
     };
     let model_info = ModelInfo::from(&llm_model);
 

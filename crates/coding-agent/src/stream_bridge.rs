@@ -7,7 +7,10 @@
 
 use agent_core::agent_loop::{StreamFn, StreamFnInput};
 use agent_core::event::{AssistantMessageEvent, EventStream, PartialAssistantMessage, PartialContentBlock};
-use agent_core::types::{AgentMessage, ContentBlock, LlmRequest, Model, StopReason, ToolDefinition};
+use agent_core::types::{
+    AgentMessage, AnthropicOptions, Api, ContentBlock, LlmRequest, Model, ProviderOptions,
+    StopReason, ToolDefinition,
+};
 use llm_client::provider::LlmProvider;
 use llm_client::streaming::{Delta, LlmEvent};
 use std::sync::Arc;
@@ -190,6 +193,26 @@ pub fn convert_sse_stream(
     stream
 }
 
+/// Derive `ProviderOptions` from a model's catalog `compat` flags so the
+/// provider sees data-driven overrides (adaptive thinking, temperature
+/// support) instead of relying on substring matching. Returns `None` when the
+/// model carries no relevant flags or its API family has no options type yet.
+fn compat_to_provider_options(model: &Model) -> Option<ProviderOptions> {
+    match model.api {
+        Api::Anthropic => {
+            let compat = &model.compat;
+            if compat.force_adaptive_thinking.is_none() && compat.supports_temperature.is_none() {
+                return None;
+            }
+            Some(ProviderOptions::Anthropic(AnthropicOptions {
+                force_adaptive_thinking: compat.force_adaptive_thinking,
+                supports_temperature: compat.supports_temperature,
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// Create a `StreamFn` compatible with agent-core from an `LlmProvider`.
 /// Tools, messages, and system prompt are forwarded directly — the loop and
 /// the provider both speak `AgentMessage` now, so no conversion is needed.
@@ -215,7 +238,10 @@ pub fn create_stream_fn(provider: Arc<dyn LlmProvider>, model: Model) -> StreamF
                 temperature: input.temperature,
                 reasoning_effort: input.reasoning,
                 thinking_budgets: input.thinking_budgets,
-                provider_options: input.provider_options,
+                // Caller-supplied options win; otherwise derive them from the
+                // model's catalog `compat` flags so provider behaviour
+                // (adaptive thinking, temperature suppression) is data-driven.
+                provider_options: input.provider_options.or_else(|| compat_to_provider_options(&model)),
                 ..Default::default()
             };
 
@@ -240,5 +266,42 @@ mod tests {
         let mut p = PartialAssistantMessage::new(agent_core::types::Api::Anthropic, "p", "m");
         p.ensure_block_at(2);
         assert_eq!(p.content.len(), 3);
+    }
+
+    #[test]
+    fn test_compat_to_provider_options_anthropic() {
+        let model = Model {
+            api: Api::Anthropic,
+            compat: agent_core::types::ModelCompat {
+                force_adaptive_thinking: Some(true),
+                supports_temperature: Some(false),
+            },
+            ..Default::default()
+        };
+        let opts = compat_to_provider_options(&model).expect("anthropic compat maps to options");
+        match opts {
+            ProviderOptions::Anthropic(a) => {
+                assert_eq!(a.force_adaptive_thinking, Some(true));
+                assert_eq!(a.supports_temperature, Some(false));
+            }
+            _ => panic!("expected anthropic options"),
+        }
+    }
+
+    #[test]
+    fn test_compat_to_provider_options_none_when_empty() {
+        // No compat flags → no derived options (substring fallback applies).
+        let model = Model { api: Api::Anthropic, ..Default::default() };
+        assert!(compat_to_provider_options(&model).is_none());
+        // Non-anthropic API has no options type yet.
+        let model = Model {
+            api: Api::Openai,
+            compat: agent_core::types::ModelCompat {
+                supports_temperature: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(compat_to_provider_options(&model).is_none());
     }
 }

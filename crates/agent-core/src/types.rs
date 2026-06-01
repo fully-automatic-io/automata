@@ -256,6 +256,21 @@ impl Default for ModelCost {
     }
 }
 
+/// API-specific compatibility flags that override the provider's default
+/// behaviour for a given model. Mirrors pi-mono's `compat` object; only the
+/// flags the Rust providers actually consume are modelled. Unset flags fall
+/// back to substring matching on the model id (see the Anthropic provider).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelCompat {
+    /// Force adaptive thinking (`thinking.type = "adaptive"`) regardless of id.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "forceAdaptiveThinking")]
+    pub force_adaptive_thinking: Option<bool>,
+    /// Whether the model accepts the Anthropic `temperature` field. Claude
+    /// Opus 4.7+ reject non-default temperature values.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "supportsTemperature")]
+    pub supports_temperature: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -271,6 +286,8 @@ pub struct Model {
     pub context_window: u64,
     #[serde(rename = "maxTokens")]
     pub max_tokens: u64,
+    #[serde(default)]
+    pub compat: ModelCompat,
 }
 
 impl Default for Model {
@@ -286,6 +303,7 @@ impl Default for Model {
             cost: ModelCost::default(),
             context_window: 0,
             max_tokens: 0,
+            compat: ModelCompat::default(),
         }
     }
 }
@@ -685,6 +703,10 @@ pub struct AnthropicOptions {
     /// Cloudflare AI Gateway, Fireworks, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "forceAdaptiveThinking")]
     pub force_adaptive_thinking: Option<bool>,
+    /// Whether the model accepts the `temperature` field. `None` falls back to
+    /// substring matching on the model id. Claude Opus 4.7+ set this `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "supportsTemperature")]
+    pub supports_temperature: Option<bool>,
 }
 
 /// Provider-specific knobs OpenAI providers respect. Reserved for future
@@ -1235,6 +1257,7 @@ mod tests {
     fn test_provider_options_anthropic_serde() {
         let opts = ProviderOptions::Anthropic(AnthropicOptions {
             force_adaptive_thinking: Some(true),
+            ..Default::default()
         });
         let v = serde_json::to_value(&opts).unwrap();
         assert_eq!(v["provider"], "anthropic");
@@ -1258,6 +1281,7 @@ mod tests {
         let r = LlmRequest {
             provider_options: Some(ProviderOptions::Anthropic(AnthropicOptions {
                 force_adaptive_thinking: Some(true),
+                ..Default::default()
             })),
             ..Default::default()
         };

@@ -114,6 +114,7 @@ fn stub_model() -> Model {
         cost: ModelCost::default(),
         context_window: 200_000,
         max_tokens: 8192,
+        ..Default::default()
     }
 }
 
