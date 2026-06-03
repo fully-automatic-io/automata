@@ -1,120 +1,170 @@
-// Coding agent example — demonstrates session management and file tools.
+// Coding agent SDK example — demonstrates the Rust-style setup path:
+// settings + auth + model registry + resource loading + JSONL v3 sessions.
 
-use agent_core::harness::session::{InMemorySessionStorage, JsonlSessionRepo, Session};
+use agent_core::harness::session::JsonlSessionRepo;
 use agent_core::tool::AgentTool;
-use agent_core::types::{AgentMessage, ContentBlock, MessageContent, StopReason, Usage};
-use coding_agent::tools::{EditTool, EditToolOptions, ReadTool, ReadToolOptions, WriteTool, WriteToolOptions};
+use agent_core::types::{AgentMessage, ContentBlock};
+use coding_agent::tools::{
+    EditTool, EditToolOptions, ReadTool, ReadToolOptions, WriteTool, WriteToolOptions,
+};
+use coding_agent::{CreateAgentSessionOptions, create_agent_session};
 use tempfile::TempDir;
 
-fn user(text: &str) -> AgentMessage {
-    AgentMessage::User {
-        content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]),
-        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
-        metadata: None,
-    }
-}
-
-fn assistant(text: &str, api: agent_core::types::Api, provider: &str, model: &str) -> AgentMessage {
-    AgentMessage::Assistant {
-        content: vec![ContentBlock::Text { text: text.into() }],
-        api, provider: provider.into(), model: model.into(),
-        usage: Usage { input: 10, output: 20, total_tokens: 30, ..Default::default() },
-        stop_reason: StopReason::EndTurn,
-        error_message: None,
-        timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
-    }
-}
-
 #[tokio::main]
-async fn main() {
-    println!("=== Automata Coding Agent Example ===\n");
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("=== Automata Coding Agent SDK Example ===\n");
 
-    let dir = TempDir::new().unwrap();
-    let cwd = dir.path().to_string_lossy().to_string();
+    let dir = TempDir::new()?;
+    let cwd_path = dir.path().join("repo");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(cwd_path.join(".automata/skills"))?;
+    std::fs::create_dir_all(cwd_path.join(".automata/prompts"))?;
+    std::fs::create_dir_all(&agent_dir)?;
 
-    // ── 1. File tools demo ────────────────────────────────────────────────────
-    println!("1. File Tools Demo");
+    let cwd = cwd_path.to_string_lossy().to_string();
+    let agent_dir_string = agent_dir.to_string_lossy().to_string();
+
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "system_prompt": "You are Automata's coding assistant.",
+            "append_system_prompt": ["Keep answers concise and cite touched files."],
+            "shell_command_prefix": "set -e"
+        })
+        .to_string(),
+    )?;
+    std::fs::write(
+        cwd_path.join("AGENTS.md"),
+        "Project instruction: prefer small, focused Rust changes.",
+    )?;
+    std::fs::write(
+        cwd_path.join(".automata/skills/rust-review.md"),
+        "---\nname: rust-review\ndescription: Review Rust code for correctness\n---\n# Rust review\n",
+    )?;
+    std::fs::write(
+        agent_dir.join("auth.json"),
+        serde_json::json!({
+            "anthropic": { "type": "api_key", "key": "sk-example-from-auth-json" }
+        })
+        .to_string(),
+    )?;
+
+    // ── 1. SDK setup demo ───────────────────────────────────────────────────
+    println!("1. SDK Setup Demo");
+    println!("-----------------");
+
+    let mut handle = create_agent_session(CreateAgentSessionOptions {
+        cwd: cwd.clone(),
+        agent_dir: Some(agent_dir_string),
+        session_path: None,
+        sessions_root: None,
+        model: None,
+        api_key: Some("sk-example-runtime-override".into()),
+        thinking_level: None,
+        allowed_tools: Some(vec!["read".into(), "write".into(), "ls".into()]),
+    })
+    .await?;
+
+    let model_id = handle
+        .selected_model
+        .as_ref()
+        .map(|model| model.id.as_str())
+        .unwrap_or("(none)");
+    println!("  ✓ Selected model: {model_id}");
+    println!("  ✓ Loaded tools: {}", handle.tool_names.join(", "));
+    println!("  ✓ Context files: {}", handle.resources.context_files.len());
+    println!("  ✓ Skills: {}", handle.resources.skills.len());
+    println!(
+        "  ✓ Runtime auth configured: {}",
+        handle.auth.auth_status("anthropic").configured
+    );
+
+    let prompt = handle.system_prompt();
+    assert!(prompt.contains("Project instruction"));
+    assert!(prompt.contains("rust-review"));
+    println!("  ✓ Built system prompt from settings/resources");
+
+    handle.session.append_active_tools_change(handle.tool_names.clone()).await?;
+    handle.session.append_message(AgentMessage::user_text("hello sdk")).await?;
+    let sdk_context = handle.session.build_context().await?;
+    assert_eq!(sdk_context.active_tool_names, Some(handle.tool_names.clone()));
+    println!("  ✓ JSONL v3 session restored active tools");
+
+    // ── 2. File tools demo ──────────────────────────────────────────────────
+    println!("\n2. File Tools Demo");
     println!("------------------");
 
     let write = WriteTool::new(cwd.clone(), WriteToolOptions::default());
-    let read  = ReadTool::new(cwd.clone(), ReadToolOptions::default());
-    let edit  = EditTool::new(cwd.clone(), EditToolOptions::default());
+    let read = ReadTool::new(cwd.clone(), ReadToolOptions::default());
+    let edit = EditTool::new(cwd.clone(), EditToolOptions::default());
 
-    let file_path = dir.path().join("hello.rs").to_string_lossy().to_string();
+    let file_path = cwd_path.join("hello.rs").to_string_lossy().to_string();
 
-    write.execute("w1".into(), serde_json::json!({
-        "path": &file_path,
-        "content": "fn main() {\n    println!(\"hello\");\n}\n"
-    }), None, None).await.unwrap();
+    write
+        .execute(
+            "w1".into(),
+            serde_json::json!({
+                "path": &file_path,
+                "content": "fn main() {\n    println!(\"hello\");\n}\n"
+            }),
+            None,
+            None,
+        )
+        .await?;
     println!("  ✓ Wrote hello.rs");
 
-    let result = read.execute("r1".into(), serde_json::json!({"path": &file_path}), None, None).await.unwrap();
+    let result = read
+        .execute("r1".into(), serde_json::json!({"path": &file_path}), None, None)
+        .await?;
     if let ContentBlock::Text { text } = &result.content[0] {
         println!("  ✓ Read {} bytes", text.len());
     }
 
-    edit.execute("e1".into(), serde_json::json!({
-        "path": &file_path,
-        "edits": [{"oldText": "hello", "newText": "world"}]
-    }), None, None).await.unwrap();
+    edit.execute(
+        "e1".into(),
+        serde_json::json!({
+            "path": &file_path,
+            "edits": [{"oldText": "hello", "newText": "world"}]
+        }),
+        None,
+        None,
+    )
+    .await?;
     println!("  ✓ Edited hello → world");
 
-    let result = read.execute("r2".into(), serde_json::json!({"path": &file_path}), None, None).await.unwrap();
+    let result = read
+        .execute("r2".into(), serde_json::json!({"path": &file_path}), None, None)
+        .await?;
     if let ContentBlock::Text { text } = &result.content[0] {
         assert!(text.contains("world"), "edit should have replaced hello with world");
         println!("  ✓ Verified edit");
     }
 
-    // ── 2. Session management (in-memory) ─────────────────────────────────────
-    println!("\n2. Session Management Demo");
-    println!("--------------------------");
-
-    let mut session = Session::new(Box::new(InMemorySessionStorage::new(None)));
-
-    let id1 = session.append_message(user("What is Rust?")).await.unwrap();
-    println!("  ✓ Appended user message (id={})", &id1[..id1.len().min(8)]);
-
-    session.append_message(assistant(
-        "Rust is a systems programming language.",
-        agent_core::types::Api::Anthropic, "anthropic", "claude-opus-4-7",
-    )).await.unwrap();
-    println!("  ✓ Appended assistant message");
-
-    let ctx = session.build_context().await.unwrap();
-    println!("  ✓ Context: {} messages, model={:?}",
-        ctx.messages.len(),
-        ctx.model.as_ref().map(|m| m.model_id.as_str())
-    );
-
-    session.move_to(Some(&id1), None).await.unwrap();
-    let id3 = session.append_message(user("What is Go?")).await.unwrap();
-    println!("  ✓ Branched and added alternative question (id={})", &id3[..id3.len().min(8)]);
-
-    let ctx2 = session.build_context().await.unwrap();
-    println!("  ✓ Branch context: {} messages", ctx2.messages.len());
-
-    // ── 3. Session persistence (JSONL on disk) ───────────────────────────────
+    // ── 3. Session persistence demo ─────────────────────────────────────────
     println!("\n3. Session Persistence Demo");
     println!("---------------------------");
 
-    let sessions_root = dir.path().join("sessions");
+    let sessions_root = dir.path().join("manual-sessions");
     let repo = JsonlSessionRepo::new(&sessions_root);
-    let mut mgr = repo.create(dir.path().to_str().unwrap(), None, None).await.unwrap();
+    let mut session = repo.create(&cwd, None, None).await?;
 
-    mgr.append_message(user("hello")).await.unwrap();
-    mgr.append_message(assistant("hi", agent_core::types::Api::Anthropic, "t", "m")).await.unwrap();
+    session.append_active_tools_change(vec!["read".into(), "write".into()]).await?;
+    session.append_message(AgentMessage::user_text("hello")).await?;
 
-    let id = mgr.get_metadata().await.id;
-    drop(mgr);
+    let id = session.get_metadata().await.id;
+    drop(session);
 
-    let listed = repo.list(Some(dir.path().to_str().unwrap())).await.unwrap();
+    let listed = repo.list(Some(&cwd)).await?;
     let entry = listed.iter().find(|m| m.id == id).expect("session listed");
     println!("  ✓ Session persisted to: {}", entry.path);
 
-    let reloaded = repo.open_by_path(&entry.path).await.unwrap();
-    let ctx = reloaded.build_context().await.unwrap();
-    println!("  ✓ Reloaded: {} messages", ctx.messages.len());
-    assert_eq!(ctx.messages.len(), 2);
+    let reloaded = repo.open_by_path(&entry.path).await?;
+    let ctx = reloaded.build_context().await?;
+    assert_eq!(ctx.active_tool_names, Some(vec!["read".into(), "write".into()]));
+    println!("  ✓ Reloaded v3 session with active tool state");
 
-    println!("\n✅ All demos completed successfully!");
+    println!("\nAll demos completed successfully.");
+    Ok(())
 }

@@ -2,8 +2,8 @@
 // tool-calling turn (write a file via the bash tool, then answer), exercising
 // the full stream-bridge -> AgentHarness -> tool-loop wiring.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::harness::session::{InMemorySessionStorage, Session};
 use agent_core::types::{Api, Model, ModelCost};
@@ -27,9 +27,7 @@ impl ScriptedProvider {
 }
 
 fn sse(events: Vec<LlmEvent>) -> LlmStream {
-    Box::pin(futures::stream::iter(
-        events.into_iter().map(Ok::<LlmEvent, LlmError>),
-    ))
+    Box::pin(futures::stream::iter(events.into_iter().map(Ok::<LlmEvent, LlmError>)))
 }
 
 #[async_trait]
@@ -73,7 +71,12 @@ impl LlmProvider for ScriptedProvider {
                         stop_reason: Some(LlmStopReason::ToolUse),
                         stop_sequence: None,
                     },
-                    usage: Some(Usage { input: 10, output: 5, total_tokens: 15, ..Default::default() }),
+                    usage: Some(Usage {
+                        input: 10,
+                        output: 5,
+                        total_tokens: 15,
+                        ..Default::default()
+                    }),
                 },
                 LlmEvent::MessageStop,
             ]))
@@ -94,7 +97,12 @@ impl LlmProvider for ScriptedProvider {
                         stop_reason: Some(LlmStopReason::EndTurn),
                         stop_sequence: None,
                     },
-                    usage: Some(Usage { input: 12, output: 3, total_tokens: 15, ..Default::default() }),
+                    usage: Some(Usage {
+                        input: 12,
+                        output: 3,
+                        total_tokens: 15,
+                        ..Default::default()
+                    }),
                 },
                 LlmEvent::MessageStop,
             ]))
@@ -147,11 +155,13 @@ async fn prompt_drives_tool_call_then_answers() {
     );
 
     // The final assistant message should carry the "done" answer.
-    let has_done = messages.iter().any(|m| match m {
+    let has_done = messages.iter().any(|m| {
+        match m {
         agent_core::types::AgentMessage::Assistant { content, .. } => content.iter().any(|b| {
             matches!(b, agent_core::types::ContentBlock::Text { text } if text.contains("done"))
         }),
         _ => false,
+    }
     });
     assert!(has_done, "final assistant message should contain 'done'");
 

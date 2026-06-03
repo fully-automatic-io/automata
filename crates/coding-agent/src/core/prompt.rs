@@ -35,9 +35,10 @@ pub fn load_context_files(cwd: &Path) -> ContextFiles {
         for name in &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"] {
             let path = current.join(name);
             if path.exists()
-                && let Ok(content) = std::fs::read_to_string(&path) {
-                    files.push(LoadedContextFile { path, content });
-                }
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                files.push(LoadedContextFile { path, content });
+            }
         }
         dir = current.parent().map(|p| p.to_path_buf());
     }
@@ -49,7 +50,7 @@ pub fn load_context_files(cwd: &Path) -> ContextFiles {
 
 // The canonical skill type lives in agent-core; re-export it so callers of
 // `build_system_prompt` use a single `Skill` across the workspace.
-pub use agent_core::harness::skills::{load_skills_from_dir, Skill};
+pub use agent_core::harness::skills::{Skill, load_skills_from_dir};
 
 /// Load skills from a directory of `*.md` files (delegates to the canonical
 /// loader, which honors YAML frontmatter and `disable-model-invocation`).
@@ -60,14 +61,20 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
 pub fn discover_extension_paths(cwd: &Path, agent_dir: &Path) -> Vec<String> {
     let mut paths = Vec::new();
     let local = cwd.join(".automata/extensions");
-    if local.exists() { collect_extension_files(&local, &mut paths); }
+    if local.exists() {
+        collect_extension_files(&local, &mut paths);
+    }
     let global = agent_dir.join("extensions");
-    if global.exists() { collect_extension_files(&global, &mut paths); }
+    if global.exists() {
+        collect_extension_files(&global, &mut paths);
+    }
     paths
 }
 
 fn collect_extension_files(dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
@@ -75,7 +82,9 @@ fn collect_extension_files(dir: &Path, out: &mut Vec<String>) {
             out.push(path.to_string_lossy().to_string());
         } else if path.is_dir() {
             let index = path.join("extension.wasm");
-            if index.exists() { out.push(index.to_string_lossy().to_string()); }
+            if index.exists() {
+                out.push(index.to_string_lossy().to_string());
+            }
         }
     }
 }
@@ -100,14 +109,14 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
     let skills = opts.skills.unwrap_or(&[]);
     let tools = opts.selected_tools.unwrap_or(&["read", "bash", "edit", "write"]);
 
-    let append_section = opts.append_system_prompt
-        .map(|s| format!("\n\n{}", s))
-        .unwrap_or_default();
+    let append_section =
+        opts.append_system_prompt.map(|s| format!("\n\n{}", s)).unwrap_or_default();
 
     let context_section = if context_files.is_empty() {
         String::new()
     } else {
-        let mut s = "\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n".to_string();
+        let mut s = "\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n"
+            .to_string();
         for f in context_files {
             s.push_str(&format!(
                 "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
@@ -131,15 +140,23 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
     let footer = format!("\nCurrent date: {}\nCurrent working directory: {}", date, cwd);
 
     if let Some(custom) = opts.custom_prompt {
-        return format!("{}{}{}{}{}", custom, append_section, context_section, skills_section, footer);
+        return format!(
+            "{}{}{}{}{}",
+            custom, append_section, context_section, skills_section, footer
+        );
     }
 
     let tools_list = match opts.tool_snippets {
         Some(snippets) => {
-            let visible: Vec<String> = tools.iter()
+            let visible: Vec<String> = tools
+                .iter()
                 .filter_map(|&n| snippets.get(n).map(|s| format!("- {}: {}", n, s)))
                 .collect();
-            if visible.is_empty() { "(none)".to_string() } else { visible.join("\n") }
+            if visible.is_empty() {
+                "(none)".to_string()
+            } else {
+                visible.join("\n")
+            }
         }
         None => "(none)".to_string(),
     };
@@ -156,11 +173,14 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
     }
     for g in opts.prompt_guidelines.unwrap_or(&[]) {
         let g = g.trim().to_string();
-        if !g.is_empty() && !guidelines.contains(&g) { guidelines.push(g); }
+        if !g.is_empty() && !guidelines.contains(&g) {
+            guidelines.push(g);
+        }
     }
     guidelines.push("Be concise in your responses".to_string());
     guidelines.push("Show file paths clearly when working with files".to_string());
-    let guidelines_str = guidelines.iter().map(|g| format!("- {}", g)).collect::<Vec<_>>().join("\n");
+    let guidelines_str =
+        guidelines.iter().map(|g| format!("- {}", g)).collect::<Vec<_>>().join("\n");
 
     let prompt = format!(
         "You are an expert coding assistant. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{}\n\nGuidelines:\n{}",

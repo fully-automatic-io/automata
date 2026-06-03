@@ -4,7 +4,7 @@
 // Typed events, named hook closures, and simple concurrency using a single
 // shared mutex on the inner state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,11 +12,11 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{AgentEventSink, AgentLoop, StreamFn};
-use crate::event::AgentEvent;
 use crate::auto_retry::{compute_retry_delay, is_retryable_error};
+use crate::event::AgentEvent;
 use crate::harness::compaction::{
-    compact, estimate_context_tokens_with_source, prepare_compaction, CompactionError,
-    CompactionResult, CompactionSettings, StreamFn as CompactionStreamFn,
+    CompactionError, CompactionResult, CompactionSettings, StreamFn as CompactionStreamFn, compact,
+    estimate_context_tokens_with_source, prepare_compaction,
 };
 use crate::harness::messages::default_convert_to_llm;
 use crate::harness::session::{
@@ -25,10 +25,9 @@ use crate::harness::session::{
 use crate::overflow::is_context_overflow;
 use crate::tool::AgentTool;
 use crate::types::{
-    AfterToolCallFn, AgentContext, AgentLoopConfig, AgentMessage, BeforeToolCallFn,
-    ConvertToLlmFn, ModelInfo, OnPayloadFn, OnResponseFn, PrepareNextTurnFn,
-    ShouldStopAfterTurnFn, StopReason, ThinkingBudgets, ThinkingLevel, ToolExecutionMode,
-    TransformContextFn, Transport,
+    AfterToolCallFn, AgentContext, AgentLoopConfig, AgentMessage, BeforeToolCallFn, ConvertToLlmFn,
+    ModelInfo, OnPayloadFn, OnResponseFn, PrepareNextTurnFn, ShouldStopAfterTurnFn, StopReason,
+    ThinkingBudgets, ThinkingLevel, ToolExecutionMode, TransformContextFn, Transport,
 };
 
 // ============================================================================
@@ -49,6 +48,8 @@ pub enum HarnessError {
     Busy(HarnessPhase),
     #[error("Invalid state: {0}")]
     InvalidState(String),
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("Session error: {0}")]
     Session(#[from] SessionError),
     #[error("Compaction error: {0}")]
@@ -72,8 +73,12 @@ pub enum HarnessError {
 #[allow(clippy::large_enum_variant)]
 pub enum HarnessEvent {
     Agent(AgentEvent),
-    Compaction { result: CompactionResult },
-    CompactionStart { reason: CompactionReason },
+    Compaction {
+        result: CompactionResult,
+    },
+    CompactionStart {
+        reason: CompactionReason,
+    },
     CompactionEnd {
         reason: CompactionReason,
         result: Option<CompactionResult>,
@@ -167,9 +172,9 @@ impl std::fmt::Debug for AutoCompactionConfig {
 }
 
 pub type HarnessListener = Arc<
-    dyn Fn(HarnessEvent, Option<CancellationToken>)
-            -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send + Sync,
+    dyn Fn(HarnessEvent, Option<CancellationToken>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
 >;
 
 // ============================================================================
@@ -179,7 +184,13 @@ pub type HarnessListener = Arc<
 enum PendingWrite {
     Message(AgentMessage),
     ThinkingLevelChange(ThinkingLevel),
-    ModelChange { provider: String, model_id: String },
+    ModelChange {
+        provider: String,
+        model_id: String,
+    },
+    ActiveToolsChange {
+        active_tool_names: Vec<String>,
+    },
     Compaction {
         summary: String,
         first_kept_entry_id: String,
@@ -249,10 +260,18 @@ pub struct StreamOptionsPatch {
 
 impl StreamOptions {
     pub fn apply_patch(&mut self, patch: StreamOptionsPatch) {
-        if let Some(v) = patch.temperature { self.temperature = v; }
-        if let Some(v) = patch.max_tokens { self.max_tokens = v; }
-        if let Some(v) = patch.reasoning { self.reasoning = v; }
-        if let Some(v) = patch.transport { self.transport = v; }
+        if let Some(v) = patch.temperature {
+            self.temperature = v;
+        }
+        if let Some(v) = patch.max_tokens {
+            self.max_tokens = v;
+        }
+        if let Some(v) = patch.reasoning {
+            self.reasoning = v;
+        }
+        if let Some(v) = patch.transport {
+            self.transport = v;
+        }
     }
 }
 
@@ -273,9 +292,63 @@ pub struct HarnessConfig {
 
 #[derive(Default)]
 pub struct HarnessResources {
-    pub tools: Vec<Arc<dyn AgentTool>>,
+    pub tools: HashMap<String, Arc<dyn AgentTool>>,
+    pub active_tool_names: Vec<String>,
     pub stream_options: StreamOptions,
     pub model_info: Option<ModelInfo>,
+}
+
+fn validate_unique_names(names: &[String], message: &str) -> Result<(), HarnessError> {
+    let mut seen = HashSet::with_capacity(names.len());
+    let mut duplicates = Vec::new();
+    for name in names {
+        if !seen.insert(name.as_str()) && !duplicates.iter().any(|existing| existing == name) {
+            duplicates.push(name.clone());
+        }
+    }
+    if duplicates.is_empty() {
+        Ok(())
+    } else {
+        Err(HarnessError::InvalidArgument(format!("{}: {}", message, duplicates.join(", "))))
+    }
+}
+
+impl HarnessResources {
+    fn replace_tools(
+        &mut self,
+        tools: Vec<Arc<dyn AgentTool>>,
+        active_tool_names: Option<Vec<String>>,
+    ) {
+        let next_active = active_tool_names
+            .unwrap_or_else(|| tools.iter().map(|tool| tool.name().to_string()).collect());
+        self.tools = tools.into_iter().map(|tool| (tool.name().to_string(), tool)).collect();
+        self.active_tool_names = next_active;
+    }
+
+    fn active_tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.tools_for_names(&self.active_tool_names)
+    }
+
+    fn tools_for_names(&self, names: &[String]) -> Vec<Arc<dyn AgentTool>> {
+        names.iter().filter_map(|name| self.tools.get(name).cloned()).collect()
+    }
+
+    fn validate_active_tool_names(&self, names: &[String]) -> Result<(), HarnessError> {
+        validate_unique_names(names, "Duplicate active tool name(s)")?;
+        let missing: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !self.tools.contains_key(*name))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::InvalidArgument(format!(
+                "Unknown tool(s): {}",
+                missing.join(", ")
+            )))
+        }
+    }
 }
 
 // ============================================================================
@@ -355,7 +428,8 @@ impl AgentHarness {
             last_assistant_message: Arc::new(Mutex::new(None)),
             auto_compaction: Arc::new(Mutex::new(None)),
             stream_fn: options.stream_fn,
-            convert_to_llm: options.convert_to_llm
+            convert_to_llm: options
+                .convert_to_llm
                 .unwrap_or_else(|| Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs)))),
             transform_context: options.transform_context,
             before_tool_call: options.before_tool_call,
@@ -367,7 +441,9 @@ impl AgentHarness {
         }
     }
 
-    pub async fn phase(&self) -> HarnessPhase { *self.phase.lock().await }
+    pub async fn phase(&self) -> HarnessPhase {
+        *self.phase.lock().await
+    }
 
     /// Test-only: force the phase to a specific value (e.g. simulate a concurrent
     /// turn / compaction). Production code should never call this.
@@ -376,7 +452,9 @@ impl AgentHarness {
         *self.phase.lock().await = phase;
     }
 
-    pub async fn signal(&self) -> CancellationToken { self.abort.lock().await.clone() }
+    pub async fn signal(&self) -> CancellationToken {
+        self.abort.lock().await.clone()
+    }
 
     /// Cancel the in-flight turn (if any) and clear the steer / follow-up
     /// queues. Returns the messages that were discarded so callers can
@@ -448,19 +526,25 @@ impl AgentHarness {
 
     pub async fn drain_steer(&self) -> Vec<AgentMessage> {
         let v = std::mem::take(&mut *self.steer_queue.lock().await);
-        if !v.is_empty() { self.dispatch_queue_update().await; }
+        if !v.is_empty() {
+            self.dispatch_queue_update().await;
+        }
         v
     }
 
     pub async fn drain_follow_up(&self) -> Vec<AgentMessage> {
         let v = std::mem::take(&mut *self.follow_up_queue.lock().await);
-        if !v.is_empty() { self.dispatch_queue_update().await; }
+        if !v.is_empty() {
+            self.dispatch_queue_update().await;
+        }
         v
     }
 
     pub async fn drain_next_turn(&self) -> Vec<AgentMessage> {
         let v = std::mem::take(&mut *self.next_turn_queue.lock().await);
-        if !v.is_empty() { self.dispatch_queue_update().await; }
+        if !v.is_empty() {
+            self.dispatch_queue_update().await;
+        }
         v
     }
 
@@ -508,7 +592,8 @@ impl AgentHarness {
             steer_count: steer,
             follow_up_count: follow_up,
             next_turn_count: next_turn,
-        }).await;
+        })
+        .await;
     }
 
     // -----------------------------------------------------------------------
@@ -542,11 +627,84 @@ impl AgentHarness {
             model_id,
             previous_provider: Some(prev_provider),
             previous_model_id: Some(prev_model),
-        }).await;
+        })
+        .await;
     }
 
+    /// Install the available tool set and mark every supplied tool active.
+    ///
+    /// This setup-oriented method preserves the pre-migration behavior and does
+    /// not write an `active_tools_change` entry. Use
+    /// [`AgentHarness::set_tools`] or [`AgentHarness::set_active_tool_names`]
+    /// for user-visible changes that should be persisted in the session tree.
     pub async fn set_active_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
-        self.resources.lock().await.tools = tools;
+        self.resources.lock().await.replace_tools(tools, None);
+    }
+
+    pub async fn set_tools(
+        &self,
+        tools: Vec<Arc<dyn AgentTool>>,
+        active_tool_names: Option<Vec<String>>,
+    ) -> Result<(), HarnessError> {
+        validate_unique_names(
+            &tools.iter().map(|tool| tool.name().to_string()).collect::<Vec<_>>(),
+            "Duplicate tool name(s)",
+        )?;
+        let active_tool_names = active_tool_names
+            .unwrap_or_else(|| tools.iter().map(|tool| tool.name().to_string()).collect());
+        let mut next = HarnessResources::default();
+        next.replace_tools(tools, Some(active_tool_names.clone()));
+        next.validate_active_tool_names(&active_tool_names)?;
+
+        if *self.phase.lock().await == HarnessPhase::Idle {
+            self.flush_pending().await?;
+            self.session
+                .lock()
+                .await
+                .append_active_tools_change(active_tool_names.clone())
+                .await?;
+        } else {
+            self.pending.lock().await.push(PendingWrite::ActiveToolsChange {
+                active_tool_names: active_tool_names.clone(),
+            });
+        }
+
+        let mut resources = self.resources.lock().await;
+        resources.tools = next.tools;
+        resources.active_tool_names = active_tool_names;
+        Ok(())
+    }
+
+    pub async fn set_active_tool_names(&self, names: Vec<String>) -> Result<(), HarnessError> {
+        validate_unique_names(&names, "Duplicate active tool name(s)")?;
+        {
+            let resources = self.resources.lock().await;
+            resources.validate_active_tool_names(&names)?;
+        }
+
+        if *self.phase.lock().await == HarnessPhase::Idle {
+            self.flush_pending().await?;
+            self.session.lock().await.append_active_tools_change(names.clone()).await?;
+        } else {
+            self.pending
+                .lock()
+                .await
+                .push(PendingWrite::ActiveToolsChange { active_tool_names: names.clone() });
+        }
+        self.resources.lock().await.active_tool_names = names;
+        Ok(())
+    }
+
+    pub async fn registered_tool_names(&self) -> Vec<String> {
+        self.resources.lock().await.tools.keys().cloned().collect()
+    }
+
+    pub async fn active_tool_names(&self) -> Vec<String> {
+        self.resources.lock().await.active_tool_names.clone()
+    }
+
+    pub async fn active_tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.resources.lock().await.active_tools()
     }
 
     pub async fn set_model_info(&self, info: ModelInfo) {
@@ -610,7 +768,10 @@ impl AgentHarness {
             });
             return Ok(String::new());
         }
-        Ok(self.session.lock().await
+        Ok(self
+            .session
+            .lock()
+            .await
             .append_compaction(summary, first_kept_entry_id, tokens_before, details, None)
             .await?)
     }
@@ -629,7 +790,10 @@ impl AgentHarness {
             });
             return Ok(String::new());
         }
-        Ok(self.session.lock().await
+        Ok(self
+            .session
+            .lock()
+            .await
             .append_branch_summary(from_id, summary, details, None)
             .await?)
     }
@@ -667,7 +831,10 @@ impl AgentHarness {
             });
             return Ok(String::new());
         }
-        Ok(self.session.lock().await
+        Ok(self
+            .session
+            .lock()
+            .await
             .append_custom_message(custom_type, content, display, details)
             .await?)
     }
@@ -679,10 +846,10 @@ impl AgentHarness {
         label: Option<String>,
     ) -> Result<String, HarnessError> {
         if *self.phase.lock().await != HarnessPhase::Idle {
-            self.pending.lock().await.push(PendingWrite::Label {
-                target_id: target_id.to_string(),
-                label,
-            });
+            self.pending
+                .lock()
+                .await
+                .push(PendingWrite::Label { target_id: target_id.to_string(), label });
             return Ok(String::new());
         }
         Ok(self.session.lock().await.append_label(target_id, label).await?)
@@ -691,9 +858,10 @@ impl AgentHarness {
     /// Update (or queue) the session-info name.
     pub async fn set_session_name(&self, name: &str) -> Result<String, HarnessError> {
         if *self.phase.lock().await != HarnessPhase::Idle {
-            self.pending.lock().await.push(PendingWrite::SessionInfo {
-                name: Some(name.to_string()),
-            });
+            self.pending
+                .lock()
+                .await
+                .push(PendingWrite::SessionInfo { name: Some(name.to_string()) });
             return Ok(String::new());
         }
         Ok(self.session.lock().await.append_session_name(name).await?)
@@ -751,7 +919,9 @@ impl AgentHarness {
             let Some(prep) = prep else { return Ok(None) };
 
             let result = compact(&prep, stream_fn).await?;
-            self.session.lock().await
+            self.session
+                .lock()
+                .await
                 .append_compaction(
                     &result.summary,
                     &result.first_kept_entry_id,
@@ -761,9 +931,11 @@ impl AgentHarness {
                         "modifiedFiles": result.modified_files,
                     })),
                     None,
-                ).await?;
+                )
+                .await?;
             Ok(Some(result))
-        }).await;
+        })
+        .await;
 
         *self.phase.lock().await = HarnessPhase::Idle;
 
@@ -883,9 +1055,10 @@ impl AgentHarness {
         // Stale-message protection: a pre-compaction usage record must not
         // re-trigger compaction on the next prompt. Compare timestamps.
         if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await
-            && (*msg_timestamp as i64) <= latest_compaction_ts {
-                return Ok(PostRunDecision::Stop);
-            }
+            && (*msg_timestamp as i64) <= latest_compaction_ts
+        {
+            return Ok(PostRunDecision::Stop);
+        }
 
         let same_model = msg_provider == &cur_provider && msg_model == &cur_model_id;
 
@@ -904,7 +1077,8 @@ impl AgentHarness {
                         max_attempts: settings.max_retries,
                         delay_ms,
                         error_message: err.to_string(),
-                    }).await;
+                    })
+                    .await;
                     // Drop the error message from session state so the retry
                     // doesn't re-include it as context.
                     self.drop_last_assistant_from_session().await;
@@ -918,7 +1092,8 @@ impl AgentHarness {
                         success: false,
                         attempt,
                         final_error: msg.assistant_error_message().map(|s| s.to_string()),
-                    }).await;
+                    })
+                    .await;
                 }
             }
         } else if *self.retry_attempt.lock().await > 0 {
@@ -929,7 +1104,8 @@ impl AgentHarness {
                 success: true,
                 attempt,
                 final_error: None,
-            }).await;
+            })
+            .await;
         }
 
         // ── 2. Overflow path (drop error msg, compact, retry once) ──
@@ -942,14 +1118,22 @@ impl AgentHarness {
                     will_retry: false,
                     error_message: Some(
                         "Context overflow recovery failed after one compact-and-retry attempt. \
-                         Try reducing context or switching to a larger-context model.".into(),
+                         Try reducing context or switching to a larger-context model."
+                            .into(),
                     ),
-                }).await;
+                })
+                .await;
                 return Ok(PostRunDecision::Stop);
             }
             *self.overflow_recovery_attempted.lock().await = true;
             self.drop_last_assistant_from_session().await;
-            self.run_auto_compaction(CompactionReason::Overflow, true, compaction_settings, compaction_stream_fn).await?;
+            self.run_auto_compaction(
+                CompactionReason::Overflow,
+                true,
+                compaction_settings,
+                compaction_stream_fn,
+            )
+            .await?;
             return Ok(PostRunDecision::CompactedRetry);
         }
 
@@ -960,14 +1144,16 @@ impl AgentHarness {
             let session_ctx = self.session.lock().await.build_context().await?;
             let est = estimate_context_tokens_with_source(&session_ctx.messages);
             let Some(idx) = est.last_usage_index else {
-                return Ok(PostRunDecision::Stop);  // No usage data anywhere.
+                return Ok(PostRunDecision::Stop); // No usage data anywhere.
             };
             // Verify the source isn't pre-compaction either.
             if let Some(latest_compaction_ts) = self.latest_compaction_timestamp().await
-                && let Some(AgentMessage::Assistant { timestamp, .. }) = session_ctx.messages.get(idx)
-                    && (*timestamp as i64) <= latest_compaction_ts {
-                        return Ok(PostRunDecision::Stop);
-                    }
+                && let Some(AgentMessage::Assistant { timestamp, .. }) =
+                    session_ctx.messages.get(idx)
+                && (*timestamp as i64) <= latest_compaction_ts
+            {
+                return Ok(PostRunDecision::Stop);
+            }
             est.tokens
         } else {
             // Successful response — use the message's own usage.
@@ -977,8 +1163,15 @@ impl AgentHarness {
             total as usize
         };
 
-        if should_compact_at_threshold(context_tokens, context_window as usize, compaction_settings) {
-            self.run_auto_compaction(CompactionReason::Threshold, false, compaction_settings, compaction_stream_fn).await?;
+        if should_compact_at_threshold(context_tokens, context_window as usize, compaction_settings)
+        {
+            self.run_auto_compaction(
+                CompactionReason::Threshold,
+                false,
+                compaction_settings,
+                compaction_stream_fn,
+            )
+            .await?;
             // Threshold-triggered compaction does not auto-retry the turn.
         }
         Ok(PostRunDecision::Stop)
@@ -1003,7 +1196,8 @@ impl AgentHarness {
                     aborted: false,
                     will_retry,
                     error_message: None,
-                }).await;
+                })
+                .await;
                 Ok(())
             }
             Err(e) => {
@@ -1014,7 +1208,8 @@ impl AgentHarness {
                     aborted: matches!(e, HarnessError::Compaction(CompactionError::Aborted)),
                     will_retry: false,
                     error_message: Some(msg),
-                }).await;
+                })
+                .await;
                 Err(e)
             }
         }
@@ -1048,9 +1243,10 @@ impl AgentHarness {
         // Find the last assistant message entry.
         let target_parent = branch.iter().rev().find_map(|e| {
             if let SessionTreeEntry::Message { message, parent_id, .. } = e
-                && matches!(message, AgentMessage::Assistant { .. }) {
-                    return Some(parent_id.clone());
-                }
+                && matches!(message, AgentMessage::Assistant { .. })
+            {
+                return Some(parent_id.clone());
+            }
             None
         });
         if let Some(parent) = target_parent.flatten() {
@@ -1172,6 +1368,7 @@ impl AgentHarness {
     ) -> Result<Vec<AgentMessage>, HarnessError> {
         // Build context + tools snapshot
         let session_ctx = self.session.lock().await.build_context().await?;
+        let restored_active_tool_names = session_ctx.active_tool_names.clone();
         let messages: Vec<AgentMessage> = session_ctx.messages;
 
         let cfg = self.config.lock().await;
@@ -1182,7 +1379,10 @@ impl AgentHarness {
         drop(cfg);
 
         let resources = self.resources.lock().await;
-        let tools = resources.tools.clone();
+        let tools = restored_active_tool_names
+            .as_deref()
+            .map(|names| resources.tools_for_names(names))
+            .unwrap_or_else(|| resources.active_tools());
         let opts = resources.stream_options.clone();
         let model_info = resources.model_info.clone().unwrap_or(ModelInfo {
             id: model_id.clone(),
@@ -1300,7 +1500,9 @@ impl AgentHarness {
         let mut prompts = prompts;
         prompts.extend(self.drain_next_turn().await);
 
-        Ok(AgentLoop::new(&config, &emit, &self.stream_fn).run(prompts, context, Some(signal)).await)
+        Ok(AgentLoop::new(&config, &emit, &self.stream_fn)
+            .run(prompts, context, Some(signal))
+            .await)
     }
 
     // -----------------------------------------------------------------------
@@ -1320,15 +1522,33 @@ impl AgentHarness {
         let mut session = self.session.lock().await;
         for write in pending {
             match write {
-                PendingWrite::Message(msg) => { session.append_message(msg).await?; }
+                PendingWrite::Message(msg) => {
+                    session.append_message(msg).await?;
+                }
                 PendingWrite::ThinkingLevelChange(level) => {
                     session.append_thinking_level_change(level).await?;
                 }
                 PendingWrite::ModelChange { provider, model_id } => {
                     session.append_model_change(&provider, &model_id).await?;
                 }
-                PendingWrite::Compaction { summary, first_kept_entry_id, tokens_before, details } => {
-                    session.append_compaction(&summary, &first_kept_entry_id, tokens_before, details, None).await?;
+                PendingWrite::ActiveToolsChange { active_tool_names } => {
+                    session.append_active_tools_change(active_tool_names).await?;
+                }
+                PendingWrite::Compaction {
+                    summary,
+                    first_kept_entry_id,
+                    tokens_before,
+                    details,
+                } => {
+                    session
+                        .append_compaction(
+                            &summary,
+                            &first_kept_entry_id,
+                            tokens_before,
+                            details,
+                            None,
+                        )
+                        .await?;
                 }
                 PendingWrite::BranchSummary { from_id, summary, details } => {
                     session.append_branch_summary(&from_id, &summary, details, None).await?;

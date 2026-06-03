@@ -95,26 +95,24 @@ static NON_OVERFLOW_SET: Lazy<RegexSet> =
 ///
 /// Returns `false` for non-assistant messages.
 pub fn is_context_overflow(message: &AgentMessage, context_window: Option<u64>) -> bool {
-    let AgentMessage::Assistant {
-        stop_reason,
-        error_message,
-        usage,
-        ..
-    } = message
-    else {
+    let AgentMessage::Assistant { stop_reason, error_message, usage, .. } = message else {
         return false;
     };
 
     // Case 1: error-message pattern.
     if *stop_reason == StopReason::Error
         && let Some(msg) = error_message.as_deref()
-            && !NON_OVERFLOW_SET.is_match(msg) && OVERFLOW_SET.is_match(msg) {
-                return true;
-            }
+        && !NON_OVERFLOW_SET.is_match(msg)
+        && OVERFLOW_SET.is_match(msg)
+    {
+        return true;
+    }
 
     // A window of 0 means "unknown" (model info not supplied); the
     // token-count cases below can't be evaluated meaningfully against it.
-    let Some(window) = context_window.filter(|w| *w > 0) else { return false };
+    let Some(window) = context_window.filter(|w| *w > 0) else {
+        return false;
+    };
 
     // Case 2: silent overflow.
     if *stop_reason == StopReason::EndTurn {
@@ -160,7 +158,12 @@ mod tests {
             api: Api::Anthropic,
             provider: "test".into(),
             model: "test".into(),
-            usage: Usage { input, output, cache_read, ..Default::default() },
+            usage: Usage {
+                input,
+                output,
+                cache_read,
+                ..Default::default()
+            },
             stop_reason: StopReason::EndTurn,
             error_message: None,
             timestamp: 0,
@@ -173,7 +176,12 @@ mod tests {
             api: Api::Anthropic,
             provider: "test".into(),
             model: "test".into(),
-            usage: Usage { input, output, cache_read, ..Default::default() },
+            usage: Usage {
+                input,
+                output,
+                cache_read,
+                ..Default::default()
+            },
             stop_reason: StopReason::MaxTokens,
             error_message: None,
             timestamp: 0,
@@ -193,7 +201,9 @@ mod tests {
     #[test]
     fn detects_anthropic_request_too_large() {
         assert!(is_context_overflow(
-            &err_assistant("413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}"),
+            &err_assistant(
+                "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}"
+            ),
             None,
         ));
     }
@@ -209,7 +219,9 @@ mod tests {
     #[test]
     fn detects_openai_compat_max_context_length() {
         assert!(is_context_overflow(
-            &err_assistant("Requested token count exceeds the model's maximum context length of 131072 tokens"),
+            &err_assistant(
+                "Requested token count exceeds the model's maximum context length of 131072 tokens"
+            ),
             None,
         ));
     }
@@ -217,7 +229,9 @@ mod tests {
     #[test]
     fn detects_google_overflow() {
         assert!(is_context_overflow(
-            &err_assistant("The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"),
+            &err_assistant(
+                "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"
+            ),
             None,
         ));
     }
@@ -225,7 +239,9 @@ mod tests {
     #[test]
     fn detects_xai_overflow() {
         assert!(is_context_overflow(
-            &err_assistant("This model's maximum prompt length is 131072 but the request contains 537812 tokens"),
+            &err_assistant(
+                "This model's maximum prompt length is 131072 but the request contains 537812 tokens"
+            ),
             None,
         ));
     }
@@ -233,7 +249,9 @@ mod tests {
     #[test]
     fn detects_openrouter_poolside() {
         assert!(is_context_overflow(
-            &err_assistant("Input length 213462 exceeds the maximum allowed input length of 200000 tokens"),
+            &err_assistant(
+                "Input length 213462 exceeds the maximum allowed input length of 200000 tokens"
+            ),
             None,
         ));
     }
@@ -241,7 +259,9 @@ mod tests {
     #[test]
     fn detects_together_ai() {
         assert!(is_context_overflow(
-            &err_assistant("The input (213462 tokens) is longer than the model's context length (200000 tokens)"),
+            &err_assistant(
+                "The input (213462 tokens) is longer than the model's context length (200000 tokens)"
+            ),
             None,
         ));
     }
@@ -265,10 +285,7 @@ mod tests {
 
     #[test]
     fn skips_rate_limit() {
-        assert!(!is_context_overflow(
-            &err_assistant("rate limit exceeded, please retry"),
-            None,
-        ));
+        assert!(!is_context_overflow(&err_assistant("rate limit exceeded, please retry"), None,));
     }
 
     // ─── silent overflow (Case 2) ───

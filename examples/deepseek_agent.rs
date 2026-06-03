@@ -1,6 +1,5 @@
 use llm_client::{
-    AnthropicProvider, AuthMethod, ContentPart, LlmMessage, LlmProvider, LlmRequest,
-    ProviderConfig,
+    AnthropicProvider, AuthMethod, ContentPart, LlmMessage, LlmProvider, LlmRequest, ProviderConfig,
 };
 
 #[tokio::main]

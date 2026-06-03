@@ -6,7 +6,7 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use crate::tools::bash::{TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use crate::tools::bash::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncationResult};
 use agent_core::harness::utils::split_lines_for_counting;
 
 /// Snapshot returned by [`OutputAccumulator::snapshot`].
@@ -72,7 +72,9 @@ impl OutputAccumulator {
 
     /// Append a raw byte chunk from the process stream.
     pub fn append(&mut self, data: &[u8]) {
-        if self.finished { return; }
+        if self.finished {
+            return;
+        }
         self.total_raw_bytes += data.len();
         let text = String::from_utf8_lossy(data).into_owned();
         self.append_decoded_text(&text);
@@ -80,9 +82,10 @@ impl OutputAccumulator {
         if self.should_use_temp_file() {
             self.ensure_temp_file();
             if let Some(ref path) = self.temp_path
-                && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                    let _ = f.write_all(data);
-                }
+                && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            {
+                let _ = f.write_all(data);
+            }
         } else if !data.is_empty() {
             self.raw_chunks.push(data.to_vec());
         }
@@ -90,7 +93,9 @@ impl OutputAccumulator {
 
     /// Signal that no more data will arrive.
     pub fn finish(&mut self) {
-        if self.finished { return; }
+        if self.finished {
+            return;
+        }
         self.finished = true;
         if self.should_use_temp_file() {
             self.ensure_temp_file();
@@ -123,7 +128,9 @@ impl OutputAccumulator {
     // ── private ──────────────────────────────────────────────────────────────
 
     fn append_decoded_text(&mut self, text: &str) {
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         let bytes = text.len();
         self.total_decoded_bytes += bytes;
         self.tail.push_str(text);
@@ -191,13 +198,16 @@ impl OutputAccumulator {
         let total_lines_in_tail = lines.len();
         let total_bytes_in_tail = text.len();
 
-        let truncated = self.total_lines > self.max_lines || self.total_decoded_bytes > self.max_bytes;
+        let truncated =
+            self.total_lines > self.max_lines || self.total_decoded_bytes > self.max_bytes;
 
         let mut out_lines: Vec<&str> = vec![];
         let mut out_bytes = 0usize;
         for line in lines.iter().rev() {
             let lb = line.len() + 1;
-            if out_lines.len() >= self.max_lines || out_bytes + lb > self.max_bytes { break; }
+            if out_lines.len() >= self.max_lines || out_bytes + lb > self.max_bytes {
+                break;
+            }
             out_lines.push(line);
             out_bytes += lb;
         }
@@ -206,9 +216,14 @@ impl OutputAccumulator {
         let content = out_lines.join("\n");
 
         let truncated_by = if truncated {
-            if self.total_decoded_bytes > self.max_bytes { Some("bytes".into()) }
-            else { Some("lines".into()) }
-        } else { None };
+            if self.total_decoded_bytes > self.max_bytes {
+                Some("bytes".into())
+            } else {
+                Some("lines".into())
+            }
+        } else {
+            None
+        };
 
         TruncationResult {
             content,
@@ -233,11 +248,11 @@ impl OutputAccumulator {
     }
 
     fn ensure_temp_file(&mut self) {
-        if self.temp_path.is_some() { return; }
-        let path = std::env::temp_dir().join(format!(
-            "automata-output-{}.log",
-            uuid::Uuid::new_v4()
-        ));
+        if self.temp_path.is_some() {
+            return;
+        }
+        let path =
+            std::env::temp_dir().join(format!("automata-output-{}.log", uuid::Uuid::new_v4()));
         // Flush buffered raw chunks.
         if let Ok(mut f) = std::fs::File::create(&path) {
             for chunk in self.raw_chunks.drain(..) {

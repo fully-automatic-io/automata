@@ -1,10 +1,10 @@
 // Integration tests for coding-agent tools
 
+use agent_core::tool::AgentTool;
 use coding_agent::tools::{
     EditTool, EditToolOptions, FindTool, GrepTool, LsTool, ReadTool, ReadToolOptions, WriteTool,
     WriteToolOptions,
 };
-use agent_core::tool::AgentTool;
 use std::fs;
 use tempfile::TempDir;
 
@@ -14,11 +14,23 @@ async fn test_write_then_read_roundtrip() {
     let path = dir.path().join("test.txt");
     let path_str = path.to_string_lossy().to_string();
 
-    let write = WriteTool::new(dir.path().to_string_lossy().to_string(), WriteToolOptions::default());
-    write.execute("1".into(), serde_json::json!({"path": &path_str, "content": "hello\nworld\n"}), None, None).await.unwrap();
+    let write =
+        WriteTool::new(dir.path().to_string_lossy().to_string(), WriteToolOptions::default());
+    write
+        .execute(
+            "1".into(),
+            serde_json::json!({"path": &path_str, "content": "hello\nworld\n"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     let read = ReadTool::new(dir.path().to_string_lossy().to_string(), ReadToolOptions::default());
-    let result = read.execute("2".into(), serde_json::json!({"path": &path_str}), None, None).await.unwrap();
+    let result = read
+        .execute("2".into(), serde_json::json!({"path": &path_str}), None, None)
+        .await
+        .unwrap();
 
     let text = match &result.content[0] {
         agent_core::types::ContentBlock::Text { text } => text.clone(),
@@ -34,14 +46,23 @@ async fn test_write_then_edit_roundtrip() {
     let path = dir.path().join("edit_test.rs");
     let path_str = path.to_string_lossy().to_string();
 
-    let write = WriteTool::new(dir.path().to_string_lossy().to_string(), WriteToolOptions::default());
+    let write =
+        WriteTool::new(dir.path().to_string_lossy().to_string(), WriteToolOptions::default());
     write.execute("1".into(), serde_json::json!({"path": &path_str, "content": "fn main() {\n    println!(\"hello\");\n}\n"}), None, None).await.unwrap();
 
     let edit = EditTool::new(dir.path().to_string_lossy().to_string(), EditToolOptions::default());
-    let result = edit.execute("2".into(), serde_json::json!({
-        "path": &path_str,
-        "edits": [{"oldText": "hello", "newText": "world"}]
-    }), None, None).await.unwrap();
+    let result = edit
+        .execute(
+            "2".into(),
+            serde_json::json!({
+                "path": &path_str,
+                "edits": [{"oldText": "hello", "newText": "world"}]
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     assert!(!result.terminate);
     let content = fs::read_to_string(&path).unwrap();
@@ -59,7 +80,10 @@ async fn test_ls_lists_written_files() {
     write.execute("2".into(), serde_json::json!({"path": dir.path().join("b.txt").to_string_lossy().to_string(), "content": "b"}), None, None).await.unwrap();
 
     let ls = LsTool::new(cwd.clone());
-    let result = ls.execute("3".into(), serde_json::json!({"path": &cwd}), None, None).await.unwrap();
+    let result = ls
+        .execute("3".into(), serde_json::json!({"path": &cwd}), None, None)
+        .await
+        .unwrap();
 
     let text = match &result.content[0] {
         agent_core::types::ContentBlock::Text { text } => text.clone(),
@@ -78,7 +102,10 @@ async fn test_find_locates_files() {
     fs::write(dir.path().join("bar.txt"), "text").unwrap();
 
     let find = FindTool::new(cwd.clone());
-    let result = find.execute("1".into(), serde_json::json!({"pattern": "*.rs", "path": &cwd}), None, None).await.unwrap();
+    let result = find
+        .execute("1".into(), serde_json::json!({"pattern": "*.rs", "path": &cwd}), None, None)
+        .await
+        .unwrap();
 
     let text = match &result.content[0] {
         agent_core::types::ContentBlock::Text { text } => text.clone(),
@@ -97,10 +124,19 @@ async fn test_grep_finds_pattern() {
     let dir = TempDir::new().unwrap();
     let cwd = dir.path().to_string_lossy().to_string();
 
-    fs::write(dir.path().join("code.rs"), "fn hello_world() {\n    println!(\"hello\");\n}\n").unwrap();
+    fs::write(dir.path().join("code.rs"), "fn hello_world() {\n    println!(\"hello\");\n}\n")
+        .unwrap();
 
     let grep = GrepTool::new(cwd.clone());
-    let result = grep.execute("1".into(), serde_json::json!({"pattern": "hello_world", "path": &cwd}), None, None).await.unwrap();
+    let result = grep
+        .execute(
+            "1".into(),
+            serde_json::json!({"pattern": "hello_world", "path": &cwd}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     let text = match &result.content[0] {
         agent_core::types::ContentBlock::Text { text } => text.clone(),
@@ -118,10 +154,17 @@ async fn test_edit_uniqueness_check() {
     fs::write(&path, "foo\nfoo\nbar\n").unwrap();
 
     let edit = EditTool::new(dir.path().to_string_lossy().to_string(), EditToolOptions::default());
-    let result = edit.execute("1".into(), serde_json::json!({
-        "path": &path_str,
-        "edits": [{"oldText": "foo", "newText": "baz"}]
-    }), None, None).await;
+    let result = edit
+        .execute(
+            "1".into(),
+            serde_json::json!({
+                "path": &path_str,
+                "edits": [{"oldText": "foo", "newText": "baz"}]
+            }),
+            None,
+            None,
+        )
+        .await;
 
     // Should fail because "foo" appears twice
     // Should fail because "foo" appears twice
@@ -138,7 +181,15 @@ async fn test_read_offset_limit() {
     fs::write(&path, &content).unwrap();
 
     let read = ReadTool::new(dir.path().to_string_lossy().to_string(), ReadToolOptions::default());
-    let result = read.execute("1".into(), serde_json::json!({"path": &path_str, "offset": 3, "limit": 3}), None, None).await.unwrap();
+    let result = read
+        .execute(
+            "1".into(),
+            serde_json::json!({"path": &path_str, "offset": 3, "limit": 3}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     let text = match &result.content[0] {
         agent_core::types::ContentBlock::Text { text } => text.clone(),

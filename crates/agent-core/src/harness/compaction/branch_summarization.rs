@@ -1,11 +1,11 @@
-use crate::harness::session::types::SessionTreeEntry;
-use crate::types::AgentMessage;
-use super::compaction::{estimate_tokens, StreamFn, CompactionError, SUMMARIZATION_SYSTEM_PROMPT};
+use super::compaction::{CompactionError, SUMMARIZATION_SYSTEM_PROMPT, StreamFn, estimate_tokens};
 use super::utils::{
-    FileOperations, create_file_ops, extract_file_ops_from_message,
-    compute_file_lists, format_file_operations, serialize_conversation,
+    FileOperations, compute_file_lists, create_file_ops, extract_file_ops_from_message,
+    format_file_operations, serialize_conversation,
 };
 use crate::harness::messages::convert_to_llm;
+use crate::harness::session::types::SessionTreeEntry;
+use crate::types::AgentMessage;
 
 const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
 
@@ -27,17 +27,26 @@ fn parse_ts(s: &str) -> u64 {
 fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> {
     match entry {
         SessionTreeEntry::Message { message, .. } => {
-            if matches!(message, AgentMessage::ToolResult { .. }) { None } else { Some(message.clone()) }
+            if matches!(message, AgentMessage::ToolResult { .. }) {
+                None
+            } else {
+                Some(message.clone())
+            }
         }
-        SessionTreeEntry::CustomMessage { custom_type, content, display, details, timestamp, .. } => {
-            Some(AgentMessage::Custom {
-                custom_type: custom_type.clone(),
-                content: content.clone(),
-                display: *display,
-                details: details.clone(),
-                timestamp: parse_ts(timestamp),
-            })
-        }
+        SessionTreeEntry::CustomMessage {
+            custom_type,
+            content,
+            display,
+            details,
+            timestamp,
+            ..
+        } => Some(AgentMessage::Custom {
+            custom_type: custom_type.clone(),
+            content: content.clone(),
+            display: *display,
+            details: details.clone(),
+            timestamp: parse_ts(timestamp),
+        }),
         SessionTreeEntry::BranchSummary { summary, from_id, timestamp, .. } => {
             Some(AgentMessage::BranchSummary {
                 summary: summary.clone(),
@@ -56,35 +65,52 @@ fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> {
     }
 }
 
-pub fn prepare_branch_entries(entries: &[SessionTreeEntry], token_budget: usize) -> (Vec<AgentMessage>, FileOperations) {
+pub fn prepare_branch_entries(
+    entries: &[SessionTreeEntry],
+    token_budget: usize,
+) -> (Vec<AgentMessage>, FileOperations) {
     let mut file_ops = create_file_ops();
 
     // Collect file ops from branch_summary details first
     for entry in entries {
         if let SessionTreeEntry::BranchSummary { details: Some(details), from_hook, .. } = entry
-            && from_hook != &Some(true) {
-                if let Some(read) = details.get("readFiles").and_then(|r| r.as_array()) {
-                    for f in read { if let Some(s) = f.as_str() { file_ops.read.insert(s.to_string()); } }
-                }
-                if let Some(modified) = details.get("modifiedFiles").and_then(|r| r.as_array()) {
-                    for f in modified { if let Some(s) = f.as_str() { file_ops.edited.insert(s.to_string()); } }
+            && from_hook != &Some(true)
+        {
+            if let Some(read) = details.get("readFiles").and_then(|r| r.as_array()) {
+                for f in read {
+                    if let Some(s) = f.as_str() {
+                        file_ops.read.insert(s.to_string());
+                    }
                 }
             }
+            if let Some(modified) = details.get("modifiedFiles").and_then(|r| r.as_array()) {
+                for f in modified {
+                    if let Some(s) = f.as_str() {
+                        file_ops.edited.insert(s.to_string());
+                    }
+                }
+            }
+        }
     }
 
     let mut messages: Vec<AgentMessage> = vec![];
     let mut total_tokens = 0usize;
 
     for entry in entries.iter().rev() {
-        let Some(msg) = get_message_from_entry(entry) else { continue };
+        let Some(msg) = get_message_from_entry(entry) else {
+            continue;
+        };
         extract_file_ops_from_message(&msg, &mut file_ops);
         let tokens = estimate_tokens(&msg);
 
         if token_budget > 0 && total_tokens + tokens > token_budget {
-            if matches!(entry, SessionTreeEntry::Compaction { .. } | SessionTreeEntry::BranchSummary { .. })
-                && total_tokens < (token_budget as f64 * 0.9) as usize {
-                    messages.insert(0, msg);
-                }
+            if matches!(
+                entry,
+                SessionTreeEntry::Compaction { .. } | SessionTreeEntry::BranchSummary { .. }
+            ) && total_tokens < (token_budget as f64 * 0.9) as usize
+            {
+                messages.insert(0, msg);
+            }
             break;
         }
         messages.insert(0, msg);
@@ -122,12 +148,18 @@ pub async fn generate_branch_summary(
         None => BRANCH_SUMMARY_PROMPT.to_string(),
     };
 
-    let prompt_text = format!("<conversation>\n{}\n</conversation>\n\n{}", conversation_text, instructions);
+    let prompt_text =
+        format!("<conversation>\n{}\n</conversation>\n\n{}", conversation_text, instructions);
     let summarization_messages = vec![AgentMessage::user_text(prompt_text)];
 
     let text = stream_fn(summarization_messages, SUMMARIZATION_SYSTEM_PROMPT).await?;
     let (read_files, modified_files) = compute_file_lists(&file_ops);
-    let summary = format!("{}{}{}", BRANCH_SUMMARY_PREAMBLE, text, format_file_operations(&read_files, &modified_files));
+    let summary = format!(
+        "{}{}{}",
+        BRANCH_SUMMARY_PREAMBLE,
+        text,
+        format_file_operations(&read_files, &modified_files)
+    );
 
     Ok(BranchSummaryResult { summary, read_files, modified_files })
 }
@@ -143,8 +175,11 @@ pub async fn collect_entries_for_branch_summary(
     };
 
     let old_path: std::collections::HashSet<String> = session
-        .get_branch_from(old_leaf).await?
-        .iter().map(|e| e.id().to_string()).collect();
+        .get_branch_from(old_leaf)
+        .await?
+        .iter()
+        .map(|e| e.id().to_string())
+        .collect();
 
     let target_path = session.get_branch_from(target_id).await?;
     let mut common_ancestor_id: Option<String> = None;
@@ -158,9 +193,15 @@ pub async fn collect_entries_for_branch_summary(
     let mut entries = vec![];
     let mut current: Option<String> = Some(old_leaf.to_string());
     while let Some(ref id) = current.clone() {
-        if Some(id.as_str()) == common_ancestor_id.as_deref() { break; }
-        let entry = session.storage().get_entry(id).await
-            .ok_or_else(|| crate::harness::session::types::SessionError::InvalidSession(format!("Entry {} not found", id)))?;
+        if Some(id.as_str()) == common_ancestor_id.as_deref() {
+            break;
+        }
+        let entry = session.storage().get_entry(id).await.ok_or_else(|| {
+            crate::harness::session::types::SessionError::InvalidSession(format!(
+                "Entry {} not found",
+                id
+            ))
+        })?;
         let parent = entry.parent_id().map(|s| s.to_string());
         entries.push(entry);
         current = parent;

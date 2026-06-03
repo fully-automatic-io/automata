@@ -3,8 +3,8 @@
 //! Trigger retry when the error message starts with `HTTP 5` or `HTTP 429`. Honour
 //! `Retry-After` if the server supplied it.
 
-use std::time::Duration;
 use crate::provider::LlmError;
+use std::time::Duration;
 
 /// Should this error trigger a retry?
 pub fn should_retry(err: &LlmError) -> bool {
@@ -32,7 +32,10 @@ pub fn retry_delay(
         initial_ms.saturating_mul(2u64.saturating_pow(attempt))
     };
     if let Some(cap) = max_delay_ms
-        && ms > cap { ms = cap; }
+        && ms > cap
+    {
+        ms = cap;
+    }
     Duration::from_millis(ms)
 }
 
@@ -48,13 +51,19 @@ mod tests {
 
     #[test]
     fn test_should_retry_5xx() {
-        let err = LlmError::Http { status: 503, message: "Service Unavailable".into() };
+        let err = LlmError::Http {
+            status: 503,
+            message: "Service Unavailable".into(),
+        };
         assert!(should_retry(&err));
     }
 
     #[test]
     fn test_should_retry_429() {
-        let err = LlmError::Http { status: 429, message: "rate limited".into() };
+        let err = LlmError::Http {
+            status: 429,
+            message: "rate limited".into(),
+        };
         assert!(should_retry(&err));
         let err2 = LlmError::RateLimit { retry_after_secs: 5 };
         assert!(should_retry(&err2));
@@ -62,7 +71,10 @@ mod tests {
 
     #[test]
     fn test_no_retry_4xx() {
-        let err = LlmError::Http { status: 400, message: "bad request".into() };
+        let err = LlmError::Http {
+            status: 400,
+            message: "bad request".into(),
+        };
         assert!(!should_retry(&err));
         let err2 = LlmError::AuthError;
         assert!(!should_retry(&err2));

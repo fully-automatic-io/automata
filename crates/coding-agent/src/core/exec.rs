@@ -24,11 +24,16 @@ pub struct ExecResult {
 
 pub async fn exec_command(command: &str, opts: ExecOptions) -> Result<ExecResult, String> {
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command)
+    cmd.arg("-c")
+        .arg(command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(cwd) = &opts.cwd { cmd.current_dir(cwd); }
-    if let Some(env) = &opts.env { cmd.envs(env); }
+    if let Some(cwd) = &opts.cwd {
+        cmd.current_dir(cwd);
+    }
+    if let Some(env) = &opts.env {
+        cmd.envs(env);
+    }
 
     let run = async {
         let output = cmd.output().await.map_err(|e| e.to_string())?;
@@ -70,11 +75,14 @@ pub struct BashExecutorOptions {
 pub async fn execute_bash(command: &str, opts: BashExecutorOptions) -> Result<BashResult, String> {
     let shell = opts.shell_path.as_deref().unwrap_or("/bin/bash");
     let mut cmd = Command::new(shell);
-    cmd.arg("-c").arg(command)
+    cmd.arg("-c")
+        .arg(command)
         .current_dir(&opts.cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(env) = &opts.env { cmd.envs(env); }
+    if let Some(env) = &opts.env {
+        cmd.envs(env);
+    }
 
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let stdout = child.stdout.take().unwrap();
@@ -159,7 +167,10 @@ pub struct ShellConfig {
 
 pub fn get_shell_config(shell_path: Option<&str>) -> ShellConfig {
     if let Some(path) = shell_path {
-        return ShellConfig { shell: path.to_string(), args: vec!["-c".to_string()] };
+        return ShellConfig {
+            shell: path.to_string(),
+            args: vec!["-c".to_string()],
+        };
     }
     let shell = env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
     ShellConfig { shell, args: vec!["-c".to_string()] }
@@ -179,7 +190,7 @@ pub fn untrack_detached_child_pid(pid: u32) {
 
 #[cfg(unix)]
 pub fn kill_process_tree(pid: u32) -> Result<(), std::io::Error> {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     let children = get_child_pids(pid);
     for child_pid in &children {
@@ -207,19 +218,25 @@ fn get_child_pids(parent_pid: u32) -> Vec<u32> {
     std::process::Command::new("pgrep")
         .args(["-P", &parent_pid.to_string()])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter_map(|l| l.trim().parse().ok())
-            .collect())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 #[cfg(not(unix))]
-fn get_child_pids(_parent_pid: u32) -> Vec<u32> { Vec::new() }
+fn get_child_pids(_parent_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
 
 pub fn cleanup_detached_processes() {
     let pids = detached_pids().lock().unwrap().clone();
-    for pid in pids { let _ = kill_process_tree(pid); }
+    for pid in pids {
+        let _ = kill_process_tree(pid);
+    }
 }
 
 // ── shell_config path helper (used by BashTool) ───────────────────────────────

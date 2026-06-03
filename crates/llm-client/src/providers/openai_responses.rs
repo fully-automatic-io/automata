@@ -38,17 +38,20 @@ impl OpenAIResponsesProvider {
     }
 
     fn build_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
-        let input: Vec<serde_json::Value> = request.messages.iter()
-            .flat_map(convert_message)
-            .collect();
+        let input: Vec<serde_json::Value> =
+            request.messages.iter().flat_map(convert_message).collect();
 
-        let tools: Vec<serde_json::Value> = request.tools.iter()
-            .map(|t| json!({
-                "type": "function",
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.input_schema,
-            }))
+        let tools: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                })
+            })
             .collect();
 
         let mut body = json!({
@@ -80,7 +83,10 @@ impl OpenAIResponsesProvider {
         body
     }
 
-    async fn send_with_retry(&self, body: serde_json::Value) -> Result<reqwest::Response, LlmError> {
+    async fn send_with_retry(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response, LlmError> {
         use crate::retry::{format_http_error, retry_delay, should_retry};
         let mut last_err: Option<LlmError> = None;
         for attempt in 0..=self.config.max_retries {
@@ -91,27 +97,36 @@ impl OpenAIResponsesProvider {
                 };
                 tokio::time::sleep(retry_delay(attempt - 1, 500, Some(30_000), after)).await;
             }
-            let resp = self.client
+            let resp = self
+                .client
                 .post(self.base_url())
                 .bearer_auth(&self.config.api_key)
                 .json(&body)
-                .send().await;
+                .send()
+                .await;
 
             match resp {
                 Ok(r) if r.status().is_success() => return Ok(r),
                 Ok(r) => {
                     let status = r.status().as_u16();
                     if status == 429 {
-                        let secs = r.headers().get("retry-after")
+                        let secs = r
+                            .headers()
+                            .get("retry-after")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(5);
                         last_err = Some(LlmError::RateLimit { retry_after_secs: secs });
                         continue;
                     }
-                    if status == 401 { return Err(LlmError::AuthError); }
+                    if status == 401 {
+                        return Err(LlmError::AuthError);
+                    }
                     let body_txt = r.text().await.unwrap_or_default();
-                    let err = LlmError::Http { status, message: format_http_error(status, &body_txt) };
+                    let err = LlmError::Http {
+                        status,
+                        message: format_http_error(status, &body_txt),
+                    };
                     if should_retry(&err) {
                         last_err = Some(err);
                         continue;
@@ -161,35 +176,43 @@ impl LlmProvider for OpenAIResponsesProvider {
             cached_tokens: u64,
         }
 
-        let api_resp: ApiResponse = resp.json().await
-            .map_err(|e| LlmError::SerializationError(e.to_string()))?;
+        let api_resp: ApiResponse =
+            resp.json().await.map_err(|e| LlmError::SerializationError(e.to_string()))?;
 
-        let content: Vec<ContentPart> = api_resp.output.iter()
-            .flat_map(parse_output_item)
-            .collect();
+        let content: Vec<ContentPart> =
+            api_resp.output.iter().flat_map(parse_output_item).collect();
 
         let stop_reason = match api_resp.status.as_deref() {
             Some("incomplete") => StopReason::MaxTokens,
             _ => {
                 // If any output item is a function_call, signal ToolUse; else EndTurn.
-                let has_tool = api_resp.output.iter().any(|v| {
-                    v.get("type").and_then(|t| t.as_str()) == Some("function_call")
-                });
-                if has_tool { StopReason::ToolUse } else { StopReason::EndTurn }
+                let has_tool = api_resp
+                    .output
+                    .iter()
+                    .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("function_call"));
+                if has_tool {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                }
             }
         };
 
-        let usage = api_resp.usage.map(|u| {
-            let cache_read = u.input_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
-            Usage {
-                input: u.input_tokens.saturating_sub(cache_read),
-                output: u.output_tokens,
-                cache_read,
-                cache_write: 0,
-                total_tokens: u.input_tokens + u.output_tokens,
-                cost: Default::default(),
-            }
-        }).unwrap_or_default();
+        let usage = api_resp
+            .usage
+            .map(|u| {
+                let cache_read =
+                    u.input_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
+                Usage {
+                    input: u.input_tokens.saturating_sub(cache_read),
+                    output: u.output_tokens,
+                    cache_read,
+                    cache_write: 0,
+                    total_tokens: u.input_tokens + u.output_tokens,
+                    cost: Default::default(),
+                }
+            })
+            .unwrap_or_default();
 
         Ok(LlmResponse {
             id: api_resp.id,
@@ -227,7 +250,12 @@ impl LlmProvider for OpenAIResponsesProvider {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-enum BlockKind { None, Text, Thinking, ToolCall }
+enum BlockKind {
+    None,
+    Text,
+    Thinking,
+    ToolCall,
+}
 
 struct TranslateState {
     current_index: usize,
@@ -271,7 +299,8 @@ async fn translate_event(
                 None => return out,
             };
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            s.current_index = payload.get("output_index")
+            s.current_index = payload
+                .get("output_index")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(s.current_index);
@@ -310,7 +339,8 @@ async fn translate_event(
         "response.output_text.delta"
         | "response.reasoning_text.delta"
         | "response.reasoning_summary_text.delta" => {
-            let delta_text = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let delta_text =
+                payload.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if delta_text.is_empty() {
                 return out;
             }
@@ -322,7 +352,8 @@ async fn translate_event(
             out.push(Ok(LlmEvent::ContentBlockDelta { index: s.current_index, delta }));
         }
         "response.function_call_arguments.delta" => {
-            let delta_text = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let delta_text =
+                payload.get("delta").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if !delta_text.is_empty() {
                 s.tool_buf.push_str(&delta_text);
                 out.push(Ok(LlmEvent::ContentBlockDelta {
@@ -333,13 +364,15 @@ async fn translate_event(
         }
         "response.function_call_arguments.done" => {
             if let Some(full) = payload.get("arguments").and_then(|v| v.as_str())
-                && full.starts_with(&s.tool_buf) && full.len() > s.tool_buf.len() {
-                    let tail = full[s.tool_buf.len()..].to_string();
-                    out.push(Ok(LlmEvent::ContentBlockDelta {
-                        index: s.current_index,
-                        delta: Delta::InputJsonDelta { partial_json: tail },
-                    }));
-                }
+                && full.starts_with(&s.tool_buf)
+                && full.len() > s.tool_buf.len()
+            {
+                let tail = full[s.tool_buf.len()..].to_string();
+                out.push(Ok(LlmEvent::ContentBlockDelta {
+                    index: s.current_index,
+                    delta: Delta::InputJsonDelta { partial_json: tail },
+                }));
+            }
         }
         "response.output_item.done" => {
             out.push(Ok(LlmEvent::ContentBlockStop { index: s.current_index }));
@@ -347,7 +380,8 @@ async fn translate_event(
         }
         "response.completed" => {
             let usage = payload.get("response").and_then(|r| r.get("usage")).map(|u| {
-                let cache_read = u.get("input_tokens_details")
+                let cache_read = u
+                    .get("input_tokens_details")
                     .and_then(|d| d.get("cached_tokens"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
@@ -369,9 +403,17 @@ async fn translate_event(
                 let has_tool = resp
                     .and_then(|r| r.get("output"))
                     .and_then(|o| o.as_array())
-                    .map(|arr| arr.iter().any(|v| v.get("type").and_then(|t| t.as_str()) == Some("function_call")))
+                    .map(|arr| {
+                        arr.iter().any(|v| {
+                            v.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                        })
+                    })
                     .unwrap_or(false);
-                Some(if has_tool { StopReason::ToolUse } else { StopReason::EndTurn })
+                Some(if has_tool {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                })
             };
             out.push(Ok(LlmEvent::MessageDelta {
                 delta: crate::streaming::MessageDelta { stop_reason, stop_sequence: None },
@@ -385,7 +427,9 @@ async fn translate_event(
                 .and_then(|r| r.get("error"))
                 .and_then(|e| e.get("message"))
                 .and_then(|v| v.as_str())
-                .or_else(|| payload.get("error").and_then(|e| e.get("message")).and_then(|v| v.as_str()))
+                .or_else(|| {
+                    payload.get("error").and_then(|e| e.get("message")).and_then(|v| v.as_str())
+                })
                 .unwrap_or("Responses API error")
                 .to_string();
             out.push(Ok(LlmEvent::Error {
@@ -404,9 +448,8 @@ async fn translate_event(
 fn convert_message(msg: &LlmMessage) -> Vec<serde_json::Value> {
     match msg {
         LlmMessage::User { content, .. } => {
-            let content_arr: Vec<serde_json::Value> = to_blocks(content).iter()
-                .map(convert_user_content_part)
-                .collect();
+            let content_arr: Vec<serde_json::Value> =
+                to_blocks(content).iter().map(convert_user_content_part).collect();
             vec![json!({ "type": "message", "role": "user", "content": content_arr })]
         }
         LlmMessage::Assistant { content, .. } => {
@@ -454,8 +497,15 @@ fn convert_message(msg: &LlmMessage) -> Vec<serde_json::Value> {
             out
         }
         LlmMessage::ToolResult { tool_call_id, content, .. } => {
-            let text: String = content.iter()
-                .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None })
+            let text: String = content
+                .iter()
+                .filter_map(|p| {
+                    if let ContentPart::Text { text } = p {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("");
             vec![json!({
@@ -497,9 +547,10 @@ fn parse_output_item(item: &serde_json::Value) -> Vec<ContentPart> {
                 for c in arr {
                     let ctype = c.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     if ctype == "output_text"
-                        && let Some(text) = c.get("text").and_then(|t| t.as_str()) {
-                            out.push(ContentPart::Text { text: text.to_string() });
-                        }
+                        && let Some(text) = c.get("text").and_then(|t| t.as_str())
+                    {
+                        out.push(ContentPart::Text { text: text.to_string() });
+                    }
                 }
             }
             out
@@ -519,7 +570,8 @@ fn parse_output_item(item: &serde_json::Value) -> Vec<ContentPart> {
             let id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let args_raw = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
-            let arguments: serde_json::Value = serde_json::from_str(args_raw).unwrap_or(serde_json::json!({}));
+            let arguments: serde_json::Value =
+                serde_json::from_str(args_raw).unwrap_or(serde_json::json!({}));
             vec![ContentPart::ToolCall { id, name, arguments }]
         }
         _ => vec![],
@@ -645,7 +697,10 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    fn ev(name: &str, json: serde_json::Value) -> Result<Event, eventsource_stream::EventStreamError<reqwest::Error>> {
+    fn ev(
+        name: &str,
+        json: serde_json::Value,
+    ) -> Result<Event, eventsource_stream::EventStreamError<reqwest::Error>> {
         Ok(Event {
             event: name.into(),
             data: serde_json::to_string(&json).unwrap(),
@@ -666,9 +721,13 @@ mod tests {
     async fn translate_response_created_emits_message_start() {
         let s = fresh_state();
         let evs = translate_event(
-            ev("response.created", serde_json::json!({"response": {"id": "r1", "model": "gpt-5"}})),
+            ev(
+                "response.created",
+                serde_json::json!({"response": {"id": "r1", "model": "gpt-5"}}),
+            ),
             s,
-        ).await;
+        )
+        .await;
         match &evs[0] {
             Ok(LlmEvent::MessageStart { id, model }) => {
                 assert_eq!(id, "r1");
@@ -683,18 +742,26 @@ mod tests {
         let s = fresh_state();
         // item.added (message)
         let _ = translate_event(
-            ev("response.output_item.added", serde_json::json!({
-                "output_index": 0, "item": {"type": "message"}
-            })),
+            ev(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": 0, "item": {"type": "message"}
+                }),
+            ),
             s.clone(),
-        ).await;
+        )
+        .await;
         // delta
         let evs = translate_event(
             ev("response.output_text.delta", serde_json::json!({"delta": "Hi "})),
             s.clone(),
-        ).await;
+        )
+        .await;
         match &evs[0] {
-            Ok(LlmEvent::ContentBlockDelta { index: 0, delta: crate::streaming::Delta::TextDelta { text } }) => {
+            Ok(LlmEvent::ContentBlockDelta {
+                index: 0,
+                delta: crate::streaming::Delta::TextDelta { text },
+            }) => {
                 assert_eq!(text, "Hi ");
             }
             _ => panic!("expected TextDelta, got {:?}", evs[0]),
@@ -703,7 +770,8 @@ mod tests {
         let evs = translate_event(
             ev("response.output_item.done", serde_json::json!({"item": {"type": "message"}})),
             s.clone(),
-        ).await;
+        )
+        .await;
         match &evs[0] {
             Ok(LlmEvent::ContentBlockStop { index: 0 }) => {}
             _ => panic!("expected ContentBlockStop, got {:?}", evs[0]),
@@ -714,29 +782,44 @@ mod tests {
     async fn translate_tool_call_args_streaming() {
         let s = fresh_state();
         let _ = translate_event(
-            ev("response.output_item.added", serde_json::json!({
-                "output_index": 0,
-                "item": {"type": "function_call", "call_id": "tc1", "name": "bash"}
-            })),
+            ev(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": 0,
+                    "item": {"type": "function_call", "call_id": "tc1", "name": "bash"}
+                }),
+            ),
             s.clone(),
-        ).await;
+        )
+        .await;
         let evs = translate_event(
             ev("response.function_call_arguments.delta", serde_json::json!({"delta": "{\"cmd"})),
             s.clone(),
-        ).await;
+        )
+        .await;
         match &evs[0] {
-            Ok(LlmEvent::ContentBlockDelta { delta: crate::streaming::Delta::InputJsonDelta { partial_json }, .. }) => {
+            Ok(LlmEvent::ContentBlockDelta {
+                delta: crate::streaming::Delta::InputJsonDelta { partial_json },
+                ..
+            }) => {
                 assert_eq!(partial_json, "{\"cmd");
             }
             _ => panic!("expected InputJsonDelta, got {:?}", evs[0]),
         }
         // .done with the canonical full string emits any tail delta only.
         let evs = translate_event(
-            ev("response.function_call_arguments.done", serde_json::json!({"arguments": "{\"cmd\":\"ls\"}"})),
+            ev(
+                "response.function_call_arguments.done",
+                serde_json::json!({"arguments": "{\"cmd\":\"ls\"}"}),
+            ),
             s.clone(),
-        ).await;
+        )
+        .await;
         match &evs[0] {
-            Ok(LlmEvent::ContentBlockDelta { delta: crate::streaming::Delta::InputJsonDelta { partial_json }, .. }) => {
+            Ok(LlmEvent::ContentBlockDelta {
+                delta: crate::streaming::Delta::InputJsonDelta { partial_json },
+                ..
+            }) => {
                 assert_eq!(partial_json, "\":\"ls\"}");
             }
             _ => panic!("expected tail InputJsonDelta, got {:?}", evs[0]),
@@ -747,26 +830,30 @@ mod tests {
     async fn translate_response_completed_emits_usage_and_stop() {
         let s = fresh_state();
         let evs = translate_event(
-            ev("response.completed", serde_json::json!({
-                "response": {
-                    "status": "completed",
-                    "usage": {
-                        "input_tokens": 100,
-                        "output_tokens": 50,
-                        "total_tokens": 150,
-                        "input_tokens_details": {"cached_tokens": 30}
-                    },
-                    "output": [{"type": "message"}]
-                }
-            })),
+            ev(
+                "response.completed",
+                serde_json::json!({
+                    "response": {
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 50,
+                            "total_tokens": 150,
+                            "input_tokens_details": {"cached_tokens": 30}
+                        },
+                        "output": [{"type": "message"}]
+                    }
+                }),
+            ),
             s,
-        ).await;
+        )
+        .await;
         // First event: MessageDelta with usage.
         match &evs[0] {
             Ok(LlmEvent::MessageDelta { delta, usage }) => {
                 assert_eq!(delta.stop_reason, Some(StopReason::EndTurn));
                 let u = usage.as_ref().unwrap();
-                assert_eq!(u.input, 70);  // 100 - 30 cached
+                assert_eq!(u.input, 70); // 100 - 30 cached
                 assert_eq!(u.output, 50);
                 assert_eq!(u.cache_read, 30);
                 assert_eq!(u.total_tokens, 150);
@@ -784,14 +871,18 @@ mod tests {
     async fn translate_tool_use_stop_reason() {
         let s = fresh_state();
         let evs = translate_event(
-            ev("response.completed", serde_json::json!({
-                "response": {
-                    "status": "completed",
-                    "output": [{"type": "function_call"}]
-                }
-            })),
+            ev(
+                "response.completed",
+                serde_json::json!({
+                    "response": {
+                        "status": "completed",
+                        "output": [{"type": "function_call"}]
+                    }
+                }),
+            ),
             s,
-        ).await;
+        )
+        .await;
         match &evs[0] {
             Ok(LlmEvent::MessageDelta { delta, .. }) => {
                 assert_eq!(delta.stop_reason, Some(StopReason::ToolUse));
@@ -804,11 +895,15 @@ mod tests {
     async fn translate_response_incomplete_maps_to_max_tokens() {
         let s = fresh_state();
         let evs = translate_event(
-            ev("response.completed", serde_json::json!({
-                "response": {"status": "incomplete", "output": []}
-            })),
+            ev(
+                "response.completed",
+                serde_json::json!({
+                    "response": {"status": "incomplete", "output": []}
+                }),
+            ),
             s,
-        ).await;
+        )
+        .await;
         match &evs[0] {
             Ok(LlmEvent::MessageDelta { delta, .. }) => {
                 assert_eq!(delta.stop_reason, Some(StopReason::MaxTokens));
@@ -821,11 +916,15 @@ mod tests {
     async fn translate_response_failed_emits_error() {
         let s = fresh_state();
         let evs = translate_event(
-            ev("response.failed", serde_json::json!({
-                "response": {"error": {"message": "boom"}}
-            })),
+            ev(
+                "response.failed",
+                serde_json::json!({
+                    "response": {"error": {"message": "boom"}}
+                }),
+            ),
             s,
-        ).await;
+        )
+        .await;
         match &evs[0] {
             Ok(LlmEvent::Error { error }) => assert_eq!(error.message, "boom"),
             _ => panic!("expected Error, got {:?}", evs[0]),

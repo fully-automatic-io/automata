@@ -1,6 +1,7 @@
-
 use agent_core::tool::AgentTool;
-use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock, ToolExecutionMode};
+use agent_core::types::{
+    AgentToolResult, AgentToolUpdateCallback, ContentBlock, ToolExecutionMode,
+};
 use async_trait::async_trait;
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
@@ -51,7 +52,10 @@ where
     // Get or create mutex for this file
     let lock = {
         let mut queues = FILE_MUTATION_QUEUES.lock().await;
-        queues.entry(path.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        queues
+            .entry(path.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     };
 
     // Acquire lock for this file
@@ -137,11 +141,7 @@ pub fn restore_line_endings(content: &str, ending: &str) -> String {
 /// 5. Special-width spaces → ASCII space
 fn fuzzy_normalize(text: &str) -> String {
     let nfkc: String = text.nfkc().collect();
-    let trimmed = nfkc
-        .split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let trimmed = nfkc.split('\n').map(str::trim_end).collect::<Vec<_>>().join("\n");
     trimmed
         .chars()
         .map(|c| match c {
@@ -153,11 +153,7 @@ fn fuzzy_normalize(text: &str) -> String {
             '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
             | '\u{2212}' => '-',
             // Special-width spaces: NBSP, en/em/thin/hair/etc, narrow NBSP, math, ideographic.
-            '\u{00A0}'
-            | '\u{2002}'..='\u{200A}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}' => ' ',
+            '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
             other => other,
         })
         .collect()
@@ -358,7 +354,9 @@ pub async fn compute_edits_diff<O: EditOperations>(
         std::path::Path::new(cwd).join(path).to_string_lossy().into_owned()
     };
 
-    let raw = operations.read_file(&absolute).await
+    let raw = operations
+        .read_file(&absolute)
+        .await
         .map_err(|e| format!("Could not read file: {path}. {e}"))?;
     let raw_str = String::from_utf8_lossy(&raw);
     let (_bom, stripped) = strip_bom(&raw_str);
@@ -379,10 +377,14 @@ pub async fn compute_edit_diff<O: EditOperations>(
 ) -> Result<EditDiffResult, String> {
     compute_edits_diff(
         path,
-        &[Edit { old_text: old_text.to_string(), new_text: new_text.to_string() }],
+        &[Edit {
+            old_text: old_text.to_string(),
+            new_text: new_text.to_string(),
+        }],
         cwd,
         operations,
-    ).await
+    )
+    .await
 }
 
 // ============================================================================
@@ -394,7 +396,6 @@ pub struct EditToolOptions {
     pub operations: Option<Arc<dyn EditOperations>>,
 }
 
-
 pub struct EditTool {
     cwd: String,
     operations: Arc<dyn EditOperations>,
@@ -402,23 +403,15 @@ pub struct EditTool {
 
 impl EditTool {
     pub fn new(cwd: String, options: EditToolOptions) -> Self {
-        let ops = options
-            .operations
-            .unwrap_or_else(|| Arc::new(LocalEditOperations));
-        Self {
-            cwd,
-            operations: ops,
-        }
+        let ops = options.operations.unwrap_or_else(|| Arc::new(LocalEditOperations));
+        Self { cwd, operations: ops }
     }
 
     fn resolve_path(&self, path: &str) -> String {
         if Path::new(path).is_absolute() {
             path.to_string()
         } else {
-            Path::new(&self.cwd)
-                .join(path)
-                .to_string_lossy()
-                .to_string()
+            Path::new(&self.cwd).join(path).to_string_lossy().to_string()
         }
     }
 }
@@ -483,11 +476,8 @@ impl AgentTool for EditTool {
         if has_legacy {
             let old_text = args.get("oldText").unwrap().clone();
             let new_text = args.get("newText").unwrap().clone();
-            let mut edits = args
-                .get("edits")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
+            let mut edits =
+                args.get("edits").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             edits.push(serde_json::json!({"oldText": old_text, "newText": new_text}));
 
             if let Some(obj) = args.as_object_mut() {
@@ -500,9 +490,10 @@ impl AgentTool for EditTool {
         // Handle edits as JSON string
         if let Some(edits_str) = args.get("edits").and_then(|v| v.as_str())
             && let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(edits_str)
-                && let Some(obj) = args.as_object_mut() {
-                    obj.insert("edits".to_string(), serde_json::Value::Array(parsed));
-                }
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("edits".to_string(), serde_json::Value::Array(parsed));
+        }
 
         args
     }
@@ -514,10 +505,7 @@ impl AgentTool for EditTool {
         signal: Option<CancellationToken>,
         on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'path' parameter")?;
+        let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing 'path' parameter")?;
 
         let edits: Vec<Edit> = params
             .get("edits")
@@ -552,27 +540,18 @@ impl AgentTool for EditTool {
         let on_update_arc: Option<Arc<AgentToolUpdateCallback>> = on_update.map(Arc::new);
 
         // Use file mutation queue to prevent concurrent edits
-        
 
         with_file_mutation_queue(&absolute_path, async {
             // Check file exists and is accessible
-            self.operations
-                .access(&absolute_path)
-                .await
-                .map_err(|e| {
-                    Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e))
-                        as Box<dyn std::error::Error + Send + Sync>
-                })?;
+            self.operations.access(&absolute_path).await.map_err(|e| {
+                Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
             // Read file
-            let buffer = self
-                .operations
-                .read_file(&absolute_path)
-                .await
-                .map_err(|e| {
-                    Box::new(std::io::Error::other(e))
-                        as Box<dyn std::error::Error + Send + Sync>
-                })?;
+            let buffer = self.operations.read_file(&absolute_path).await.map_err(|e| {
+                Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
             let raw_content = String::from_utf8_lossy(&buffer).to_string();
 
@@ -584,8 +563,7 @@ impl AgentTool for EditTool {
             // Apply edits
             let (base, new) = apply_edits_to_normalized_content(&normalized, &edits, path)
                 .map_err(|e| {
-                    Box::new(std::io::Error::other(e))
-                        as Box<dyn std::error::Error + Send + Sync>
+                    Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
             // Check if anything changed
@@ -626,28 +604,16 @@ impl AgentTool for EditTool {
             let final_content = format!("{}{}", bom, restore_line_endings(&new, original_ending));
 
             // Write file
-            self.operations
-                .write_file(&absolute_path, &final_content)
-                .await
-                .map_err(|e| {
-                    Box::new(std::io::Error::other(e))
-                        as Box<dyn std::error::Error + Send + Sync>
-                })?;
+            self.operations.write_file(&absolute_path, &final_content).await.map_err(|e| {
+                Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
             Ok(AgentToolResult {
                 content: vec![ContentBlock::Text {
-                    text: format!(
-                        "Successfully applied {} edit(s) to {}",
-                        edits.len(),
-                        path
-                    ),
+                    text: format!("Successfully applied {} edit(s) to {}", edits.len(), path),
                 }],
-                details: serde_json::to_value(EditToolDetails {
-                    diff,
-                    patch,
-                    first_changed_line,
-                })
-                .unwrap_or_default(),
+                details: serde_json::to_value(EditToolDetails { diff, patch, first_changed_line })
+                    .unwrap_or_default(),
                 terminate: false,
             })
         })
@@ -753,8 +719,7 @@ mod tests {
             old_text: "let s = \"hello\";".into(),
             new_text: "let s = \"HELLO\";".into(),
         }];
-        let (_, new) =
-            apply_edits_to_normalized_content(src, &edits, "/x.rs").expect("apply");
+        let (_, new) = apply_edits_to_normalized_content(src, &edits, "/x.rs").expect("apply");
         assert!(new.contains("let s = \"HELLO\";"));
         // The other line should also have been normalized (fuzzy rewrite of
         // the entire file is deliberate).
@@ -806,41 +771,47 @@ mod tests {
 
     #[test]
     fn test_apply_edits_not_found() {
-        assert!(apply_edits_to_normalized_content(
-            "a\nb",
-            &[Edit {
-                old_text: "z".into(),
-                new_text: "x".into()
-            }],
-            "test.txt"
-        )
-        .is_err());
+        assert!(
+            apply_edits_to_normalized_content(
+                "a\nb",
+                &[Edit {
+                    old_text: "z".into(),
+                    new_text: "x".into()
+                }],
+                "test.txt"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_apply_edits_empty_old_text() {
-        assert!(apply_edits_to_normalized_content(
-            "a\nb",
-            &[Edit {
-                old_text: "".into(),
-                new_text: "x".into()
-            }],
-            "test.txt"
-        )
-        .is_err());
+        assert!(
+            apply_edits_to_normalized_content(
+                "a\nb",
+                &[Edit {
+                    old_text: "".into(),
+                    new_text: "x".into()
+                }],
+                "test.txt"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_apply_edits_not_unique() {
-        assert!(apply_edits_to_normalized_content(
-            "a\nb\nb\nc",
-            &[Edit {
-                old_text: "b".into(),
-                new_text: "x".into()
-            }],
-            "test.txt"
-        )
-        .is_err());
+        assert!(
+            apply_edits_to_normalized_content(
+                "a\nb\nb\nc",
+                &[Edit {
+                    old_text: "b".into(),
+                    new_text: "x".into()
+                }],
+                "test.txt"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -877,10 +848,15 @@ mod tests {
         let ops = LocalEditOperations;
         let result = compute_edits_diff(
             path.to_str().unwrap(),
-            &[Edit { old_text: "hello".into(), new_text: "world".into() }],
+            &[Edit {
+                old_text: "hello".into(),
+                new_text: "world".into(),
+            }],
             dir.path().to_str().unwrap(),
             &ops,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(result.diff.contains("-│") || result.diff.contains("+│"));
         assert!(result.patch.contains("--- a/"));
@@ -899,13 +875,10 @@ mod tests {
         std::fs::write(&path, "a\nb\nc\n").unwrap();
 
         let ops = LocalEditOperations;
-        let result = compute_edit_diff(
-            path.to_str().unwrap(),
-            "b",
-            "x",
-            dir.path().to_str().unwrap(),
-            &ops,
-        ).await.unwrap();
+        let result =
+            compute_edit_diff(path.to_str().unwrap(), "b", "x", dir.path().to_str().unwrap(), &ops)
+                .await
+                .unwrap();
 
         assert!(result.patch.contains("-b"));
         assert!(result.patch.contains("+x"));
@@ -917,10 +890,14 @@ mod tests {
         let ops = LocalEditOperations;
         let err = compute_edits_diff(
             "/no/such/file.txt",
-            &[Edit { old_text: "x".into(), new_text: "y".into() }],
+            &[Edit {
+                old_text: "x".into(),
+                new_text: "y".into(),
+            }],
             "/",
             &ops,
-        ).await;
+        )
+        .await;
         assert!(err.is_err());
     }
 
@@ -931,10 +908,8 @@ mod tests {
         let file = dir.path().join("foo.txt");
         tokio::fs::write(&file, "alpha\nbeta\ngamma\n").await.unwrap();
 
-        let tool = EditTool::new(
-            dir.path().to_string_lossy().into_owned(),
-            EditToolOptions::default(),
-        );
+        let tool =
+            EditTool::new(dir.path().to_string_lossy().into_owned(), EditToolOptions::default());
 
         let updates: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let updates_clone = updates.clone();

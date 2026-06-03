@@ -1,27 +1,30 @@
-// Multi-turn chat example — keeps a single AgentContext across turns and feeds
-// each new user prompt back into run_agent_loop together with the accumulated
-// message history (assistant turns, tool calls, tool results all preserved).
+// Multi-turn chat example — uses agent-core Session + AgentHarness directly.
+//
+// This mirrors pi-mono's layering: agent-core owns the session tree and harness;
+// coding-agent only supplies coding tools and the llm-client stream bridge.
 //
 // Run with:
 //   ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic \
 //   ANTHROPIC_AUTH_TOKEN=sk-... \
 //   cargo run --example multi_turn_chat
 //
+// Optional persistence:
+//   AGENT_SESSIONS_DIR=/tmp/automata-sessions cargo run --example multi_turn_chat
+//
 // Type your message and press Enter. Type `/exit` (or Ctrl-D) to quit.
-// Type `/history` to dump the message log, `/reset` to start over.
+// Type `/history` to dump the session log, `/reset` to start over.
 
-use agent_core::agent_loop::{AgentEventSink, AgentLoop};
 use agent_core::event::AgentEvent;
-use agent_core::harness::messages::default_convert_to_llm;
-use agent_core::tool::AgentTool;
+use agent_core::harness::session::{InMemorySessionStorage, JsonlSessionRepo, Session};
+use agent_core::harness::{
+    AgentHarness, AgentHarnessOptions, HarnessConfig, HarnessEvent, StreamOptions,
+};
 use agent_core::types::{
-    AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, Model, ModelInfo, ToolExecutionMode,
+    AgentMessage, Api, ContentBlock, Model, ModelCost, ModelInfo, ThinkingLevel, ToolExecutionMode,
     Transport,
 };
 use coding_agent::stream_bridge::create_stream_fn;
-use coding_agent::tools::{BashTool, BashToolOptions, LsTool};
-use llm_client::{AnthropicProvider, AuthMethod, LlmProvider, ProviderConfig};
-use std::sync::Arc;
+use coding_agent::{Auth, ProviderBuild, build_provider, build_tools};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 fn truncate(s: &str, n: usize) -> String {
@@ -30,6 +33,179 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let end: String = s.chars().take(n).collect();
         format!("{end}…")
+    }
+}
+
+fn model(endpoint: &str, model_id: &str) -> Model {
+    Model {
+        id: model_id.to_string(),
+        name: model_id.to_string(),
+        api: Api::Anthropic,
+        provider: "deepseek".into(),
+        base_url: endpoint.to_string(),
+        reasoning: false,
+        input: vec!["text".into()],
+        cost: ModelCost::default(),
+        context_window: 128_000,
+        max_tokens: 8192,
+        ..Default::default()
+    }
+}
+
+async fn new_agent_core_session(cwd: &str) -> Session {
+    if let Ok(root) = std::env::var("AGENT_SESSIONS_DIR") {
+        let repo = JsonlSessionRepo::new(root);
+        repo.create(cwd, None, None).await.expect("create JSONL session")
+    } else {
+        Session::new(Box::new(InMemorySessionStorage::new(None)))
+    }
+}
+
+async fn build_harness(cwd: &str, endpoint: &str, token: &str, model_id: &str) -> AgentHarness {
+    let session = new_agent_core_session(cwd).await;
+    let model = model(endpoint, model_id);
+    let provider = build_provider(ProviderBuild {
+        model: &model,
+        api_key: token.to_string(),
+        base_url: Some(endpoint.to_string()),
+        auth: Auth::Bearer,
+    });
+
+    let harness = AgentHarness::new(
+        session,
+        HarnessConfig {
+            system_prompt: format!(
+                "你是一个友好的中文助手，工作目录是 {cwd}。\n\
+                 可以用 bash 在该目录下执行命令，用 ls 列目录。请保持简洁，必要时才调用工具。"
+            ),
+            thinking_level: ThinkingLevel::Off,
+            model_provider: model.provider.clone(),
+            model_id: model.id.clone(),
+        },
+        AgentHarnessOptions {
+            stream_fn: create_stream_fn(provider, model.clone()),
+            convert_to_llm: None,
+            transform_context: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            should_stop_after_turn: None,
+            prepare_next_turn: None,
+            on_payload: None,
+            on_response: None,
+        },
+    );
+
+    let tool_names = ["bash", "ls"];
+    let tools = build_tools(cwd, &tool_names);
+    harness
+        .set_tools(tools, Some(tool_names.iter().map(|name| (*name).to_string()).collect()))
+        .await
+        .expect("set active tools");
+    harness.set_model_info(ModelInfo::from(&model)).await;
+    harness
+        .set_stream_options(StreamOptions {
+            max_tokens: Some(4096),
+            temperature: Some(0.0),
+            transport: Some(Transport::Sse),
+            tool_execution: Some(ToolExecutionMode::Sequential),
+            ..Default::default()
+        })
+        .await;
+
+    harness
+}
+
+async fn subscribe_harness(harness: &AgentHarness) {
+    harness
+        .subscribe(|event, _signal| async move {
+            match event {
+                HarnessEvent::Agent(AgentEvent::MessageEnd { message }) => {
+                    if let Some(content) = message.assistant_content() {
+                        for block in content {
+                            match block {
+                                ContentBlock::Text { text } if !text.is_empty() => {
+                                    println!("[assistant] {}", truncate(text, 800));
+                                }
+                                ContentBlock::ToolCall { name, arguments, .. } => {
+                                    let args = serde_json::to_string(arguments).unwrap_or_default();
+                                    println!("[tool_call] {} {}", name, truncate(&args, 200));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                HarnessEvent::Agent(AgentEvent::ToolExecutionEnd {
+                    tool_name,
+                    result,
+                    is_error,
+                    ..
+                }) => {
+                    let summary = result
+                        .content
+                        .iter()
+                        .find_map(|block| {
+                            if let ContentBlock::Text { text } = block {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or("(no text)");
+                    let prefix = if is_error {
+                        "[tool_error]"
+                    } else {
+                        "[tool_result]"
+                    };
+                    println!("{} {}: {}", prefix, tool_name, truncate(summary, 400));
+                }
+                HarnessEvent::SavePoint => {
+                    println!("[session] save point");
+                }
+                _ => {}
+            }
+        })
+        .await;
+}
+
+fn preview_message(message: &AgentMessage) -> String {
+    match message {
+        AgentMessage::User { content, .. } => content
+            .as_blocks()
+            .iter()
+            .filter_map(|block| {
+                if let ContentBlock::Text { text } = block {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        AgentMessage::Assistant { content, .. } => content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::ToolCall { name, .. } => format!("<tool {name}>"),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        AgentMessage::ToolResult { tool_name, content, .. } => {
+            let text = content
+                .iter()
+                .filter_map(|block| {
+                    if let ContentBlock::Text { text } = block {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!("<{tool_name}: {text}>")
+        }
+        _ => serde_json::to_string(&message.to_json()).unwrap_or_default(),
     }
 }
 
@@ -43,104 +219,20 @@ async fn main() {
     let model_id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into());
 
     let endpoint = format!("{}/v1/messages", base.trim_end_matches('/'));
-    let provider: Arc<dyn LlmProvider> = Arc::new(AnthropicProvider::new(
-        ProviderConfig::new(token)
-            .with_base_url(endpoint.clone())
-            .with_auth_method(AuthMethod::Bearer),
-    ));
-
     let cwd = std::env::var("AGENT_CWD").unwrap_or_else(|_| "/tmp".into());
+    let session_mode = std::env::var("AGENT_SESSIONS_DIR")
+        .map(|root| format!("jsonl at {root}"))
+        .unwrap_or_else(|_| "in-memory".into());
 
-    println!("=== Multi-turn chat ===");
+    println!("=== Agent-core multi-turn chat ===");
     println!("model    : {model_id}");
     println!("endpoint : {endpoint}");
     println!("workdir  : {cwd}");
+    println!("session  : {session_mode}");
     println!("commands : /exit, /reset, /history\n");
 
-    let bash = Arc::new(BashTool::new(cwd.clone(), BashToolOptions::default()));
-    let ls = Arc::new(LsTool::new(cwd.clone()));
-    let tools: Vec<Arc<dyn AgentTool>> = vec![bash, ls];
-
-    let emit: AgentEventSink = Arc::new(|event: AgentEvent| {
-        Box::pin(async move {
-            match &event {
-                AgentEvent::MessageEnd { message } => {
-                    if let Some(content) = message.assistant_content() {
-                        for c in content {
-                            match c {
-                                ContentBlock::Text { text } if !text.is_empty() => {
-                                    println!("[assistant] {}", truncate(text, 800));
-                                }
-                                ContentBlock::ToolCall { name, arguments, .. } => {
-                                    let args = serde_json::to_string(arguments).unwrap_or_default();
-                                    println!("[tool_call] {} {}", name, truncate(&args, 200));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                AgentEvent::ToolExecutionEnd { tool_name, result, is_error, .. } => {
-                    let summary = result
-                        .content
-                        .iter()
-                        .find_map(|b| {
-                            if let ContentBlock::Text { text } = b {
-                                Some(text.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or("(no text)");
-                    let prefix = if *is_error {
-                        "[tool_error]"
-                    } else {
-                        "[tool_result]"
-                    };
-                    println!("{} {}: {}", prefix, tool_name, truncate(summary, 400));
-                }
-                _ => {}
-            }
-        })
-    });
-
-    let llm_model = Model {
-        id: model_id.clone(),
-        name: model_id.clone(),
-        api: agent_core::types::Api::Anthropic,
-        provider: "deepseek".into(),
-        base_url: endpoint.clone(),
-        reasoning: false,
-        input: vec!["text".into()],
-        cost: Default::default(),
-        context_window: 128_000,
-        max_tokens: 8192,
-        ..Default::default()
-    };
-    let model_info = ModelInfo::from(&llm_model);
-
-    let config = AgentLoopConfig {
-        max_tokens: Some(4096),
-        temperature: Some(0.0),
-        tool_execution: ToolExecutionMode::Sequential,
-        transport: Transport::Sse,
-        ..AgentLoopConfig::new(model_info, Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs))))
-    };
-
-    let system_prompt = format!(
-        "你是一个友好的中文助手，工作目录是 {cwd}。\n\
-         可以用 bash 在该目录下执行命令，用 ls 列目录。\n\
-         请保持简洁，必要时才调用工具。"
-    );
-
-    let make_context = || AgentContext {
-        system_prompt: system_prompt.clone(),
-        messages: vec![],
-        tools: tools.clone(),
-    };
-
-    let mut context = make_context();
-    let stream_fn = create_stream_fn(provider, llm_model);
+    let mut harness = build_harness(&cwd, &endpoint, &token, &model_id).await;
+    subscribe_harness(&harness).await;
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -152,13 +244,13 @@ async fn main() {
         let _ = std::io::stdout().flush();
 
         let line = match lines.next_line().await {
-            Ok(Some(l)) => l,
+            Ok(Some(line)) => line,
             Ok(None) => {
                 println!("\n(EOF — bye)");
                 break;
             }
-            Err(e) => {
-                eprintln!("stdin error: {e}");
+            Err(err) => {
+                eprintln!("stdin error: {err}");
                 break;
             }
         };
@@ -173,53 +265,22 @@ async fn main() {
                 break;
             }
             "/reset" => {
-                context = make_context();
+                harness = build_harness(&cwd, &endpoint, &token, &model_id).await;
+                subscribe_harness(&harness).await;
                 turn = 0;
-                println!("(history cleared)");
+                println!("(new agent-core session)");
                 continue;
             }
             "/history" => {
+                let context = harness.build_context().await.expect("history");
                 println!("--- history ({} messages) ---", context.messages.len());
-                for (i, m) in context.messages.iter().enumerate() {
-                    let preview = match m {
-                        AgentMessage::User { content, .. } => content
-                            .as_blocks()
-                            .iter()
-                            .filter_map(|b| {
-                                if let ContentBlock::Text { text } = b {
-                                    Some(text.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                        AgentMessage::Assistant { content, .. } => content
-                            .iter()
-                            .map(|c| match c {
-                                ContentBlock::Text { text } => text.clone(),
-                                ContentBlock::ToolCall { name, .. } => format!("<tool {}>", name),
-                                _ => String::new(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                        AgentMessage::ToolResult { tool_name, content, .. } => {
-                            let text = content
-                                .iter()
-                                .filter_map(|b| {
-                                    if let ContentBlock::Text { text } = b {
-                                        Some(text.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("");
-                            format!("<{}: {}>", tool_name, text)
-                        }
-                        _ => serde_json::to_string(&m.to_json()).unwrap_or_default(),
-                    };
-                    println!("  [{i}] {}: {}", m.role(), truncate(&preview, 200));
+                println!("active tools: {:?}", context.active_tool_names);
+                for (i, message) in context.messages.iter().enumerate() {
+                    println!(
+                        "  [{i}] {}: {}",
+                        message.role(),
+                        truncate(&preview_message(message), 200)
+                    );
                 }
                 continue;
             }
@@ -229,16 +290,15 @@ async fn main() {
         turn += 1;
         println!("\n--- turn {turn} ---");
 
-        let prompt = AgentMessage::user_text(user_text);
-
-        // AgentLoop::run appends the prompt to context.messages and returns the new
-        // messages from this turn (user prompt + assistant turns + tool results).
-        let new_messages = AgentLoop::new(&config, &emit, &stream_fn)
-            .run(vec![prompt], context.clone(), None)
-            .await;
-
-        context.messages.extend(new_messages);
+        if let Err(err) = harness.execute_turn(vec![AgentMessage::user_text(user_text)]).await {
+            eprintln!("turn failed: {err}");
+        }
     }
 
-    println!("\n=== session ended — {} turns, {} messages ===", turn, context.messages.len());
+    let messages = harness
+        .build_context()
+        .await
+        .map(|context| context.messages.len())
+        .unwrap_or_default();
+    println!("\n=== session ended — {} turns, {} messages ===", turn, messages);
 }

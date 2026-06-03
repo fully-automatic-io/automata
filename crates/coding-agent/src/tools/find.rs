@@ -1,4 +1,3 @@
-
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
@@ -102,10 +101,7 @@ impl AgentTool for FindTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing 'pattern' parameter")?;
 
-        let search_path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let search_path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         let limit = params
             .get("limit")
@@ -127,8 +123,9 @@ impl AgentTool for FindTool {
         }
 
         // Compile glob pattern
-        let glob_matcher = Self::compile_glob(pattern)
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<_>)?;
+        let glob_matcher = Self::compile_glob(pattern).map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)) as Box<_>
+        })?;
 
         // Check if we need full path matching
         let full_path_match = Self::needs_full_path_match(pattern);
@@ -152,9 +149,7 @@ impl AgentTool for FindTool {
             // Check for cancellation
             if signal.as_ref().is_some_and(|s| s.is_cancelled()) {
                 return Ok(AgentToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: "Search cancelled".to_string(),
-                    }],
+                    content: vec![ContentBlock::Text { text: "Search cancelled".to_string() }],
                     details: serde_json::to_value(FindToolDetails::default()).unwrap_or_default(),
                     terminate: false,
                 });
@@ -171,15 +166,10 @@ impl AgentTool for FindTool {
             }
 
             // Get relative path
-            let rel_path = entry
-                .path()
-                .strip_prefix(&base_dir)
-                .unwrap_or(entry.path());
+            let rel_path = entry.path().strip_prefix(&base_dir).unwrap_or(entry.path());
 
             // Convert to POSIX-style path (forward slashes)
-            let path_str = rel_path
-                .to_string_lossy()
-                .replace('\\', "/");
+            let path_str = rel_path.to_string_lossy().replace('\\', "/");
 
             // Add trailing slash for directories
             let display_path = if entry.file_type().is_some_and(|ft| ft.is_dir()) {
@@ -226,10 +216,7 @@ impl AgentTool for FindTool {
             let mut text = results.join("\n");
 
             if truncated {
-                text.push_str(&format!(
-                    "\n\n... (truncated at {} results)",
-                    results.len()
-                ));
+                text.push_str(&format!("\n\n... (truncated at {} results)", results.len()));
                 if results.len() < limit {
                     text.push_str(&format!(
                         "\nConsider increasing the limit parameter (current: {})",
@@ -247,7 +234,8 @@ impl AgentTool for FindTool {
                 truncated,
                 total_results: results.len(),
                 max_results: Some(limit),
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             terminate: false,
         })
     }

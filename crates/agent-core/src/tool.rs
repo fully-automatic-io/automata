@@ -1,7 +1,4 @@
-
-use crate::types::{
-    AgentToolResult, AgentToolUpdateCallback, ContentBlock, ToolExecutionMode,
-};
+use crate::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock, ToolExecutionMode};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -147,11 +144,7 @@ pub fn create_success_tool_result(
     content: Vec<ContentBlock>,
     details: serde_json::Value,
 ) -> AgentToolResult {
-    AgentToolResult {
-        content,
-        details,
-        terminate: false,
-    }
+    AgentToolResult { content, details, terminate: false }
 }
 
 /// Downcast a tool result `details` Value into a tool-specific typed struct.
@@ -176,7 +169,11 @@ pub fn validate_tool_arguments(
     let schema = tool.parameters();
 
     // If schema has no properties or is empty, skip validation
-    if schema.get("properties").and_then(|p| p.as_object()).is_none_or(|o| o.is_empty()) {
+    if schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .is_none_or(|o| o.is_empty())
+    {
         return Ok(prepared_args);
     }
 
@@ -188,11 +185,7 @@ pub fn validate_tool_arguments(
         for req in required {
             let key = req.as_str().unwrap_or("");
             if !obj.contains_key(key) {
-                return Err(format!(
-                    "Tool {}: missing required field '{}'",
-                    tool.name(),
-                    key
-                ));
+                return Err(format!("Tool {}: missing required field '{}'", tool.name(), key));
             }
         }
     }
@@ -245,9 +238,7 @@ impl ToolRegistry {
 
 impl Clone for ToolRegistry {
     fn clone(&self) -> Self {
-        Self {
-            tools: self.tools.clone(),
-        }
+        Self { tools: self.tools.clone() }
     }
 }
 
@@ -310,9 +301,7 @@ mod tests {
         ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
             *self.executed.lock().unwrap() = true;
             Ok(AgentToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("done: {}", params),
-                }],
+                content: vec![ContentBlock::Text { text: format!("done: {}", params) }],
                 details: serde_json::Value::Null,
                 terminate: false,
             })
@@ -323,12 +312,7 @@ mod tests {
     async fn test_tool_execution() {
         let tool = MockTool::new("mock");
         let result = tool
-            .execute(
-                "tc1".to_string(),
-                serde_json::json!({"input": "test"}),
-                None,
-                None,
-            )
+            .execute("tc1".to_string(), serde_json::json!({"input": "test"}), None, None)
             .await
             .unwrap();
         assert!(!result.terminate);
@@ -337,10 +321,7 @@ mod tests {
     #[test]
     fn test_validate_arguments() {
         let tool = MockTool::new("mock");
-        let result = validate_tool_arguments(
-            &tool,
-            serde_json::json!({"input": "hello"}),
-        );
+        let result = validate_tool_arguments(&tool, serde_json::json!({"input": "hello"}));
         assert!(result.is_ok());
     }
 
@@ -385,7 +366,10 @@ mod tests {
     #[test]
     fn test_downcast_details_round_trip() {
         #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-        struct MyDetails { count: u32, ok: bool }
+        struct MyDetails {
+            count: u32,
+            ok: bool,
+        }
         let original = MyDetails { count: 42, ok: true };
         let value = serde_json::to_value(&original).unwrap();
         let recovered: MyDetails = downcast_details(&value).unwrap();
@@ -395,7 +379,10 @@ mod tests {
     #[test]
     fn test_downcast_details_shape_mismatch() {
         #[derive(Debug, serde::Deserialize)]
-        struct Wanted { #[allow(dead_code)] needed_field: u32 }
+        struct Wanted {
+            #[allow(dead_code)]
+            needed_field: u32,
+        }
         let value = serde_json::json!({"unrelated": "shape"});
         assert!(downcast_details::<Wanted>(&value).is_err());
     }

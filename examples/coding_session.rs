@@ -10,8 +10,8 @@
 //   ANTHROPIC_AUTH_TOKEN=sk-... \
 //   cargo run --example coding_session
 
-use agent_core::harness::HarnessEvent;
 use agent_core::event::AgentEvent;
+use agent_core::harness::HarnessEvent;
 use agent_core::types::{Api, ContentBlock, Model, ModelCost};
 use coding_agent::{Auth, CodingAgentSession, SessionOptions};
 
@@ -68,20 +68,21 @@ async fn main() {
     session
         .subscribe(|event, _signal| async move {
             if let HarnessEvent::Agent(AgentEvent::MessageEnd { message }) = event
-                && let Some(content) = message.assistant_content() {
-                    for block in content {
-                        match block {
-                            ContentBlock::Text { text } if !text.is_empty() => {
-                                println!("[assistant] {}", truncate(text, 600));
-                            }
-                            ContentBlock::ToolCall { name, arguments, .. } => {
-                                let args = serde_json::to_string(arguments).unwrap_or_default();
-                                println!("[tool_call] {name} {}", truncate(&args, 200));
-                            }
-                            _ => {}
+                && let Some(content) = message.assistant_content()
+            {
+                for block in content {
+                    match block {
+                        ContentBlock::Text { text } if !text.is_empty() => {
+                            println!("[assistant] {}", truncate(text, 600));
                         }
+                        ContentBlock::ToolCall { name, arguments, .. } => {
+                            let args = serde_json::to_string(arguments).unwrap_or_default();
+                            println!("[tool_call] {name} {}", truncate(&args, 200));
+                        }
+                        _ => {}
                     }
                 }
+            }
         })
         .await;
 

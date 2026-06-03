@@ -18,9 +18,15 @@ struct EchoTool;
 
 #[async_trait]
 impl AgentTool for EchoTool {
-    fn name(&self) -> &str { "echo" }
-    fn label(&self) -> &str { "echo" }
-    fn description(&self) -> &str { "Echo the input back" }
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn label(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Echo the input back"
+    }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -28,10 +34,15 @@ impl AgentTool for EchoTool {
             "required": ["text"]
         })
     }
-    fn execution_mode(&self) -> Option<ToolExecutionMode> { None }
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        None
+    }
     async fn execute(
-        &self, _id: String, params: serde_json::Value,
-        _signal: Option<CancellationToken>, _on_update: Option<AgentToolUpdateCallback>,
+        &self,
+        _id: String,
+        params: serde_json::Value,
+        _signal: Option<CancellationToken>,
+        _on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let text = params["text"].as_str().unwrap_or("").to_string();
         Ok(AgentToolResult {
@@ -49,13 +60,17 @@ fn make_mock_stream_fn() -> StreamFn {
             let stream2 = stream.clone();
             tokio::spawn(async move {
                 use agent_core::event::{PartialAssistantMessage, PartialContentBlock};
-                let mut partial = PartialAssistantMessage::new(agent_core::types::Api::Mock, "mock", "mock-1");
+                let mut partial =
+                    PartialAssistantMessage::new(agent_core::types::Api::Mock, "mock", "mock-1");
                 stream2.push(AssistantMessageEvent::Start { partial: partial.clone() });
                 partial.content.push(PartialContentBlock::Text {
                     text: String::new(),
                     text_signature: None,
                 });
-                stream2.push(AssistantMessageEvent::TextStart { content_index: 0, partial: partial.clone() });
+                stream2.push(AssistantMessageEvent::TextStart {
+                    content_index: 0,
+                    partial: partial.clone(),
+                });
                 if let Some(PartialContentBlock::Text { text, .. }) = partial.content.get_mut(0) {
                     text.push_str("Hello from the mock LLM!");
                 }
@@ -77,7 +92,13 @@ fn make_mock_stream_fn() -> StreamFn {
                 stream2.end(final_msg);
             });
             Ok(stream)
-        }) as Pin<Box<dyn std::future::Future<Output = Result<AssistantMessageEventStream, String>> + Send>>
+        })
+            as Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<AssistantMessageEventStream, String>>
+                        + Send,
+                >,
+            >
     })
 }
 
@@ -95,10 +116,12 @@ async fn main() {
                 AgentEvent::AgentEnd { messages } => format!("agent_end ({} msgs)", messages.len()),
                 AgentEvent::TurnStart => "turn_start".to_string(),
                 AgentEvent::TurnEnd { .. } => "turn_end".to_string(),
-                AgentEvent::MessageStart { message } =>
-                    format!("message_start role={}", message.role()),
-                AgentEvent::MessageEnd { message } =>
-                    format!("message_end role={}", message.role()),
+                AgentEvent::MessageStart { message } => {
+                    format!("message_start role={}", message.role())
+                }
+                AgentEvent::MessageEnd { message } => {
+                    format!("message_end role={}", message.role())
+                }
                 _ => return,
             };
             log.lock().await.push(label);
@@ -117,10 +140,8 @@ async fn main() {
         max_tokens: 4096,
     };
 
-    let config = AgentLoopConfig::new(
-        model,
-        Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs))),
-    );
+    let config =
+        AgentLoopConfig::new(model, Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs))));
 
     let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(EchoTool)];
     let context = AgentContext {

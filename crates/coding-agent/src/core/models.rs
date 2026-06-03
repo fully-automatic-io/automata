@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
-pub const DEFAULT_AGENT_DIR: &str = ".automata";
-pub const DEFAULT_SESSIONS_DIR: &str = ".automata/sessions";
+pub const DEFAULT_AGENT_DIR: &str = ".automata/agent";
+pub const DEFAULT_SESSIONS_DIR: &str = ".automata/agent/sessions";
 pub const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16384;
 pub const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20000;
 

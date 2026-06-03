@@ -1,4 +1,3 @@
-
 use crate::provider::{LlmError, LlmProvider, LlmStream, ProviderConfig};
 use crate::streaming::{Delta, LlmEvent};
 use crate::types::{
@@ -34,19 +33,22 @@ impl OpenAIProvider {
     }
 
     fn build_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
-        let messages: Vec<serde_json::Value> = request.messages.iter()
-            .filter_map(convert_message)
-            .collect();
+        let messages: Vec<serde_json::Value> =
+            request.messages.iter().filter_map(convert_message).collect();
 
-        let tools: Vec<serde_json::Value> = request.tools.iter()
-            .map(|t| json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema,
-                }
-            }))
+        let tools: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
+            })
             .collect();
 
         let mut body = json!({
@@ -87,27 +89,31 @@ impl OpenAIProvider {
         //     `cache_control: {type: "ephemeral", ttl?: "1h"}` on system / last
         //     tool / last user message
         if let Some(retention) = request.cache_retention
-            && retention != CacheRetention::None {
-                let use_anthropic_style = request
-                    .openai_options()
-                    .and_then(|o| o.anthropic_cache_control)
-                    .unwrap_or(false);
-                if use_anthropic_style {
-                    let cache_control = match retention {
-                        CacheRetention::Long => json!({"type": "ephemeral", "ttl": "1h"}),
-                        CacheRetention::Short => json!({"type": "ephemeral"}),
-                        CacheRetention::None => json!(null),
-                    };
-                    apply_anthropic_cache_control(&mut body, &cache_control);
-                } else if retention == CacheRetention::Long {
-                    body["prompt_cache_retention"] = json!("24h");
-                }
+            && retention != CacheRetention::None
+        {
+            let use_anthropic_style = request
+                .openai_options()
+                .and_then(|o| o.anthropic_cache_control)
+                .unwrap_or(false);
+            if use_anthropic_style {
+                let cache_control = match retention {
+                    CacheRetention::Long => json!({"type": "ephemeral", "ttl": "1h"}),
+                    CacheRetention::Short => json!({"type": "ephemeral"}),
+                    CacheRetention::None => json!(null),
+                };
+                apply_anthropic_cache_control(&mut body, &cache_control);
+            } else if retention == CacheRetention::Long {
+                body["prompt_cache_retention"] = json!("24h");
             }
+        }
 
         body
     }
 
-    async fn send_with_retry(&self, body: serde_json::Value) -> Result<reqwest::Response, LlmError> {
+    async fn send_with_retry(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response, LlmError> {
         use crate::retry::{format_http_error, retry_delay, should_retry};
         let mut last_err: Option<LlmError> = None;
         for attempt in 0..=self.config.max_retries {
@@ -118,28 +124,37 @@ impl OpenAIProvider {
                 };
                 tokio::time::sleep(retry_delay(attempt - 1, 500, Some(30_000), after)).await;
             }
-            let resp = self.client
+            let resp = self
+                .client
                 .post(self.base_url())
                 .bearer_auth(&self.config.api_key)
                 .json(&body)
-                .send().await;
+                .send()
+                .await;
 
             match resp {
                 Ok(r) if r.status().is_success() => return Ok(r),
                 Ok(r) => {
                     let status = r.status().as_u16();
                     if status == 429 {
-                        let secs = r.headers().get("retry-after")
+                        let secs = r
+                            .headers()
+                            .get("retry-after")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(5);
                         last_err = Some(LlmError::RateLimit { retry_after_secs: secs });
                         continue;
                     }
-                    if status == 401 { return Err(LlmError::AuthError); }
+                    if status == 401 {
+                        return Err(LlmError::AuthError);
+                    }
                     let body = r.text().await.unwrap_or_default();
                     // Prefix status onto message body so the retry layer (and callers) can match (52e13870).
-                    let err = LlmError::Http { status, message: format_http_error(status, &body) };
+                    let err = LlmError::Http {
+                        status,
+                        message: format_http_error(status, &body),
+                    };
                     if should_retry(&err) {
                         last_err = Some(err);
                         continue;
@@ -186,9 +201,10 @@ fn apply_anthropic_cache_control(body: &mut serde_json::Value, cache_control: &s
     // 3. Last tool definition.
     if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut())
         && let Some(last) = tools.last_mut()
-            && let Some(obj) = last.as_object_mut() {
-                obj.insert("cache_control".into(), cache_control.clone());
-            }
+        && let Some(obj) = last.as_object_mut()
+    {
+        obj.insert("cache_control".into(), cache_control.clone());
+    }
 }
 
 /// Attach `cache_control` to the last text part of a message, promoting flat
@@ -210,9 +226,10 @@ fn attach_cache_to_text_content(msg: &mut serde_json::Value, cache_control: &ser
         });
         let idx = last_text_idx.or_else(|| arr.len().checked_sub(1));
         if let Some(i) = idx
-            && let Some(obj) = arr[i].as_object_mut() {
-                obj.insert("cache_control".into(), cache_control.clone());
-            }
+            && let Some(obj) = arr[i].as_object_mut()
+        {
+            obj.insert("cache_control".into(), cache_control.clone());
+        }
     }
 }
 
@@ -227,11 +244,19 @@ fn convert_message(msg: &LlmMessage) -> Option<serde_json::Value> {
             // place for prior `thinking` blocks. We drop them on replay. If the
             // remaining content is empty (model produced thinking-only), skip the
             // message entirely so the endpoint doesn't reject it.
-            let text: String = content.iter()
-                .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None })
+            let text: String = content
+                .iter()
+                .filter_map(|p| {
+                    if let ContentPart::Text { text } = p {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("");
-            let tool_calls: Vec<serde_json::Value> = content.iter()
+            let tool_calls: Vec<serde_json::Value> = content
+                .iter()
                 .filter_map(|p| {
                     if let ContentPart::ToolCall { id, name, arguments } = p {
                         Some(json!({
@@ -239,7 +264,9 @@ fn convert_message(msg: &LlmMessage) -> Option<serde_json::Value> {
                             "type": "function",
                             "function": {"name": name, "arguments": arguments.to_string()}
                         }))
-                    } else { None }
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             if text.is_empty() && tool_calls.is_empty() {
@@ -252,8 +279,15 @@ fn convert_message(msg: &LlmMessage) -> Option<serde_json::Value> {
             }
         }
         LlmMessage::ToolResult { tool_call_id, content, is_error: _, .. } => {
-            let text = content.iter()
-                .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None })
+            let text = content
+                .iter()
+                .filter_map(|p| {
+                    if let ContentPart::Text { text } = p {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("");
             Some(json!({"role": "tool", "tool_call_id": tool_call_id, "content": text}))
@@ -266,8 +300,15 @@ fn convert_message(msg: &LlmMessage) -> Option<serde_json::Value> {
 fn extract_text(content: &MessageContent) -> String {
     match content {
         MessageContent::String(s) => s.clone(),
-        MessageContent::Blocks(blocks) => blocks.iter()
-            .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None })
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|p| {
+                if let ContentPart::Text { text } = p {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>()
             .join(""),
     }
@@ -312,21 +353,25 @@ impl LlmProvider for OpenAIProvider {
             completion_tokens: u64,
         }
 
-        let api_resp: ApiResponse = resp.json().await
-            .map_err(|e| LlmError::SerializationError(e.to_string()))?;
+        let api_resp: ApiResponse =
+            resp.json().await.map_err(|e| LlmError::SerializationError(e.to_string()))?;
 
-        let choice = api_resp.choices.into_iter().next()
+        let choice = api_resp
+            .choices
+            .into_iter()
+            .next()
             .ok_or_else(|| LlmError::InvalidRequest("No choices".to_string()))?;
 
         let mut content = vec![];
         if let Some(text) = choice.message.content
-            && !text.is_empty() {
-                content.push(ContentPart::Text { text });
-            }
+            && !text.is_empty()
+        {
+            content.push(ContentPart::Text { text });
+        }
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in tool_calls {
-                let input = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or(serde_json::Value::Null);
+                let input =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
                 content.push(ContentPart::ToolCall {
                     id: tc.id,
                     name: tc.function.name,
@@ -408,11 +453,15 @@ mod tests {
         r.cache_retention = Some(CacheRetention::Long);
         let body = provider().build_body(&r, false);
         assert_eq!(body["prompt_cache_retention"], "24h");
-        assert!(body.get("messages").and_then(|m| m.as_array())
-            .and_then(|a| a.first())
-            .and_then(|m| m.get("content"))
-            .map(|c| c.is_string())
-            .unwrap_or(false), "native cache must not promote content shape");
+        assert!(
+            body.get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.get("content"))
+                .map(|c| c.is_string())
+                .unwrap_or(false),
+            "native cache must not promote content shape"
+        );
     }
 
     #[test]
@@ -436,9 +485,8 @@ mod tests {
     fn cache_long_anthropic_style_inline_control() {
         let mut r = req("deepseek-chat");
         r.cache_retention = Some(CacheRetention::Long);
-        r.provider_options = Some(ProviderOptions::Openai(OpenaiOptions {
-            anthropic_cache_control: Some(true),
-        }));
+        r.provider_options =
+            Some(ProviderOptions::Openai(OpenaiOptions { anthropic_cache_control: Some(true) }));
         let body = provider().build_body(&r, false);
         assert!(body.get("prompt_cache_retention").is_none());
         // Last user message should now be an array with a `cache_control` part.
@@ -453,9 +501,8 @@ mod tests {
     fn cache_short_anthropic_style_no_ttl() {
         let mut r = req("deepseek-chat");
         r.cache_retention = Some(CacheRetention::Short);
-        r.provider_options = Some(ProviderOptions::Openai(OpenaiOptions {
-            anthropic_cache_control: Some(true),
-        }));
+        r.provider_options =
+            Some(ProviderOptions::Openai(OpenaiOptions { anthropic_cache_control: Some(true) }));
         let body = provider().build_body(&r, false);
         let messages = body["messages"].as_array().unwrap();
         let last = messages.last().unwrap();
@@ -468,18 +515,20 @@ mod tests {
     fn cache_anthropic_style_attaches_to_last_tool() {
         let mut r = req("deepseek-chat");
         r.cache_retention = Some(CacheRetention::Long);
-        r.tools = vec![crate::types::ToolDefinition {
-            name: "first".into(),
-            description: "f".into(),
-            input_schema: serde_json::json!({}),
-        }, crate::types::ToolDefinition {
-            name: "second".into(),
-            description: "s".into(),
-            input_schema: serde_json::json!({}),
-        }];
-        r.provider_options = Some(ProviderOptions::Openai(OpenaiOptions {
-            anthropic_cache_control: Some(true),
-        }));
+        r.tools = vec![
+            crate::types::ToolDefinition {
+                name: "first".into(),
+                description: "f".into(),
+                input_schema: serde_json::json!({}),
+            },
+            crate::types::ToolDefinition {
+                name: "second".into(),
+                description: "s".into(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        r.provider_options =
+            Some(ProviderOptions::Openai(OpenaiOptions { anthropic_cache_control: Some(true) }));
         let body = provider().build_body(&r, false);
         let tools = body["tools"].as_array().unwrap();
         assert!(tools[0].get("cache_control").is_none(), "first tool unchanged");

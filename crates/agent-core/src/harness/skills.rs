@@ -67,38 +67,43 @@ pub struct Skill {
 /// Load skills from a directory by scanning for *.md files with YAML frontmatter.
 pub fn load_skills_from_dir(dir: &std::path::Path) -> Vec<Skill> {
     let mut skills = vec![];
-    let Ok(entries) = std::fs::read_dir(dir) else { return skills; };
-    let mut paths: Vec<_> = entries.flatten()
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return skills;
+    };
+    let mut paths: Vec<_> = entries
+        .flatten()
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
         .map(|e| e.path())
         .collect();
     paths.sort();
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(&path)
-            && let Some(skill) = parse_skill_file(&content, &path.to_string_lossy()) {
-                skills.push(skill);
-            }
+            && let Some(skill) = parse_skill_file(&content, &path.to_string_lossy())
+        {
+            skills.push(skill);
+        }
     }
     skills
 }
 
 fn parse_skill_file(content: &str, file_path: &str) -> Option<Skill> {
     let (fm, body) = parse_frontmatter(content);
-    let name = fm.get("name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            let p = std::path::Path::new(file_path);
-            p.parent()
-                .and_then(|d| d.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-        })?;
+    let name = fm.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| {
+        let p = std::path::Path::new(file_path);
+        p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string())
+    })?;
     let description = fm.get("description").and_then(|v| v.as_str())?.to_string();
-    if description.trim().is_empty() { return None; }
-    let disable = fm.get("disable-model-invocation")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    Some(Skill { name, description, content: body.to_string(), file_path: file_path.to_string(), disable_model_invocation: disable })
+    if description.trim().is_empty() {
+        return None;
+    }
+    let disable = fm.get("disable-model-invocation").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(Skill {
+        name,
+        description,
+        content: body.to_string(),
+        file_path: file_path.to_string(),
+        disable_model_invocation: disable,
+    })
 }
 
 fn parse_frontmatter(content: &str) -> (serde_json::Map<String, Value>, &str) {
@@ -109,10 +114,20 @@ fn parse_frontmatter(content: &str) -> (serde_json::Map<String, Value>, &str) {
     let rest = &normalized[3..];
     let end = rest.find("\n---").unwrap_or(rest.len());
     let yaml_str = &rest[..end];
-    let body = if end + 4 < rest.len() { rest[end + 4..].trim() } else { "" };
+    let body = if end + 4 < rest.len() {
+        rest[end + 4..].trim()
+    } else {
+        ""
+    };
     let map = serde_yaml::from_str::<serde_json::Value>(yaml_str)
         .ok()
-        .and_then(|v| if let Value::Object(m) = v { Some(m) } else { None })
+        .and_then(|v| {
+            if let Value::Object(m) = v {
+                Some(m)
+            } else {
+                None
+            }
+        })
         .unwrap_or_default();
     (map, body)
 }

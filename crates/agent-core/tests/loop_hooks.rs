@@ -1,7 +1,9 @@
 // Tests for the agent loop's per-turn hook ordering and prepare_next_turn
 // config-snapshot semantics (pi-mono agent-loop.ts:218-251 parity).
 
-use agent_core::agent_loop::{AgentEventSink, AgentLoop, AssistantMessageEventStream, StreamFn, StreamFnInput};
+use agent_core::agent_loop::{
+    AgentEventSink, AgentLoop, AssistantMessageEventStream, StreamFn, StreamFnInput,
+};
 use agent_core::event::{AgentEvent, EventStream};
 use agent_core::types::{
     AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, ModelInfo, PrepareNextTurnContext,
@@ -48,7 +50,11 @@ fn recording_stream_fn(seen_models: Arc<Mutex<Vec<String>>>) -> StreamFn {
 }
 
 fn model(id: &str) -> ModelInfo {
-    ModelInfo { id: id.into(), provider: "p".into(), ..Default::default() }
+    ModelInfo {
+        id: id.into(),
+        provider: "p".into(),
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -58,17 +64,26 @@ async fn prepare_next_turn_switches_model_for_next_turn() {
     struct Noop;
     #[async_trait::async_trait]
     impl AgentTool for Noop {
-        fn name(&self) -> &str { "noop" }
-        fn label(&self) -> &str { "noop" }
-        fn description(&self) -> &str { "noop" }
-        fn parameters(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn label(&self) -> &str {
+            "noop"
+        }
+        fn description(&self) -> &str {
+            "noop"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
         async fn execute(
             &self,
             _id: String,
             _args: serde_json::Value,
             _signal: Option<tokio_util::sync::CancellationToken>,
             _on_update: Option<agent_core::types::AgentToolUpdateCallback>,
-        ) -> Result<agent_core::types::AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<agent_core::types::AgentToolResult, Box<dyn std::error::Error + Send + Sync>>
+        {
             Ok(agent_core::types::AgentToolResult {
                 content: vec![ContentBlock::Text { text: "ok".into() }],
                 details: serde_json::Value::Null,
@@ -81,15 +96,20 @@ async fn prepare_next_turn_switches_model_for_next_turn() {
     let stream_fn = recording_stream_fn(seen.clone());
 
     // prepare_next_turn switches the model to "model-b" after the first turn.
-    let prepare: agent_core::types::PrepareNextTurnFn = Arc::new(|_ctx: PrepareNextTurnContext, _sig| {
-        Box::pin(async move {
-            Some(TurnUpdate {
-                model: Some(ModelInfo { id: "model-b".into(), provider: "p".into(), ..Default::default() }),
-                thinking_level: Some(ThinkingLevel::High),
-                ..Default::default()
+    let prepare: agent_core::types::PrepareNextTurnFn =
+        Arc::new(|_ctx: PrepareNextTurnContext, _sig| {
+            Box::pin(async move {
+                Some(TurnUpdate {
+                    model: Some(ModelInfo {
+                        id: "model-b".into(),
+                        provider: "p".into(),
+                        ..Default::default()
+                    }),
+                    thinking_level: Some(ThinkingLevel::High),
+                    ..Default::default()
+                })
             })
-        })
-    });
+        });
 
     let config = AgentLoopConfig {
         prepare_next_turn: Some(prepare),
@@ -121,23 +141,33 @@ async fn should_stop_after_turn_exits_immediately() {
 
     // Stop right after the first turn — even though that turn has a tool call,
     // the loop must not run a second LLM turn.
-    let stop: agent_core::types::ShouldStopAfterTurnFn = Arc::new(|_ctx, _sig| Box::pin(async { true }));
+    let stop: agent_core::types::ShouldStopAfterTurnFn =
+        Arc::new(|_ctx, _sig| Box::pin(async { true }));
 
     use agent_core::tool::AgentTool;
     struct Noop;
     #[async_trait::async_trait]
     impl AgentTool for Noop {
-        fn name(&self) -> &str { "noop" }
-        fn label(&self) -> &str { "noop" }
-        fn description(&self) -> &str { "noop" }
-        fn parameters(&self) -> serde_json::Value { serde_json::json!({"type":"object"}) }
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn label(&self) -> &str {
+            "noop"
+        }
+        fn description(&self) -> &str {
+            "noop"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
         async fn execute(
             &self,
             _id: String,
             _args: serde_json::Value,
             _signal: Option<tokio_util::sync::CancellationToken>,
             _on_update: Option<agent_core::types::AgentToolUpdateCallback>,
-        ) -> Result<agent_core::types::AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<agent_core::types::AgentToolResult, Box<dyn std::error::Error + Send + Sync>>
+        {
             Ok(agent_core::types::AgentToolResult {
                 content: vec![ContentBlock::Text { text: "ok".into() }],
                 details: serde_json::Value::Null,
@@ -161,5 +191,9 @@ async fn should_stop_after_turn_exits_immediately() {
         .run(vec![AgentMessage::user_text("hi")], context, None)
         .await;
 
-    assert_eq!(seen.lock().unwrap().len(), 1, "should_stop_after_turn must end the run after one turn");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "should_stop_after_turn must end the run after one turn"
+    );
 }

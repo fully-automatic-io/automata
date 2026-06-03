@@ -1,4 +1,3 @@
-
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
@@ -80,10 +79,7 @@ impl AgentTool for LsTool {
         _signal: Option<CancellationToken>,
         _on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         let limit = params
             .get("limit")
@@ -129,18 +125,13 @@ impl AgentTool for LsTool {
             };
 
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry
-                .file_type()
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
 
             entries.push((name, is_dir));
         }
 
         // Sort entries alphabetically (case-insensitive)
-        entries.sort_by(|a, b| {
-            a.0.to_lowercase().cmp(&b.0.to_lowercase())
-        });
+        entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
 
         // Apply limits and format
         let mut result_lines: Vec<String> = Vec::new();
@@ -195,7 +186,8 @@ impl AgentTool for LsTool {
                 total_entries: entries.len(),
                 displayed_entries: Some(result_lines.len()),
                 max_entries: Some(limit),
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             terminate: false,
         })
     }

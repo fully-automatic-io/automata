@@ -1,4 +1,3 @@
-
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
@@ -24,21 +23,30 @@ pub struct ImageDimensions {
 #[serde(untagged)]
 pub enum ReadToolDetails {
     Image {
-        #[serde(rename = "originalDimensions")] original_dimensions: ImageDimensions,
-        #[serde(rename = "finalDimensions")] final_dimensions: ImageDimensions,
+        #[serde(rename = "originalDimensions")]
+        original_dimensions: ImageDimensions,
+        #[serde(rename = "finalDimensions")]
+        final_dimensions: ImageDimensions,
         resized: bool,
-        #[serde(rename = "mimeType")] mime_type: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
     },
     FirstLineTooLong {
-        #[serde(rename = "firstLineExceedsLimit")] first_line_exceeds_limit: bool,
-        #[serde(rename = "firstLineBytes")] first_line_bytes: usize,
+        #[serde(rename = "firstLineExceedsLimit")]
+        first_line_exceeds_limit: bool,
+        #[serde(rename = "firstLineBytes")]
+        first_line_bytes: usize,
     },
     Text {
         truncated: bool,
-        #[serde(rename = "totalLines")] total_lines: usize,
-        #[serde(rename = "outputLines")] output_lines: usize,
-        #[serde(rename = "startLine")] start_line: usize,
-        #[serde(rename = "endLine")] end_line: usize,
+        #[serde(rename = "totalLines")]
+        total_lines: usize,
+        #[serde(rename = "outputLines")]
+        output_lines: usize,
+        #[serde(rename = "startLine")]
+        start_line: usize,
+        #[serde(rename = "endLine")]
+        end_line: usize,
     },
 }
 
@@ -155,7 +163,6 @@ pub struct ReadToolOptions {
     pub operations: Option<Arc<dyn ReadOperations>>,
 }
 
-
 pub struct ReadTool {
     cwd: String,
     operations: Arc<dyn ReadOperations>,
@@ -179,8 +186,8 @@ impl ReadTool {
 
     /// Resize image if it exceeds max dimensions
     async fn resize_image_if_needed(data: &[u8]) -> Result<Vec<u8>, String> {
-        let img = image::load_from_memory(data)
-            .map_err(|e| format!("Failed to decode image: {}", e))?;
+        let img =
+            image::load_from_memory(data).map_err(|e| format!("Failed to decode image: {}", e))?;
 
         let (width, height) = (img.width(), img.height());
 
@@ -198,25 +205,36 @@ impl ReadTool {
 
         // Encode back to PNG
         let mut buffer = Vec::new();
-        resized.write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Png)
+        resized
+            .write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Png)
             .map_err(|e| format!("Failed to encode resized image: {}", e))?;
 
         Ok(buffer)
     }
 
     /// Read image and return as base64-encoded content block
-    async fn read_image(&self, _path: &str, absolute_path: &str) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn read_image(
+        &self,
+        _path: &str,
+        absolute_path: &str,
+    ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
         // Read image data
-        let data = self.operations.read_file(absolute_path).await
+        let data = self
+            .operations
+            .read_file(absolute_path)
+            .await
             .map_err(|e| format!("Failed to read image: {}", e))?;
 
         // Detect MIME type
-        let mime_type = self.operations.detect_image_mime_type(absolute_path).await?
+        let mime_type = self
+            .operations
+            .detect_image_mime_type(absolute_path)
+            .await?
             .unwrap_or_else(|| "image/png".to_string());
 
         // Get original dimensions
-        let img = image::load_from_memory(&data)
-            .map_err(|e| format!("Failed to decode image: {}", e))?;
+        let img =
+            image::load_from_memory(&data).map_err(|e| format!("Failed to decode image: {}", e))?;
         let (orig_width, orig_height) = (img.width(), img.height());
 
         // Resize if needed
@@ -244,8 +262,12 @@ impl ReadTool {
             content.push(ContentBlock::Text {
                 text: format!(
                     "\n<!-- Image resized from {}x{} to {}x{} (max {}x{}) -->",
-                    orig_width, orig_height, final_width, final_height,
-                    MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION
+                    orig_width,
+                    orig_height,
+                    final_width,
+                    final_height,
+                    MAX_IMAGE_DIMENSION,
+                    MAX_IMAGE_DIMENSION
                 ),
             });
         } else {
@@ -261,14 +283,23 @@ impl ReadTool {
                 final_dimensions: ImageDimensions { width: final_width, height: final_height },
                 resized,
                 mime_type: mime_type.to_string(),
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             terminate: false,
         })
     }
 
     /// Read text file with offset/limit support
-    async fn read_text(&self, absolute_path: &str, offset: usize, limit: Option<u64>) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let buffer = self.operations.read_file(absolute_path).await
+    async fn read_text(
+        &self,
+        absolute_path: &str,
+        offset: usize,
+        limit: Option<u64>,
+    ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        let buffer = self
+            .operations
+            .read_file(absolute_path)
+            .await
             .map_err(|e| Box::new(std::io::Error::other(e)) as Box<_>)?;
 
         let text = String::from_utf8_lossy(&buffer).to_string();
@@ -304,7 +335,8 @@ impl ReadTool {
                 details: serde_json::to_value(ReadToolDetails::FirstLineTooLong {
                     first_line_exceeds_limit: true,
                     first_line_bytes: all_lines[start].len(),
-                }).unwrap_or_default(),
+                })
+                .unwrap_or_default(),
                 terminate: false,
             });
         }
@@ -333,7 +365,8 @@ impl ReadTool {
                 output_lines: truncation.output_lines,
                 start_line: start + 1,
                 end_line: start + truncation.output_lines,
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             terminate: false,
         })
     }
@@ -381,16 +414,11 @@ impl AgentTool for ReadTool {
         _signal: Option<CancellationToken>,
         _on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let path = params.get("path")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'path' parameter")?;
+        let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing 'path' parameter")?;
 
-        let offset = params.get("offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
+        let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
 
-        let limit = params.get("limit")
-            .and_then(|v| v.as_u64());
+        let limit = params.get("limit").and_then(|v| v.as_u64());
 
         // Resolve absolute path — try macOS filename variants if the canonical
         // path doesn't exist (screenshot AM/PM space, NFD, curly quotes).
@@ -399,8 +427,9 @@ impl AgentTool for ReadTool {
             .into_owned();
 
         // Check file exists and is accessible
-        self.operations.access(&absolute_path).await
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<_>)?;
+        self.operations.access(&absolute_path).await.map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<_>
+        })?;
 
         // Check if it's an image
         if Self::is_image(&absolute_path) {

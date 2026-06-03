@@ -1,5 +1,5 @@
 use crate::harness::env::native::{EnvError, NativeEnv};
-use crate::harness::utils::truncate::{truncate_tail, DEFAULT_MAX_BYTES};
+use crate::harness::utils::truncate::{DEFAULT_MAX_BYTES, truncate_tail};
 use tokio_util::sync::CancellationToken;
 
 pub struct ShellCaptureResult {
@@ -11,10 +11,15 @@ pub struct ShellCaptureResult {
 }
 
 pub fn sanitize_binary_output(s: &str) -> String {
-    s.chars().filter(|&c| {
-        let code = c as u32;
-        code == 0x09 || code == 0x0a || code == 0x0d || (code > 0x1f && !(0xfff9..=0xfffb).contains(&code))
-    }).collect()
+    s.chars()
+        .filter(|&c| {
+            let code = c as u32;
+            code == 0x09
+                || code == 0x0a
+                || code == 0x0d
+                || (code > 0x1f && !(0xfff9..=0xfffb).contains(&code))
+        })
+        .collect()
 }
 
 pub async fn execute_shell_with_capture(
@@ -28,28 +33,25 @@ pub async fn execute_shell_with_capture(
     let result = env.exec(command, cwd, extra_env, timeout_secs, cancel).await;
 
     match result {
-        Err(EnvError::Aborted) => {
-            Ok(ShellCaptureResult {
-                output: String::new(),
-                exit_code: None,
-                cancelled: true,
-                truncated: false,
-                full_output_path: None,
-            })
-        }
-        Err(EnvError::Timeout(_)) => {
-            Ok(ShellCaptureResult {
-                output: String::new(),
-                exit_code: None,
-                cancelled: true,
-                truncated: false,
-                full_output_path: None,
-            })
-        }
+        Err(EnvError::Aborted) => Ok(ShellCaptureResult {
+            output: String::new(),
+            exit_code: None,
+            cancelled: true,
+            truncated: false,
+            full_output_path: None,
+        }),
+        Err(EnvError::Timeout(_)) => Ok(ShellCaptureResult {
+            output: String::new(),
+            exit_code: None,
+            cancelled: true,
+            truncated: false,
+            full_output_path: None,
+        }),
         Err(e) => Err(e),
         Ok(exec_result) => {
-            let combined = sanitize_binary_output(&format!("{}{}", exec_result.stdout, exec_result.stderr))
-                .replace('\r', "");
+            let combined =
+                sanitize_binary_output(&format!("{}{}", exec_result.stdout, exec_result.stderr))
+                    .replace('\r', "");
             let trunc = truncate_tail(&combined, DEFAULT_MAX_BYTES / 4, DEFAULT_MAX_BYTES);
 
             let full_output_path = if trunc.truncated {
@@ -65,7 +67,11 @@ pub async fn execute_shell_with_capture(
             };
 
             Ok(ShellCaptureResult {
-                output: if trunc.truncated { trunc.content } else { combined },
+                output: if trunc.truncated {
+                    trunc.content
+                } else {
+                    combined
+                },
                 exit_code: Some(exec_result.exit_code),
                 cancelled: false,
                 truncated: trunc.truncated,

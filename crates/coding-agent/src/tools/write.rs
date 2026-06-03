@@ -1,4 +1,3 @@
-
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
@@ -36,9 +35,7 @@ pub struct LocalWriteOperations;
 #[async_trait]
 impl WriteOperations for LocalWriteOperations {
     async fn write_file(&self, path: &str, content: &str) -> Result<(), String> {
-        tokio::fs::write(path, content)
-            .await
-            .map_err(|e| e.to_string())
+        tokio::fs::write(path, content).await.map_err(|e| e.to_string())
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
@@ -46,9 +43,7 @@ impl WriteOperations for LocalWriteOperations {
     }
 
     async fn mkdir(&self, dir: &str) -> Result<(), String> {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| e.to_string())
+        tokio::fs::create_dir_all(dir).await.map_err(|e| e.to_string())
     }
 
     async fn exists(&self, path: &str) -> bool {
@@ -109,7 +104,6 @@ pub struct WriteToolOptions {
     pub operations: Option<Arc<dyn WriteOperations>>,
 }
 
-
 pub struct WriteTool {
     cwd: String,
     operations: Arc<dyn WriteOperations>,
@@ -117,23 +111,15 @@ pub struct WriteTool {
 
 impl WriteTool {
     pub fn new(cwd: String, options: WriteToolOptions) -> Self {
-        let ops = options
-            .operations
-            .unwrap_or_else(|| Arc::new(LocalWriteOperations));
-        Self {
-            cwd,
-            operations: ops,
-        }
+        let ops = options.operations.unwrap_or_else(|| Arc::new(LocalWriteOperations));
+        Self { cwd, operations: ops }
     }
 
     fn resolve_path(&self, path: &str) -> String {
         if Path::new(path).is_absolute() {
             path.to_string()
         } else {
-            Path::new(&self.cwd)
-                .join(path)
-                .to_string_lossy()
-                .to_string()
+            Path::new(&self.cwd).join(path).to_string_lossy().to_string()
         }
     }
 }
@@ -176,10 +162,7 @@ impl AgentTool for WriteTool {
         _signal: Option<CancellationToken>,
         on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'path' parameter")?;
+        let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing 'path' parameter")?;
 
         let content = params
             .get("content")
@@ -214,8 +197,11 @@ impl AgentTool for WriteTool {
         if contains_emojis(content) {
             let filtered = filter_emojis(content);
             if filtered != content {
-                warnings.push("Note: Emojis were filtered from the content. \
-                    If you need emojis, please explicitly mention it in your request.".to_string());
+                warnings.push(
+                    "Note: Emojis were filtered from the content. \
+                    If you need emojis, please explicitly mention it in your request."
+                        .to_string(),
+                );
                 final_content = filtered;
             }
         }
@@ -232,9 +218,7 @@ impl AgentTool for WriteTool {
         // Emit streaming partial: full content preview before disk write hits.
         if let Some(cb) = on_update.as_ref() {
             let partial = AgentToolResult {
-                content: vec![ContentBlock::Text {
-                    text: final_content.clone(),
-                }],
+                content: vec![ContentBlock::Text { text: final_content.clone() }],
                 details: serde_json::to_value(WriteToolDetails {
                     bytes: final_content.len(),
                     file_exists,
@@ -252,25 +236,17 @@ impl AgentTool for WriteTool {
             self.operations
                 .mkdir(&parent.to_string_lossy())
                 .await
-                .map_err(|e| {
-                    Box::new(std::io::Error::other(e)) as Box<_>
-                })?;
+                .map_err(|e| Box::new(std::io::Error::other(e)) as Box<_>)?;
         }
 
         // Write file
         self.operations
             .write_file(&absolute_path, &final_content)
             .await
-            .map_err(|e| {
-                Box::new(std::io::Error::other(e)) as Box<_>
-            })?;
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<_>)?;
 
         // Build result message
-        let mut message = format!(
-            "Successfully wrote {} bytes to {}",
-            final_content.len(),
-            path
-        );
+        let mut message = format!("Successfully wrote {} bytes to {}", final_content.len(), path);
 
         if !warnings.is_empty() {
             message.push_str("\n\n");
@@ -284,7 +260,8 @@ impl AgentTool for WriteTool {
                 file_exists,
                 emojis_filtered: content != final_content,
                 is_documentation: is_documentation_file(path),
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             terminate: false,
         })
     }
@@ -369,10 +346,8 @@ mod tests {
     async fn streaming_callback_receives_preview_before_write() {
         use std::sync::Mutex;
         let dir = tempfile::tempdir().unwrap();
-        let tool = WriteTool::new(
-            dir.path().to_string_lossy().into_owned(),
-            WriteToolOptions::default(),
-        );
+        let tool =
+            WriteTool::new(dir.path().to_string_lossy().into_owned(), WriteToolOptions::default());
 
         let updates: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let updates_clone = updates.clone();

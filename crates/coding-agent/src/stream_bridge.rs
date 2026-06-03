@@ -6,7 +6,9 @@
 // the event stream the loop consumes carries the same typed snapshot.
 
 use agent_core::agent_loop::{StreamFn, StreamFnInput};
-use agent_core::event::{AssistantMessageEvent, EventStream, PartialAssistantMessage, PartialContentBlock};
+use agent_core::event::{
+    AssistantMessageEvent, EventStream, PartialAssistantMessage, PartialContentBlock,
+};
 use agent_core::types::{
     AgentMessage, AnthropicOptions, Api, ContentBlock, LlmRequest, Model, ProviderOptions,
     StopReason, ToolDefinition,
@@ -76,56 +78,69 @@ pub fn convert_sse_stream(
                         _ => {}
                     }
                 }
-                Ok(LlmEvent::ContentBlockDelta { index, delta }) => {
-                    match delta {
-                        Delta::TextDelta { text } => {
-                            if let Some(PartialContentBlock::Text { text: t, .. }) =
-                                partial.content.get_mut(index)
-                            {
-                                t.push_str(&text);
-                            }
-                            stream_clone.push(AssistantMessageEvent::TextDelta {
-                                content_index: index, delta: text, partial: partial.clone(),
-                            });
+                Ok(LlmEvent::ContentBlockDelta { index, delta }) => match delta {
+                    Delta::TextDelta { text } => {
+                        if let Some(PartialContentBlock::Text { text: t, .. }) =
+                            partial.content.get_mut(index)
+                        {
+                            t.push_str(&text);
                         }
-                        Delta::ThinkingDelta { thinking } => {
-                            if let Some(PartialContentBlock::Thinking { thinking: t, .. }) =
-                                partial.content.get_mut(index)
-                            {
-                                t.push_str(&thinking);
-                            }
-                            stream_clone.push(AssistantMessageEvent::ThinkingDelta {
-                                content_index: index, delta: thinking, partial: partial.clone(),
-                            });
-                        }
-                        Delta::InputJsonDelta { partial_json } => {
-                            if let Some(PartialContentBlock::ToolCall { arguments, partial_json: pj, .. }) =
-                                partial.content.get_mut(index)
-                            {
-                                let buf = pj.get_or_insert_with(String::new);
-                                buf.push_str(&partial_json);
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(buf) {
-                                    *arguments = parsed;
-                                }
-                            }
-                            stream_clone.push(AssistantMessageEvent::ToolCallDelta {
-                                content_index: index, delta: partial_json, partial: partial.clone(),
-                            });
-                        }
-                        _ => {}
+                        stream_clone.push(AssistantMessageEvent::TextDelta {
+                            content_index: index,
+                            delta: text,
+                            partial: partial.clone(),
+                        });
                     }
-                }
+                    Delta::ThinkingDelta { thinking } => {
+                        if let Some(PartialContentBlock::Thinking { thinking: t, .. }) =
+                            partial.content.get_mut(index)
+                        {
+                            t.push_str(&thinking);
+                        }
+                        stream_clone.push(AssistantMessageEvent::ThinkingDelta {
+                            content_index: index,
+                            delta: thinking,
+                            partial: partial.clone(),
+                        });
+                    }
+                    Delta::InputJsonDelta { partial_json } => {
+                        if let Some(PartialContentBlock::ToolCall {
+                            arguments,
+                            partial_json: pj,
+                            ..
+                        }) = partial.content.get_mut(index)
+                        {
+                            let buf = pj.get_or_insert_with(String::new);
+                            buf.push_str(&partial_json);
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(buf) {
+                                *arguments = parsed;
+                            }
+                        }
+                        stream_clone.push(AssistantMessageEvent::ToolCallDelta {
+                            content_index: index,
+                            delta: partial_json,
+                            partial: partial.clone(),
+                        });
+                    }
+                    _ => {}
+                },
                 Ok(LlmEvent::ContentBlockStop { index }) => {
-                    let Some(block) = partial.content.get(index).cloned() else { continue };
+                    let Some(block) = partial.content.get(index).cloned() else {
+                        continue;
+                    };
                     match block {
                         PartialContentBlock::Text { text, .. } => {
                             stream_clone.push(AssistantMessageEvent::TextEnd {
-                                content_index: index, content: text, partial: partial.clone(),
+                                content_index: index,
+                                content: text,
+                                partial: partial.clone(),
                             });
                         }
                         PartialContentBlock::Thinking { thinking, .. } => {
                             stream_clone.push(AssistantMessageEvent::ThinkingEnd {
-                                content_index: index, content: thinking, partial: partial.clone(),
+                                content_index: index,
+                                content: thinking,
+                                partial: partial.clone(),
                             });
                         }
                         PartialContentBlock::ToolCall { .. } => {
@@ -156,7 +171,8 @@ pub fn convert_sse_stream(
                 Ok(LlmEvent::MessageStop) => {
                     let reason = partial.stop_reason;
                     let final_msg = partial.into_finalized();
-                    stream_clone.push(AssistantMessageEvent::Done { reason, message: final_msg.clone() });
+                    stream_clone
+                        .push(AssistantMessageEvent::Done { reason, message: final_msg.clone() });
                     stream_clone.end(final_msg);
                     return;
                 }
@@ -221,7 +237,9 @@ pub fn create_stream_fn(provider: Arc<dyn LlmProvider>, model: Model) -> StreamF
         let provider = provider.clone();
         let model = model.clone();
         Box::pin(async move {
-            let tools: Vec<ToolDefinition> = input.tools.iter()
+            let tools: Vec<ToolDefinition> = input
+                .tools
+                .iter()
                 .map(|t| ToolDefinition {
                     name: t.name().to_string(),
                     description: t.description().to_string(),
@@ -241,7 +259,9 @@ pub fn create_stream_fn(provider: Arc<dyn LlmProvider>, model: Model) -> StreamF
                 // Caller-supplied options win; otherwise derive them from the
                 // model's catalog `compat` flags so provider behaviour
                 // (adaptive thinking, temperature suppression) is data-driven.
-                provider_options: input.provider_options.or_else(|| compat_to_provider_options(&model)),
+                provider_options: input
+                    .provider_options
+                    .or_else(|| compat_to_provider_options(&model)),
                 ..Default::default()
             };
 
@@ -291,7 +311,10 @@ mod tests {
     #[test]
     fn test_compat_to_provider_options_none_when_empty() {
         // No compat flags → no derived options (substring fallback applies).
-        let model = Model { api: Api::Anthropic, ..Default::default() };
+        let model = Model {
+            api: Api::Anthropic,
+            ..Default::default()
+        };
         assert!(compat_to_provider_options(&model).is_none());
         // Non-anthropic API has no options type yet.
         let model = Model {

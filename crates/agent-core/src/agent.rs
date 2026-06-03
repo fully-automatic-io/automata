@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 
 type EventListener = Arc<
     dyn Fn(AgentEvent, Option<CancellationToken>) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send + Sync,
+        + Send
+        + Sync,
 >;
 
 #[derive(Clone)]
@@ -80,9 +81,9 @@ pub struct AgentOptions {
 
 impl Agent {
     pub fn new(options: AgentOptions) -> Self {
-        let state = options.initial_state.unwrap_or_else(|| {
-            AgentState::new(None, None, None, None, None)
-        });
+        let state = options
+            .initial_state
+            .unwrap_or_else(|| AgentState::new(None, None, None, None, None));
         Self {
             state: Arc::new(Mutex::new(state)),
             listeners: Arc::new(Mutex::new(Vec::new())),
@@ -95,7 +96,8 @@ impl Agent {
             active_run: Arc::new(Mutex::new(None)),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
             stream_fn: options.stream_fn,
-            convert_to_llm: options.convert_to_llm
+            convert_to_llm: options
+                .convert_to_llm
                 .unwrap_or_else(|| Arc::new(|msgs| Box::pin(default_convert_to_llm(msgs)))),
             transform_context: options.transform_context,
             get_api_key: options.get_api_key,
@@ -157,8 +159,12 @@ impl Agent {
         self.follow_up_queue.lock().unwrap().enqueue(message);
     }
 
-    pub fn clear_steering_queue(&self) { self.steering_queue.lock().unwrap().clear(); }
-    pub fn clear_follow_up_queue(&self) { self.follow_up_queue.lock().unwrap().clear(); }
+    pub fn clear_steering_queue(&self) {
+        self.steering_queue.lock().unwrap().clear();
+    }
+    pub fn clear_follow_up_queue(&self) {
+        self.follow_up_queue.lock().unwrap().clear();
+    }
     pub fn clear_all_queues(&self) {
         self.clear_steering_queue();
         self.clear_follow_up_queue();
@@ -264,7 +270,8 @@ impl Agent {
             Box::pin(async move {
                 Ok(AgentLoop::new(&config, &emit, &stream_fn).run(messages, context, signal).await)
             })
-        }).await
+        })
+        .await
     }
 
     async fn run_continuation(&self) -> Result<Vec<AgentMessage>, String> {
@@ -282,7 +289,8 @@ impl Agent {
             Box::pin(async move {
                 Ok(AgentLoop::new(&config, &emit, &stream_fn).run_continue(context, signal).await)
             })
-        }).await
+        })
+        .await
     }
 
     fn build_loop_config(&self) -> AgentLoopConfig {
@@ -330,10 +338,7 @@ impl Agent {
         }
     }
 
-    async fn run_with_lifecycle<F, Fut>(
-        &self,
-        executor: F,
-    ) -> Result<Vec<AgentMessage>, String>
+    async fn run_with_lifecycle<F, Fut>(&self, executor: F) -> Result<Vec<AgentMessage>, String>
     where
         F: FnOnce(Option<CancellationToken>, AgentEventSink) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Vec<AgentMessage>, String>> + Send + 'static,
@@ -384,10 +389,20 @@ pub enum PromptInput {
     Text(String),
 }
 
-impl From<String> for PromptInput { fn from(s: String) -> Self { Self::Text(s) } }
-impl From<&str> for PromptInput { fn from(s: &str) -> Self { Self::Text(s.to_string()) } }
+impl From<String> for PromptInput {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+impl From<&str> for PromptInput {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
 impl From<Vec<AgentMessage>> for PromptInput {
-    fn from(m: Vec<AgentMessage>) -> Self { Self::Messages(m) }
+    fn from(m: Vec<AgentMessage>) -> Self {
+        Self::Messages(m)
+    }
 }
 
 #[cfg(test)]

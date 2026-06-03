@@ -10,8 +10,7 @@
 use crate::types::{AgentMessage, ContentBlock, MessageContent};
 use serde::{Deserialize, Serialize};
 
-pub const COMPACTION_SUMMARY_PREFIX: &str =
-    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 pub const BRANCH_SUMMARY_PREFIX: &str =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
@@ -33,7 +32,11 @@ pub struct BashExecutionMessage {
     #[serde(rename = "fullOutputPath", skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<String>,
     pub timestamp: u64,
-    #[serde(rename = "excludeFromContext", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "excludeFromContext",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub exclude_from_context: bool,
 }
 
@@ -89,13 +92,13 @@ pub fn bash_execution_to_text(
     if cancelled {
         text.push_str("\n\n(command cancelled)");
     } else if let Some(code) = exit_code
-        && code != 0 {
-            text.push_str(&format!("\n\nCommand exited with code {}", code));
-        }
-    if truncated
-        && let Some(path) = full_output_path {
-            text.push_str(&format!("\n\n[Output truncated. Full output: {}]", path));
-        }
+        && code != 0
+    {
+        text.push_str(&format!("\n\nCommand exited with code {}", code));
+    }
+    if truncated && let Some(path) = full_output_path {
+        text.push_str(&format!("\n\n[Output truncated. Full output: {}]", path));
+    }
     text
 }
 
@@ -103,56 +106,77 @@ pub fn bash_execution_to_text(
 /// CompactionSummary) into plain user/assistant/toolResult `AgentMessage`s
 /// suitable for an LLM provider.
 pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
-    messages.iter().filter_map(|m| match m {
-        AgentMessage::User { .. } | AgentMessage::Assistant { .. } | AgentMessage::ToolResult { .. } => {
-            Some(m.clone())
-        }
-        AgentMessage::BashExecution {
-            command, output, exit_code, cancelled, truncated, full_output_path,
-            timestamp, exclude_from_context,
-        } => {
-            if *exclude_from_context { return None; }
-            let text = bash_execution_to_text(
-                command, output, *exit_code, *cancelled, *truncated, full_output_path.as_deref(),
-            );
-            Some(AgentMessage::User {
-                content: MessageContent::Blocks(vec![ContentBlock::Text { text }]),
-                timestamp: *timestamp,
-                metadata: None,
-            })
-        }
-        AgentMessage::Custom { content, timestamp, .. } => {
-            let blocks = if let Some(s) = content.as_str() {
-                vec![ContentBlock::Text { text: s.to_string() }]
-            } else if let Ok(parsed) = serde_json::from_value::<Vec<ContentBlock>>(content.clone()) {
-                parsed
-            } else {
-                // fallback: stringify
-                vec![ContentBlock::Text { text: content.to_string() }]
-            };
-            Some(AgentMessage::User {
-                content: MessageContent::Blocks(blocks),
-                timestamp: *timestamp,
-                metadata: None,
-            })
-        }
-        AgentMessage::BranchSummary { summary, timestamp, .. } => {
-            let text = format!("{}{}{}", BRANCH_SUMMARY_PREFIX, summary, BRANCH_SUMMARY_SUFFIX);
-            Some(AgentMessage::User {
-                content: MessageContent::Blocks(vec![ContentBlock::Text { text }]),
-                timestamp: *timestamp,
-                metadata: None,
-            })
-        }
-        AgentMessage::CompactionSummary { summary, timestamp, .. } => {
-            let text = format!("{}{}{}", COMPACTION_SUMMARY_PREFIX, summary, COMPACTION_SUMMARY_SUFFIX);
-            Some(AgentMessage::User {
-                content: MessageContent::Blocks(vec![ContentBlock::Text { text }]),
-                timestamp: *timestamp,
-                metadata: None,
-            })
-        }
-    }).collect()
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::User { .. }
+            | AgentMessage::Assistant { .. }
+            | AgentMessage::ToolResult { .. } => Some(m.clone()),
+            AgentMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                truncated,
+                full_output_path,
+                timestamp,
+                exclude_from_context,
+            } => {
+                if *exclude_from_context {
+                    return None;
+                }
+                let text = bash_execution_to_text(
+                    command,
+                    output,
+                    *exit_code,
+                    *cancelled,
+                    *truncated,
+                    full_output_path.as_deref(),
+                );
+                Some(AgentMessage::User {
+                    content: MessageContent::Blocks(vec![ContentBlock::Text { text }]),
+                    timestamp: *timestamp,
+                    metadata: None,
+                })
+            }
+            AgentMessage::Custom { content, timestamp, .. } => {
+                let blocks = if let Some(s) = content.as_str() {
+                    vec![ContentBlock::Text { text: s.to_string() }]
+                } else if let Ok(parsed) =
+                    serde_json::from_value::<Vec<ContentBlock>>(content.clone())
+                {
+                    parsed
+                } else {
+                    // fallback: stringify
+                    vec![ContentBlock::Text { text: content.to_string() }]
+                };
+                Some(AgentMessage::User {
+                    content: MessageContent::Blocks(blocks),
+                    timestamp: *timestamp,
+                    metadata: None,
+                })
+            }
+            AgentMessage::BranchSummary { summary, timestamp, .. } => {
+                let text = format!("{}{}{}", BRANCH_SUMMARY_PREFIX, summary, BRANCH_SUMMARY_SUFFIX);
+                Some(AgentMessage::User {
+                    content: MessageContent::Blocks(vec![ContentBlock::Text { text }]),
+                    timestamp: *timestamp,
+                    metadata: None,
+                })
+            }
+            AgentMessage::CompactionSummary { summary, timestamp, .. } => {
+                let text = format!(
+                    "{}{}{}",
+                    COMPACTION_SUMMARY_PREFIX, summary, COMPACTION_SUMMARY_SUFFIX
+                );
+                Some(AgentMessage::User {
+                    content: MessageContent::Blocks(vec![ContentBlock::Text { text }]),
+                    timestamp: *timestamp,
+                    metadata: None,
+                })
+            }
+        })
+        .collect()
 }
 
 /// Default `convert_to_llm` callback for `AgentLoopConfig`.
@@ -211,7 +235,9 @@ mod tests {
                 if let ContentBlock::Text { text } = &b[0] {
                     assert!(text.contains("prior work"));
                     assert!(text.contains("<summary>"));
-                } else { panic!("expected text block"); }
+                } else {
+                    panic!("expected text block");
+                }
             }
             _ => panic!("expected user message"),
         }

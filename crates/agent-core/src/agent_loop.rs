@@ -3,7 +3,7 @@
 // queues.
 
 use crate::event::{AgentEvent, AssistantMessageEvent, EventStream};
-use crate::tool::{validate_tool_arguments, AgentTool};
+use crate::tool::{AgentTool, validate_tool_arguments};
 use crate::types::{
     AfterToolCallContext, AfterToolCallFn, AgentContext, AgentLoopConfig, AgentMessage,
     AgentToolCall, AgentToolResult, AgentToolUpdateCallback, BeforeToolCallContext, ContentBlock,
@@ -25,9 +25,12 @@ pub type AgentEventSink =
 pub type AssistantMessageEventStream = EventStream<AssistantMessageEvent, AgentMessage>;
 
 pub type StreamFn = Arc<
-    dyn Fn(StreamFnInput)
+    dyn Fn(
+            StreamFnInput,
+        )
             -> Pin<Box<dyn Future<Output = Result<AssistantMessageEventStream, String>> + Send>>
-        + Send + Sync,
+        + Send
+        + Sync,
 >;
 
 #[derive(Clone)]
@@ -177,10 +180,11 @@ impl AgentLoop<'_> {
 
             while has_more_tool_calls || !pending_messages.is_empty() {
                 if let Some(ref token) = signal
-                    && token.is_cancelled() {
-                        self.emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
-                        return;
-                    }
+                    && token.is_cancelled()
+                {
+                    self.emit(AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+                    return;
+                }
 
                 if !first_turn {
                     self.emit(AgentEvent::TurnStart).await;
@@ -199,7 +203,12 @@ impl AgentLoop<'_> {
                 }
 
                 let assistant = self
-                    .stream_assistant_response(current_context, &effective_model, effective_reasoning, signal.clone())
+                    .stream_assistant_response(
+                        current_context,
+                        &effective_model,
+                        effective_reasoning,
+                        signal.clone(),
+                    )
                     .await;
                 new_messages.push(assistant.clone());
 
@@ -217,7 +226,12 @@ impl AgentLoop<'_> {
 
                 if !tool_calls.is_empty() {
                     let batch = self
-                        .execute_tool_calls(current_context, &tool_calls, &assistant, signal.clone())
+                        .execute_tool_calls(
+                            current_context,
+                            &tool_calls,
+                            &assistant,
+                            signal.clone(),
+                        )
                         .await;
                     for result in &batch.messages {
                         current_context.messages.push(result.clone());
@@ -227,7 +241,11 @@ impl AgentLoop<'_> {
                     has_more_tool_calls = !batch.terminate;
                 }
 
-                self.emit(AgentEvent::TurnEnd { message: assistant.clone(), tool_results: tool_results.clone() }).await;
+                self.emit(AgentEvent::TurnEnd {
+                    message: assistant.clone(),
+                    tool_results: tool_results.clone(),
+                })
+                .await;
 
                 // prepare_next_turn runs after turn_end and may swap the
                 // context / model / reasoning for the next turn and inject
@@ -246,7 +264,11 @@ impl AgentLoop<'_> {
                             effective_model = model;
                         }
                         if let Some(level) = update.thinking_level {
-                            effective_reasoning = if level == ThinkingLevel::Off { None } else { Some(level) };
+                            effective_reasoning = if level == ThinkingLevel::Off {
+                                None
+                            } else {
+                                Some(level)
+                            };
                         }
                         pending_messages.extend(update.messages);
                     }
@@ -302,9 +324,7 @@ impl AgentLoop<'_> {
         let llm_messages = (self.config.convert_to_llm)(messages).await;
 
         let resolved_api_key = if let Some(ref get_key) = self.config.get_api_key {
-            get_key(model.provider.clone())
-                .await
-                .or(self.config.api_key.clone())
+            get_key(model.provider.clone()).await.or(self.config.api_key.clone())
         } else {
             self.config.api_key.clone()
         };
@@ -369,7 +389,8 @@ impl AgentLoop<'_> {
                         }
                     } else {
                         context.messages.push(final_message.clone());
-                        self.emit(AgentEvent::MessageStart { message: final_message.clone() }).await;
+                        self.emit(AgentEvent::MessageStart { message: final_message.clone() })
+                            .await;
                     }
                     if let Some(ref hook) = self.config.on_response {
                         hook(final_message.to_json()).await;
@@ -398,7 +419,8 @@ impl AgentLoop<'_> {
                             }
                         } else {
                             context.messages.push(final_msg.clone());
-                            self.emit(AgentEvent::MessageStart { message: final_msg.clone() }).await;
+                            self.emit(AgentEvent::MessageStart { message: final_msg.clone() })
+                                .await;
                         }
                         if let Some(ref hook) = self.config.on_response {
                             hook(final_msg.to_json()).await;
@@ -414,7 +436,8 @@ impl AgentLoop<'_> {
                             }
                         } else {
                             context.messages.push(final_msg.clone());
-                            self.emit(AgentEvent::MessageStart { message: final_msg.clone() }).await;
+                            self.emit(AgentEvent::MessageStart { message: final_msg.clone() })
+                                .await;
                         }
                         if let Some(ref hook) = self.config.on_response {
                             hook(final_msg.to_json()).await;
@@ -443,15 +466,20 @@ impl AgentLoop<'_> {
 }
 
 fn extract_tool_calls(message: &AgentMessage) -> Vec<AgentToolCall> {
-    let Some(content) = message.assistant_content() else { return vec![] };
-    content.iter().filter_map(|b| match b {
-        ContentBlock::ToolCall { id, name, arguments } => Some(AgentToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            arguments: arguments.clone(),
-        }),
-        _ => None,
-    }).collect()
+    let Some(content) = message.assistant_content() else {
+        return vec![];
+    };
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall { id, name, arguments } => Some(AgentToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -467,8 +495,8 @@ impl AgentLoop<'_> {
         signal: Option<CancellationToken>,
     ) -> ToolBatch {
         let has_sequential = tool_calls.iter().any(|tc| {
-            find_tool(&current_context.tools, &tc.name)
-                .and_then(|t| t.execution_mode()) == Some(ToolExecutionMode::Sequential)
+            find_tool(&current_context.tools, &tc.name).and_then(|t| t.execution_mode())
+                == Some(ToolExecutionMode::Sequential)
         });
 
         let effective_mode = match self.config.tool_execution {
@@ -479,7 +507,8 @@ impl AgentLoop<'_> {
 
         match effective_mode {
             ToolExecutionMode::Sequential => {
-                self.exec_sequential(current_context, tool_calls, assistant_message, signal).await
+                self.exec_sequential(current_context, tool_calls, assistant_message, signal)
+                    .await
             }
             ToolExecutionMode::Parallel => {
                 self.exec_parallel(current_context, tool_calls, assistant_message, signal).await
@@ -512,9 +541,12 @@ impl AgentLoop<'_> {
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
                 args: tool_call.arguments.clone(),
-            }).await;
+            })
+            .await;
 
-            let prep = self.prepare(current_context, tool_call, assistant_message, signal.clone()).await;
+            let prep = self
+                .prepare(current_context, tool_call, assistant_message, signal.clone())
+                .await;
             let finalized = match prep {
                 PreparedToolCall::Immediate { tool_call, result, is_error } => {
                     FinalizedToolCall { tool_call, result, is_error }
@@ -522,9 +554,15 @@ impl AgentLoop<'_> {
                 PreparedToolCall::Ready { tool_call, tool, args } => {
                     let exec = run_tool(&tool, &tool_call, &args, self.emit, signal.clone()).await;
                     finalize(
-                        current_context, &tool_call, &args, exec, assistant_message,
-                        &self.config.after_tool_call, signal.clone(),
-                    ).await
+                        current_context,
+                        &tool_call,
+                        &args,
+                        exec,
+                        assistant_message,
+                        &self.config.after_tool_call,
+                        signal.clone(),
+                    )
+                    .await
                 }
             };
 
@@ -535,7 +573,10 @@ impl AgentLoop<'_> {
             messages.push(msg);
         }
 
-        ToolBatch { messages, terminate: should_terminate(&finalized_calls) }
+        ToolBatch {
+            messages,
+            terminate: should_terminate(&finalized_calls),
+        }
     }
 }
 
@@ -563,9 +604,12 @@ impl AgentLoop<'_> {
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
                 args: tool_call.arguments.clone(),
-            }).await;
+            })
+            .await;
 
-            let prep = self.prepare(current_context, tool_call, assistant_message, signal.clone()).await;
+            let prep = self
+                .prepare(current_context, tool_call, assistant_message, signal.clone())
+                .await;
             match prep {
                 PreparedToolCall::Immediate { tool_call, result, is_error } => {
                     let f = FinalizedToolCall { tool_call, result, is_error };
@@ -580,7 +624,9 @@ impl AgentLoop<'_> {
                     let assistant_msg = assistant_message.clone();
                     let handle = tokio::spawn(async move {
                         let exec = run_tool(&tool, &tool_call, &args, &emit, sig.clone()).await;
-                        let f = finalize(&ctx, &tool_call, &args, exec, &assistant_msg, &after, sig).await;
+                        let f =
+                            finalize(&ctx, &tool_call, &args, exec, &assistant_msg, &after, sig)
+                                .await;
                         emit_tool_end(&f, &emit).await;
                         f
                     });
@@ -594,7 +640,9 @@ impl AgentLoop<'_> {
             match entry {
                 Entry::Immediate(f) => finalized_calls.push(f),
                 Entry::Deferred(h) => {
-                    if let Ok(f) = h.await { finalized_calls.push(f); }
+                    if let Ok(f) = h.await {
+                        finalized_calls.push(f);
+                    }
                 }
             }
         }
@@ -606,7 +654,10 @@ impl AgentLoop<'_> {
             messages.push(msg);
         }
 
-        ToolBatch { messages, terminate: should_terminate(&finalized_calls) }
+        ToolBatch {
+            messages,
+            terminate: should_terminate(&finalized_calls),
+        }
     }
 }
 
@@ -650,18 +701,23 @@ impl AgentLoop<'_> {
                 context: current_context.clone(),
             };
             if let Some(result) = before(ctx, signal.clone()).await
-                && result.block {
-                    return PreparedToolCall::Immediate {
-                        tool_call: tool_call.clone(),
-                        result: AgentToolResult::error_text(
-                            result.reason.unwrap_or_else(|| "Tool execution was blocked".into()),
-                        ),
-                        is_error: true,
-                    };
-                }
+                && result.block
+            {
+                return PreparedToolCall::Immediate {
+                    tool_call: tool_call.clone(),
+                    result: AgentToolResult::error_text(
+                        result.reason.unwrap_or_else(|| "Tool execution was blocked".into()),
+                    ),
+                    is_error: true,
+                };
+            }
         }
 
-        PreparedToolCall::Ready { tool_call: tool_call.clone(), tool, args: validated }
+        PreparedToolCall::Ready {
+            tool_call: tool_call.clone(),
+            tool,
+            args: validated,
+        }
     }
 }
 
@@ -687,7 +743,8 @@ async fn run_tool(
                 tool_name: name,
                 args,
                 partial_result: serde_json::to_value(&partial.content).unwrap_or_default(),
-            }).await;
+            })
+            .await;
         });
     }));
 
@@ -722,14 +779,26 @@ async fn finalize(
             context: current_context.clone(),
         };
         if let Some(over) = hook(ctx, signal).await {
-            if let Some(content) = over.content { result.content = content; }
-            if let Some(details) = over.details { result.details = details; }
-            if let Some(ie) = over.is_error { is_error = ie; }
-            if let Some(t) = over.terminate { result.terminate = t; }
+            if let Some(content) = over.content {
+                result.content = content;
+            }
+            if let Some(details) = over.details {
+                result.details = details;
+            }
+            if let Some(ie) = over.is_error {
+                is_error = ie;
+            }
+            if let Some(t) = over.terminate {
+                result.terminate = t;
+            }
         }
     }
 
-    FinalizedToolCall { tool_call: tool_call.clone(), result, is_error }
+    FinalizedToolCall {
+        tool_call: tool_call.clone(),
+        result,
+        is_error,
+    }
 }
 
 // ============================================================================
@@ -746,7 +815,8 @@ async fn emit_tool_end(f: &FinalizedToolCall, emit: &AgentEventSink) {
         tool_name: f.tool_call.name.clone(),
         result: f.result.clone(),
         is_error: f.is_error,
-    }).await;
+    })
+    .await;
 }
 
 fn make_tool_result_msg(f: &FinalizedToolCall) -> AgentMessage {
@@ -765,7 +835,11 @@ async fn emit_tool_result_msg(m: &AgentMessage, emit: &AgentEventSink) {
     emit(AgentEvent::MessageEnd { message: m.clone() }).await;
 }
 
-fn make_failure_message(model: &ModelInfo, stop_reason: StopReason, error_message: Option<&str>) -> AgentMessage {
+fn make_failure_message(
+    model: &ModelInfo,
+    stop_reason: StopReason,
+    error_message: Option<&str>,
+) -> AgentMessage {
     AgentMessage::Assistant {
         content: vec![ContentBlock::Text { text: String::new() }],
         api: model.api,
@@ -780,22 +854,33 @@ fn make_failure_message(model: &ModelInfo, stop_reason: StopReason, error_messag
 
 impl AgentLoop<'_> {
     async fn drain_steer(&self) -> Vec<AgentMessage> {
-        if let Some(ref get) = self.config.get_steering_messages { get().await } else { vec![] }
+        if let Some(ref get) = self.config.get_steering_messages {
+            get().await
+        } else {
+            vec![]
+        }
     }
 
     async fn drain_follow_up(&self) -> Vec<AgentMessage> {
-        if let Some(ref get) = self.config.get_follow_up_messages { get().await } else { vec![] }
+        if let Some(ref get) = self.config.get_follow_up_messages {
+            get().await
+        } else {
+            vec![]
+        }
     }
 }
 
 /// Build a `ToolDefinition` slice from the agent context. Useful when wiring
 /// up llm-client requests; kept here so the loop doesn't expose it on every path.
 pub fn tools_to_definitions(tools: &[Arc<dyn AgentTool>]) -> Vec<ToolDefinition> {
-    tools.iter().map(|t| ToolDefinition {
-        name: t.name().to_string(),
-        description: t.description().to_string(),
-        input_schema: t.parameters(),
-    }).collect()
+    tools
+        .iter()
+        .map(|t| ToolDefinition {
+            name: t.name().to_string(),
+            description: t.description().to_string(),
+            input_schema: t.parameters(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -812,11 +897,19 @@ mod tests {
         let msg = AgentMessage::Assistant {
             content: vec![
                 ContentBlock::Text { text: "x".into() },
-                ContentBlock::ToolCall { id: "tc1".into(), name: "bash".into(), arguments: serde_json::json!({}) },
+                ContentBlock::ToolCall {
+                    id: "tc1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                },
             ],
-            api: crate::types::Api::Anthropic, provider: "".into(), model: "".into(),
-            usage: Usage::default(), stop_reason: StopReason::EndTurn,
-            error_message: None, timestamp: 0,
+            api: crate::types::Api::Anthropic,
+            provider: "".into(),
+            model: "".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            timestamp: 0,
         };
         let calls = extract_tool_calls(&msg);
         assert_eq!(calls.len(), 1);

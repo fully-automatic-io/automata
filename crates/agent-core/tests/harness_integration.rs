@@ -1,7 +1,6 @@
 use agent_core::harness::{
-    convert_to_llm, format_skills_for_system_prompt,
+    InMemorySessionRepo, Skill, convert_to_llm, format_skills_for_system_prompt,
     parse_command_args, substitute_args, truncate_head, truncate_tail,
-    InMemorySessionRepo, Skill,
 };
 use agent_core::types::{AgentMessage, ContentBlock, MessageContent, StopReason, Usage};
 
@@ -32,14 +31,24 @@ fn test_session_compaction_context() {
         let mut session = repo.create_session(None);
 
         let u1 = session.append_message(AgentMessage::user_text("msg1")).await.unwrap();
-        session.append_message(AgentMessage::Assistant {
-            content: vec![ContentBlock::Text { text: "resp1".into() }],
-            api: agent_core::types::Api::Anthropic, provider: "p".into(), model: "m".into(),
-            usage: Usage::default(), stop_reason: StopReason::EndTurn,
-            error_message: None, timestamp: 0,
-        }).await.unwrap();
+        session
+            .append_message(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text { text: "resp1".into() }],
+                api: agent_core::types::Api::Anthropic,
+                provider: "p".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                error_message: None,
+                timestamp: 0,
+            })
+            .await
+            .unwrap();
 
-        session.append_compaction("Summary of history", &u1, 1000, None, None).await.unwrap();
+        session
+            .append_compaction("Summary of history", &u1, 1000, None, None)
+            .await
+            .unwrap();
 
         session.append_message(AgentMessage::user_text("msg2")).await.unwrap();
 
@@ -114,15 +123,13 @@ fn test_convert_to_llm_compaction_summary() {
 
 #[test]
 fn test_format_skills_for_system_prompt() {
-    let skills = vec![
-        Skill {
-            name: "my-skill".to_string(),
-            description: "Does something useful".to_string(),
-            content: "skill content".to_string(),
-            file_path: "/path/to/SKILL.md".to_string(),
-            disable_model_invocation: false,
-        },
-    ];
+    let skills = vec![Skill {
+        name: "my-skill".to_string(),
+        description: "Does something useful".to_string(),
+        content: "skill content".to_string(),
+        file_path: "/path/to/SKILL.md".to_string(),
+        disable_model_invocation: false,
+    }];
     let result = format_skills_for_system_prompt(&skills);
     assert!(result.contains("<available_skills>"));
     assert!(result.contains("<name>my-skill</name>"));
@@ -131,15 +138,13 @@ fn test_format_skills_for_system_prompt() {
 
 #[test]
 fn test_format_skills_excludes_disabled() {
-    let skills = vec![
-        Skill {
-            name: "hidden".to_string(),
-            description: "Hidden skill".to_string(),
-            content: "".to_string(),
-            file_path: "/path/SKILL.md".to_string(),
-            disable_model_invocation: true,
-        },
-    ];
+    let skills = vec![Skill {
+        name: "hidden".to_string(),
+        description: "Hidden skill".to_string(),
+        content: "".to_string(),
+        file_path: "/path/SKILL.md".to_string(),
+        disable_model_invocation: true,
+    }];
     let result = format_skills_for_system_prompt(&skills);
     assert!(result.is_empty());
 }
@@ -156,8 +161,14 @@ fn test_substitute_args() {
     assert_eq!(substitute_args("Hello $1!", &["world".to_string()]), "Hello world!");
     assert_eq!(substitute_args("$@", &["a".to_string(), "b".to_string()]), "a b");
     assert_eq!(substitute_args("$ARGUMENTS", &["x".to_string()]), "x");
-    assert_eq!(substitute_args("${@:2}", &["a".to_string(), "b".to_string(), "c".to_string()]), "b c");
-    assert_eq!(substitute_args("${@:1:2}", &["a".to_string(), "b".to_string(), "c".to_string()]), "a b");
+    assert_eq!(
+        substitute_args("${@:2}", &["a".to_string(), "b".to_string(), "c".to_string()]),
+        "b c"
+    );
+    assert_eq!(
+        substitute_args("${@:1:2}", &["a".to_string(), "b".to_string(), "c".to_string()]),
+        "a b"
+    );
 }
 
 #[test]

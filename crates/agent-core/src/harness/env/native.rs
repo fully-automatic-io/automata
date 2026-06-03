@@ -68,69 +68,100 @@ impl NativeEnv {
 
     fn resolve(&self, path: &str) -> PathBuf {
         let p = Path::new(path);
-        if p.is_absolute() { p.to_path_buf() } else { Path::new(&self.cwd).join(p) }
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            Path::new(&self.cwd).join(p)
+        }
     }
 
     pub async fn read_text_file(&self, path: &str) -> Result<String, EnvError> {
         let resolved = self.resolve(path);
-        tokio::fs::read_to_string(&resolved).await
+        tokio::fs::read_to_string(&resolved)
+            .await
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))
     }
 
     pub async fn read_binary_file(&self, path: &str) -> Result<Vec<u8>, EnvError> {
         let resolved = self.resolve(path);
-        tokio::fs::read(&resolved).await
+        tokio::fs::read(&resolved)
+            .await
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))
     }
 
     pub async fn write_file(&self, path: &str, content: &[u8]) -> Result<(), EnvError> {
         let resolved = self.resolve(path);
         if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| EnvError::from_io(e, &parent.to_string_lossy()))?;
         }
-        tokio::fs::write(&resolved, content).await
+        tokio::fs::write(&resolved, content)
+            .await
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))
     }
 
     pub async fn append_file(&self, path: &str, content: &[u8]) -> Result<(), EnvError> {
         let resolved = self.resolve(path);
         if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| EnvError::from_io(e, &parent.to_string_lossy()))?;
         }
         use tokio::io::AsyncWriteExt;
         let mut f = tokio::fs::OpenOptions::new()
-            .create(true).append(true).open(&resolved).await
+            .create(true)
+            .append(true)
+            .open(&resolved)
+            .await
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))?;
-        f.write_all(content).await
+        f.write_all(content)
+            .await
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))
     }
 
     pub async fn file_info(&self, path: &str) -> Result<FileInfo, EnvError> {
         let resolved = self.resolve(path);
-        let meta = tokio::fs::symlink_metadata(&resolved).await
+        let meta = tokio::fs::symlink_metadata(&resolved)
+            .await
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))?;
-        let kind = if meta.is_file() { FileKind::File }
-            else if meta.is_dir() { FileKind::Directory }
-            else { FileKind::Symlink };
-        let mtime_ms = meta.modified().ok()
+        let kind = if meta.is_file() {
+            FileKind::File
+        } else if meta.is_dir() {
+            FileKind::Directory
+        } else {
+            FileKind::Symlink
+        };
+        let mtime_ms = meta
+            .modified()
+            .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let name = resolved.file_name()
+        let name = resolved
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        Ok(FileInfo { name, path: resolved.to_string_lossy().to_string(), kind, size: meta.len(), mtime_ms })
+        Ok(FileInfo {
+            name,
+            path: resolved.to_string_lossy().to_string(),
+            kind,
+            size: meta.len(),
+            mtime_ms,
+        })
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<FileInfo>, EnvError> {
         let resolved = self.resolve(path);
-        let mut rd = tokio::fs::read_dir(&resolved).await
+        let mut rd = tokio::fs::read_dir(&resolved)
+            .await
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))?;
         let mut infos = vec![];
-        while let Some(entry) = rd.next_entry().await
-            .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))? {
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))?
+        {
             let ep = entry.path();
             if let Ok(info) = self.file_info(&ep.to_string_lossy()).await {
                 infos.push(info);
@@ -141,7 +172,8 @@ impl NativeEnv {
 
     pub async fn canonical_path(&self, path: &str) -> Result<String, EnvError> {
         let resolved = self.resolve(path);
-        tokio::fs::canonicalize(&resolved).await
+        tokio::fs::canonicalize(&resolved)
+            .await
             .map(|p| p.to_string_lossy().to_string())
             .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))
     }
@@ -169,7 +201,8 @@ impl NativeEnv {
         if recursive {
             tokio::fs::remove_dir_all(&resolved).await
         } else {
-            let meta = tokio::fs::symlink_metadata(&resolved).await
+            let meta = tokio::fs::symlink_metadata(&resolved)
+                .await
                 .map_err(|e| EnvError::from_io(e, &resolved.to_string_lossy()))?;
             if meta.is_dir() {
                 tokio::fs::remove_dir(&resolved).await
@@ -212,17 +245,25 @@ impl NativeEnv {
         let shell = find_shell().await?;
 
         let mut cmd = Command::new(&shell);
-        cmd.arg("-c").arg(command)
+        cmd.arg("-c")
+            .arg(command)
             .current_dir(&work_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null());
 
         #[cfg(unix)]
-        unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
 
         if let Some(env_map) = env {
-            for (k, v) in env_map { cmd.env(k, v); }
+            for (k, v) in env_map {
+                cmd.env(k, v);
+            }
         }
 
         let child = cmd.spawn().map_err(|e| EnvError::SpawnError(e.to_string()))?;
@@ -264,9 +305,13 @@ impl NativeEnv {
 fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(unix)]
-    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
     #[cfg(not(unix))]
-    let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).spawn();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .spawn();
 }
 
 async fn find_shell() -> Result<String, EnvError> {
@@ -277,10 +322,9 @@ async fn find_shell() -> Result<String, EnvError> {
         return Ok("sh".to_string());
     }
     // Windows: look for Git bash
-    for candidate in &[
-        r"C:\Program Files\Git\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\bin\bash.exe",
-    ] {
+    for candidate in
+        &[r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"]
+    {
         if tokio::fs::metadata(candidate).await.is_ok() {
             return Ok(candidate.to_string());
         }

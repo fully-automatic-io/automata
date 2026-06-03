@@ -8,19 +8,21 @@
 
 use std::sync::Arc;
 
-use agent_core::harness::compaction::{CompactionError, CompactionSettings, StreamFn as CompactionStreamFn};
+use agent_core::auto_retry::RetrySettings;
+use agent_core::harness::compaction::{
+    CompactionError, CompactionSettings, StreamFn as CompactionStreamFn,
+};
 use agent_core::harness::session::{InMemorySessionStorage, Session};
 use agent_core::harness::{
     AgentHarness, AgentHarnessOptions, AutoCompactionConfig, HarnessConfig, HarnessError,
     HarnessEvent, PostRunDecision, StreamOptions,
 };
-use agent_core::auto_retry::RetrySettings;
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentMessage, ContentBlock, LlmRequest, Model, ModelInfo, ThinkingLevel};
 use llm_client::provider::LlmProvider;
 use tokio_util::sync::CancellationToken;
 
-use super::provider::{build_provider, Auth, ProviderBuild};
+use super::provider::{Auth, ProviderBuild, build_provider};
 use crate::stream_bridge::create_stream_fn;
 use crate::tools::{
     BashTool, BashToolOptions, EditTool, EditToolOptions, FindTool, GrepTool, LsTool, ReadTool,
@@ -30,13 +32,35 @@ use crate::tools::{
 /// The default tool set, in display order.
 pub const DEFAULT_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
 
+#[derive(Debug, Clone, Default)]
+pub struct BuildToolsOptions {
+    pub shell_path: Option<String>,
+    pub shell_command_prefix: Option<String>,
+}
+
 /// Build the built-in coding tools for `cwd`, filtered to `names`.
 pub fn build_tools(cwd: &str, names: &[&str]) -> Vec<Arc<dyn AgentTool>> {
+    build_tools_with_options(cwd, names, BuildToolsOptions::default())
+}
+
+/// Build the built-in coding tools with runtime settings applied.
+pub fn build_tools_with_options(
+    cwd: &str,
+    names: &[&str],
+    options: BuildToolsOptions,
+) -> Vec<Arc<dyn AgentTool>> {
     let mut tools: Vec<Arc<dyn AgentTool>> = Vec::with_capacity(names.len());
     for name in names {
         let tool: Arc<dyn AgentTool> = match *name {
             "read" => Arc::new(ReadTool::new(cwd.to_string(), ReadToolOptions::default())),
-            "bash" => Arc::new(BashTool::new(cwd.to_string(), BashToolOptions::default())),
+            "bash" => Arc::new(BashTool::new(
+                cwd.to_string(),
+                BashToolOptions {
+                    shell_path: options.shell_path.clone(),
+                    command_prefix: options.shell_command_prefix.clone(),
+                    ..Default::default()
+                },
+            )),
             "edit" => Arc::new(EditTool::new(cwd.to_string(), EditToolOptions::default())),
             "write" => Arc::new(WriteTool::new(cwd.to_string(), WriteToolOptions::default())),
             "grep" => Arc::new(GrepTool::new(cwd.to_string())),
@@ -51,7 +75,10 @@ pub fn build_tools(cwd: &str, names: &[&str]) -> Vec<Arc<dyn AgentTool>> {
 
 /// Build a compaction summarization callback backed by a provider's
 /// non-streaming `complete` endpoint. Returns the concatenated text content.
-fn make_compaction_stream_fn(provider: Arc<dyn LlmProvider>, model_id: String) -> CompactionStreamFn {
+fn make_compaction_stream_fn(
+    provider: Arc<dyn LlmProvider>,
+    model_id: String,
+) -> CompactionStreamFn {
     Box::new(move |messages: Vec<AgentMessage>, system: &str| {
         let provider = provider.clone();
         let model_id = model_id.clone();
@@ -283,7 +310,9 @@ impl CodingAgentSession {
     }
 
     /// Manually compact the session history now (ignores the threshold).
-    pub async fn compact(&self) -> Result<Option<agent_core::harness::CompactionResult>, HarnessError> {
+    pub async fn compact(
+        &self,
+    ) -> Result<Option<agent_core::harness::CompactionResult>, HarnessError> {
         self.harness
             .compact(&self.compaction_settings, &self.compaction_stream_fn)
             .await
@@ -309,4 +338,3 @@ impl CodingAgentSession {
         self.harness.set_stream_options(options).await;
     }
 }
-

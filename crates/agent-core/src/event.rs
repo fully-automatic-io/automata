@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 // ============================================================================
 // PartialAssistantMessage — typed view of a streaming assistant message.
@@ -22,7 +22,11 @@ pub struct PartialAssistantMessage {
     pub usage: Usage,
     #[serde(rename = "stopReason")]
     pub stop_reason: StopReason,
-    #[serde(rename = "errorMessage", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "errorMessage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub error_message: Option<String>,
     #[serde(default)]
     pub timestamp: u64,
@@ -37,13 +41,21 @@ pub enum PartialContentBlock {
     #[serde(rename = "text")]
     Text {
         text: String,
-        #[serde(rename = "textSignature", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "textSignature",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         text_signature: Option<String>,
     },
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
-        #[serde(rename = "thinkingSignature", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "thinkingSignature",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         thinking_signature: Option<String>,
     },
     #[serde(rename = "toolCall")]
@@ -54,7 +66,11 @@ pub enum PartialContentBlock {
         #[serde(default)]
         arguments: serde_json::Value,
         /// Raw incremental JSON during streaming; cleared once the block ends.
-        #[serde(rename = "partialJson", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "partialJson",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         partial_json: Option<String>,
     },
     #[serde(rename = "image")]
@@ -66,7 +82,11 @@ pub enum PartialContentBlock {
 }
 
 impl PartialAssistantMessage {
-    pub fn new(api: crate::types::Api, provider: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        api: crate::types::Api,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             content: Vec::new(),
             api,
@@ -82,7 +102,10 @@ impl PartialAssistantMessage {
     /// Pad `content` so `index` is in-bounds, filling gaps with empty text.
     pub fn ensure_block_at(&mut self, index: usize) {
         while self.content.len() <= index {
-            self.content.push(PartialContentBlock::Text { text: String::new(), text_signature: None });
+            self.content.push(PartialContentBlock::Text {
+                text: String::new(),
+                text_signature: None,
+            });
         }
     }
 
@@ -107,7 +130,9 @@ impl PartialContentBlock {
         match self {
             Self::Text { text, .. } => ContentBlock::Text { text },
             Self::Thinking { thinking, .. } => ContentBlock::Thinking { thinking },
-            Self::ToolCall { id, name, arguments, .. } => ContentBlock::ToolCall { id, name, arguments },
+            Self::ToolCall { id, name, arguments, .. } => {
+                ContentBlock::ToolCall { id, name, arguments }
+            }
             Self::Image { data, mime_type } => ContentBlock::Image { data, mime_type },
         }
     }
@@ -190,58 +215,76 @@ pub enum AgentEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantMessageEvent {
-    Start { partial: PartialAssistantMessage },
+    Start {
+        partial: PartialAssistantMessage,
+    },
 
     TextStart {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         partial: PartialAssistantMessage,
     },
     TextDelta {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         delta: String,
         partial: PartialAssistantMessage,
     },
     TextEnd {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         content: String,
         partial: PartialAssistantMessage,
     },
 
     ThinkingStart {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         partial: PartialAssistantMessage,
     },
     ThinkingDelta {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         delta: String,
         partial: PartialAssistantMessage,
     },
     ThinkingEnd {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         content: String,
         partial: PartialAssistantMessage,
     },
 
     #[serde(rename = "toolcall_start")]
     ToolCallStart {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         partial: PartialAssistantMessage,
     },
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta {
-        #[serde(rename = "contentIndex")] content_index: usize,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
         delta: String,
         partial: PartialAssistantMessage,
     },
     #[serde(rename = "toolcall_end")]
     ToolCallEnd {
-        #[serde(rename = "contentIndex")] content_index: usize,
-        #[serde(rename = "toolCall")] tool_call: ContentBlock,
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        #[serde(rename = "toolCall")]
+        tool_call: ContentBlock,
         partial: PartialAssistantMessage,
     },
 
-    Done { reason: StopReason, message: AgentMessage },
-    Error { reason: StopReason, error: PartialAssistantMessage },
+    Done {
+        reason: StopReason,
+        message: AgentMessage,
+    },
+    Error {
+        reason: StopReason,
+        error: PartialAssistantMessage,
+    },
 }
 
 impl AssistantMessageEvent {
@@ -297,21 +340,29 @@ impl<T: Clone, R: Clone> EventStream<T, R> {
     }
 
     pub fn push(&self, event: T) {
-        if *self.is_complete.lock().unwrap() { return; }
+        if *self.is_complete.lock().unwrap() {
+            return;
+        }
         self.events.lock().unwrap().push(event);
         self.is_done.notify_one();
     }
 
     pub fn end(&self, result: R) {
         let mut done = self.is_complete.lock().unwrap();
-        if *done { return; }
+        if *done {
+            return;
+        }
         *done = true;
         *self.result.lock().unwrap() = Some(result);
         self.is_done.notify_one();
     }
 
-    pub fn is_complete(&self) -> bool { *self.is_complete.lock().unwrap() }
-    pub fn take_events(&self) -> Vec<T> { std::mem::take(&mut *self.events.lock().unwrap()) }
+    pub fn is_complete(&self) -> bool {
+        *self.is_complete.lock().unwrap()
+    }
+    pub fn take_events(&self) -> Vec<T> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
 
     /// Park until either at least one event is available or the stream has ended.
     /// Returns immediately if either condition already holds.
@@ -321,9 +372,7 @@ impl<T: Clone, R: Clone> EventStream<T, R> {
             // permit, so a push that happens between this `notified()` call and
             // the state check still wakes us up.
             let notified = self.is_done.notified();
-            if !self.events.lock().unwrap().is_empty()
-                || *self.is_complete.lock().unwrap()
-            {
+            if !self.events.lock().unwrap().is_empty() || *self.is_complete.lock().unwrap() {
                 return;
             }
             notified.await;
@@ -343,16 +392,19 @@ impl<T: Clone, R: Clone> EventStream<T, R> {
     pub async fn wait_for_result(&self) -> R {
         loop {
             if *self.is_complete.lock().unwrap()
-                && let Some(r) = self.result.lock().unwrap().clone() {
-                    return r;
-                }
+                && let Some(r) = self.result.lock().unwrap().clone()
+            {
+                return r;
+            }
             self.is_done.notified().await;
         }
     }
 }
 
 impl<T: Clone, R: Clone> Default for EventStream<T, R> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ============================================================================
@@ -364,7 +416,9 @@ pub struct AgentEventReceiver {
 }
 
 impl AgentEventReceiver {
-    pub async fn recv(&mut self) -> Option<AgentEvent> { self.rx.recv().await }
+    pub async fn recv(&mut self) -> Option<AgentEvent> {
+        self.rx.recv().await
+    }
 }
 
 pub struct AgentEventChannel {
@@ -379,16 +433,23 @@ impl AgentEventChannel {
     }
 
     pub fn send(&self, event: AgentEvent) {
-        if *self.closed.lock().unwrap() { return; }
+        if *self.closed.lock().unwrap() {
+            return;
+        }
         let _ = self.tx.send(event);
     }
 
-    pub fn close(&self) { *self.closed.lock().unwrap() = true; }
+    pub fn close(&self) {
+        *self.closed.lock().unwrap() = true;
+    }
 }
 
 impl Clone for AgentEventChannel {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), closed: Arc::clone(&self.closed) }
+        Self {
+            tx: self.tx.clone(),
+            closed: Arc::clone(&self.closed),
+        }
     }
 }
 
@@ -404,14 +465,18 @@ pub trait AgentEventListener: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-pub struct FnEventListener<F> { f: F }
+pub struct FnEventListener<F> {
+    f: F,
+}
 
 impl<F, Fut> FnEventListener<F>
 where
     F: Fn(AgentEvent, Option<tokio_util::sync::CancellationToken>) -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    pub fn new(f: F) -> Self { Self { f } }
+    pub fn new(f: F) -> Self {
+        Self { f }
+    }
 }
 
 impl<F, Fut> AgentEventListener for FnEventListener<F>
@@ -445,7 +510,8 @@ mod tests {
     #[test]
     fn test_partial_into_finalized_text() {
         let mut p = PartialAssistantMessage::new(crate::types::Api::Anthropic, "p", "m");
-        p.content.push(PartialContentBlock::Text { text: "hi".into(), text_signature: None });
+        p.content
+            .push(PartialContentBlock::Text { text: "hi".into(), text_signature: None });
         match p.into_finalized() {
             AgentMessage::Assistant { content, stop_reason, .. } => {
                 assert_eq!(stop_reason, StopReason::EndTurn);
@@ -465,16 +531,14 @@ mod tests {
             partial_json: Some("{\"cmd\":\"ls\"".into()),
         });
         match p.into_finalized() {
-            AgentMessage::Assistant { content, .. } => {
-                match &content[0] {
-                    ContentBlock::ToolCall { id, name, arguments } => {
-                        assert_eq!(id, "tc1");
-                        assert_eq!(name, "bash");
-                        assert_eq!(arguments["cmd"], "ls");
-                    }
-                    _ => panic!("expected ToolCall"),
+            AgentMessage::Assistant { content, .. } => match &content[0] {
+                ContentBlock::ToolCall { id, name, arguments } => {
+                    assert_eq!(id, "tc1");
+                    assert_eq!(name, "bash");
+                    assert_eq!(arguments["cmd"], "ls");
                 }
-            }
+                _ => panic!("expected ToolCall"),
+            },
             _ => panic!("expected Assistant"),
         }
     }
@@ -494,6 +558,9 @@ mod tests {
         let (ch, mut rx) = AgentEventChannel::new(10);
         ch.send(AgentEvent::AgentStart);
         let event = rx.recv().await.unwrap();
-        match event { AgentEvent::AgentStart => {}, _ => panic!("Expected AgentStart") }
+        match event {
+            AgentEvent::AgentStart => {}
+            _ => panic!("Expected AgentStart"),
+        }
     }
 }

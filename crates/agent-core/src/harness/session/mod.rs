@@ -4,7 +4,7 @@ pub mod uuid;
 
 pub use jsonl::{JsonlSessionMetadata, JsonlSessionRepo, JsonlSessionStorage};
 pub use types::{
-    build_session_context, BranchSummaryOptions, InMemorySessionRepo, InMemorySessionStorage,
-    Session, SessionContext, SessionError, SessionMetadata, SessionStorage, SessionTreeEntry,
+    BranchSummaryOptions, InMemorySessionRepo, InMemorySessionStorage, Session, SessionContext,
+    SessionError, SessionMetadata, SessionStorage, SessionTreeEntry, build_session_context,
 };
 pub use uuid::{now_iso, uuidv7};

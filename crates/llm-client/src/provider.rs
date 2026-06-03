@@ -1,4 +1,3 @@
-
 use crate::streaming::LlmEvent;
 use crate::types::{LlmRequest, LlmResponse};
 use async_trait::async_trait;

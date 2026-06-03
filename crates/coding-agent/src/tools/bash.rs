@@ -1,6 +1,7 @@
-
 use agent_core::tool::AgentTool;
-use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock, ToolExecutionMode};
+use agent_core::types::{
+    AgentToolResult, AgentToolUpdateCallback, ContentBlock, ToolExecutionMode,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -160,7 +161,9 @@ impl BashOperations for LocalBashOperations {
     ) -> Result<BashExecResult, Box<dyn std::error::Error + Send + Sync>> {
         let shell = self.shell_path.as_deref().unwrap_or("/bin/bash");
         let mut cmd = Command::new(shell);
-        cmd.arg("-c").arg(command).current_dir(cwd)
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if let Some(ref env) = options.env {
@@ -170,7 +173,6 @@ impl BashOperations for LocalBashOperations {
 
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
-
 
         let _stdout_buf = vec![0u8; 8192];
         let _stderr_buf = vec![0u8; 8192];
@@ -184,7 +186,9 @@ impl BashOperations for LocalBashOperations {
                     use tokio::io::AsyncBufReadExt;
                     let mut line = vec![];
                     let n = reader.read_until(b'\n', &mut line).await.unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     on_data(line);
                 }
             })
@@ -198,17 +202,18 @@ impl BashOperations for LocalBashOperations {
                     use tokio::io::AsyncBufReadExt;
                     let mut line = vec![];
                     let n = reader.read_until(b'\n', &mut line).await.unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     on_data(line);
                 }
             })
         };
 
         let status = if let Some(timeout_secs) = options.timeout {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                child.wait(),
-            ).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait())
+                .await
+            {
                 Ok(result) => result?,
                 Err(_) => {
                     let _ = child.kill().await;
@@ -222,9 +227,7 @@ impl BashOperations for LocalBashOperations {
         let _ = stdout_handle.await;
         let _ = stderr_handle.await;
 
-        Ok(BashExecResult {
-            exit_code: status.code(),
-        })
+        Ok(BashExecResult { exit_code: status.code() })
     }
 }
 
@@ -232,14 +235,12 @@ impl BashOperations for LocalBashOperations {
 // Bash Tool Options
 // ============================================================================
 
-#[derive(Clone)]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct BashToolOptions {
     pub operations: Option<Arc<dyn BashOperations>>,
     pub command_prefix: Option<String>,
     pub shell_path: Option<String>,
 }
-
 
 // ============================================================================
 // Bash Tool
@@ -253,17 +254,22 @@ pub struct BashTool {
 
 impl BashTool {
     pub fn new(cwd: String, options: BashToolOptions) -> Self {
-        let ops = options.operations.clone().unwrap_or_else(|| {
-            Arc::new(LocalBashOperations::new(options.shell_path.clone()))
-        });
+        let ops = options
+            .operations
+            .clone()
+            .unwrap_or_else(|| Arc::new(LocalBashOperations::new(options.shell_path.clone())));
         Self { cwd, options, operations: ops }
     }
 }
 
 #[async_trait]
 impl AgentTool for BashTool {
-    fn name(&self) -> &str { "bash" }
-    fn label(&self) -> &str { "bash" }
+    fn name(&self) -> &str {
+        "bash"
+    }
+    fn label(&self) -> &str {
+        "bash"
+    }
 
     fn description(&self) -> &str {
         "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated."
@@ -293,7 +299,8 @@ impl AgentTool for BashTool {
         signal: Option<CancellationToken>,
         on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let command = params.get("command")
+        let command = params
+            .get("command")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'command' field")?
             .to_string();
@@ -377,19 +384,23 @@ impl AgentTool for BashTool {
                 };
 
                 if let Some(code) = exec_result.exit_code
-                    && code != 0 {
-                        output_text.push_str(&format!("\n\nCommand exited with code {}", code));
-                        return Err(Box::new(std::io::Error::other(
-                            output_text,
-                        )));
-                    }
+                    && code != 0
+                {
+                    output_text.push_str(&format!("\n\nCommand exited with code {}", code));
+                    return Err(Box::new(std::io::Error::other(output_text)));
+                }
 
                 Ok(AgentToolResult {
                     content: vec![ContentBlock::Text { text: output_text }],
                     details: serde_json::to_value(BashToolDetails {
-                        truncation: if truncation.truncated { Some(truncation) } else { None },
+                        truncation: if truncation.truncated {
+                            Some(truncation)
+                        } else {
+                            None
+                        },
                         full_output_path,
-                    }).unwrap_or_default(),
+                    })
+                    .unwrap_or_default(),
                     terminate: false,
                 })
             }
@@ -397,15 +408,17 @@ impl AgentTool for BashTool {
                 let err_msg = e.to_string();
                 let mut output = snap.content.clone();
                 if err_msg.contains("aborted") {
-                    if !output.is_empty() { output.push_str("\n\n"); }
+                    if !output.is_empty() {
+                        output.push_str("\n\n");
+                    }
                     output.push_str("Command aborted");
                 } else if err_msg.contains("timeout") {
-                    if !output.is_empty() { output.push_str("\n\n"); }
+                    if !output.is_empty() {
+                        output.push_str("\n\n");
+                    }
                     output.push_str("Command timed out");
                 }
-                Err(Box::new(std::io::Error::other(
-                    output,
-                )))
+                Err(Box::new(std::io::Error::other(output)))
             }
         }
     }
@@ -448,7 +461,14 @@ mod tests {
     fn test_bash_tool_schema() {
         let tool = BashTool::new("/tmp".into(), BashToolOptions::default());
         let schema = tool.parameters();
-        assert!(schema.get("required").unwrap().as_array().unwrap().contains(&serde_json::json!("command")));
+        assert!(
+            schema
+                .get("required")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("command"))
+        );
     }
 
     #[tokio::test]
@@ -468,16 +488,11 @@ mod tests {
         let params = serde_json::json!({
             "command": "printf 'a\\nb\\nc\\n'"
         });
-        let result = tool
-            .execute("test".into(), params, None, Some(on_update))
-            .await;
+        let result = tool.execute("test".into(), params, None, Some(on_update)).await;
         assert!(result.is_ok(), "bash should succeed: {:?}", result.err());
 
         let collected = updates.lock().unwrap();
-        assert!(
-            !collected.is_empty(),
-            "expected at least one streaming partial update"
-        );
+        assert!(!collected.is_empty(), "expected at least one streaming partial update");
         // Final partial should contain output from the command.
         let last = collected.last().unwrap();
         assert!(

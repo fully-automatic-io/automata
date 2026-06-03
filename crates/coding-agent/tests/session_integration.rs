@@ -16,9 +16,13 @@ fn user(text: &str, ts: u64) -> AgentMessage {
 fn assistant(text: &str, ts: u64) -> AgentMessage {
     AgentMessage::Assistant {
         content: vec![ContentBlock::Text { text: text.into() }],
-        api: agent_core::types::Api::Anthropic, provider: "t".into(), model: "m".into(),
-        usage: Usage::default(), stop_reason: StopReason::EndTurn,
-        error_message: None, timestamp: ts,
+        api: agent_core::types::Api::Anthropic,
+        provider: "t".into(),
+        model: "m".into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::EndTurn,
+        error_message: None,
+        timestamp: ts,
     }
 }
 
@@ -31,14 +35,24 @@ async fn test_session_persist_and_reload() {
     let mut session = repo.create(cwd, None, None).await.unwrap();
 
     session.append_message(user("hello", 1000)).await.unwrap();
-    session.append_message(AgentMessage::Assistant {
-        content: vec![ContentBlock::Text { text: "hi there".into() }],
-        api: agent_core::types::Api::Anthropic, provider: "anthropic".into(), model: "claude-opus-4-7".into(),
-        usage: Usage { input: 5, output: 5, total_tokens: 10, ..Default::default() },
-        stop_reason: StopReason::EndTurn,
-        error_message: None,
-        timestamp: 2000,
-    }).await.unwrap();
+    session
+        .append_message(AgentMessage::Assistant {
+            content: vec![ContentBlock::Text { text: "hi there".into() }],
+            api: agent_core::types::Api::Anthropic,
+            provider: "anthropic".into(),
+            model: "claude-opus-4-7".into(),
+            usage: Usage {
+                input: 5,
+                output: 5,
+                total_tokens: 10,
+                ..Default::default()
+            },
+            stop_reason: StopReason::EndTurn,
+            error_message: None,
+            timestamp: 2000,
+        })
+        .await
+        .unwrap();
 
     let path = session.get_metadata().await.id;
     drop(session);
@@ -82,12 +96,18 @@ async fn test_session_compaction_context() {
     let _u1 = session.append_message(user("old q", 1)).await.unwrap();
     let a1 = session.append_message(assistant("old a", 2)).await.unwrap();
 
-    session.append_compaction("Summary of old conversation", &a1, 1000, None, None).await.unwrap();
+    session
+        .append_compaction("Summary of old conversation", &a1, 1000, None, None)
+        .await
+        .unwrap();
     let _u2 = session.append_message(user("new q", 3)).await.unwrap();
 
     let ctx = session.build_context().await.unwrap();
     assert!(ctx.messages.len() >= 2);
-    assert!(matches!(ctx.messages[0], AgentMessage::CompactionSummary { .. } | AgentMessage::User { .. }));
+    assert!(matches!(
+        ctx.messages[0],
+        AgentMessage::CompactionSummary { .. } | AgentMessage::User { .. }
+    ));
 }
 
 #[tokio::test]
@@ -112,23 +132,29 @@ async fn test_session_labels() {
 
     let storage = session.storage_mut();
     let lid = storage.create_entry_id().await;
-    storage.append_entry(SessionTreeEntry::Label {
-        id: lid,
-        parent_id: None,
-        timestamp: agent_core::harness::session::now_iso(),
-        target_id: id.clone(),
-        label: Some("key point".into()),
-    }).await.unwrap();
+    storage
+        .append_entry(SessionTreeEntry::Label {
+            id: lid,
+            parent_id: None,
+            timestamp: agent_core::harness::session::now_iso(),
+            target_id: id.clone(),
+            label: Some("key point".into()),
+        })
+        .await
+        .unwrap();
     assert_eq!(session.storage().get_label(&id).await.as_deref(), Some("key point"));
 
     let storage = session.storage_mut();
     let lid2 = storage.create_entry_id().await;
-    storage.append_entry(SessionTreeEntry::Label {
-        id: lid2,
-        parent_id: None,
-        timestamp: agent_core::harness::session::now_iso(),
-        target_id: id.clone(),
-        label: None,
-    }).await.unwrap();
+    storage
+        .append_entry(SessionTreeEntry::Label {
+            id: lid2,
+            parent_id: None,
+            timestamp: agent_core::harness::session::now_iso(),
+            target_id: id.clone(),
+            label: None,
+        })
+        .await
+        .unwrap();
     assert_eq!(session.storage().get_label(&id).await, None);
 }

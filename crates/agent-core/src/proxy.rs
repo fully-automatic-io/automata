@@ -99,10 +99,7 @@ pub fn process_proxy_event(
                 text: String::new(),
                 text_signature: None,
             };
-            Some(AssistantMessageEvent::TextStart {
-                content_index,
-                partial: partial.clone(),
-            })
+            Some(AssistantMessageEvent::TextStart { content_index, partial: partial.clone() })
         }
         ProxyAssistantMessageEvent::TextDelta { content_index, delta } => {
             if let Some(PartialContentBlock::Text { text, .. }) =
@@ -138,10 +135,7 @@ pub fn process_proxy_event(
                 thinking: String::new(),
                 thinking_signature: None,
             };
-            Some(AssistantMessageEvent::ThinkingStart {
-                content_index,
-                partial: partial.clone(),
-            })
+            Some(AssistantMessageEvent::ThinkingStart { content_index, partial: partial.clone() })
         }
         ProxyAssistantMessageEvent::ThinkingDelta { content_index, delta } => {
             if let Some(PartialContentBlock::Thinking { thinking, .. }) =
@@ -179,10 +173,7 @@ pub fn process_proxy_event(
                 arguments: serde_json::json!({}),
                 partial_json: None,
             };
-            Some(AssistantMessageEvent::ToolCallStart {
-                content_index,
-                partial: partial.clone(),
-            })
+            Some(AssistantMessageEvent::ToolCallStart { content_index, partial: partial.clone() })
         }
         ProxyAssistantMessageEvent::ToolCallDelta { content_index, delta } => {
             if let Some(PartialContentBlock::ToolCall { arguments, partial_json, .. }) =
@@ -231,10 +222,7 @@ pub fn process_proxy_event(
             if let Some(msg) = error_message {
                 partial.error_message = Some(msg);
             }
-            Some(AssistantMessageEvent::Error {
-                reason,
-                error: partial.clone(),
-            })
+            Some(AssistantMessageEvent::Error { reason, error: partial.clone() })
         }
     }
 }

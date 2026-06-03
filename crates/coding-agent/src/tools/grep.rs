@@ -1,4 +1,3 @@
-
 use agent_core::tool::AgentTool;
 use agent_core::types::{AgentToolResult, AgentToolUpdateCallback, ContentBlock};
 use async_trait::async_trait;
@@ -112,16 +111,16 @@ impl AgentTool for GrepTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing 'pattern' parameter")?;
 
-        let search_path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let search_path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         let glob = params.get("glob").and_then(|v| v.as_str());
         let ignore_case = params.get("ignoreCase").and_then(|v| v.as_bool()).unwrap_or(false);
         let literal = params.get("literal").and_then(|v| v.as_bool()).unwrap_or(false);
         let context = params.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MAX_MATCHES as u64) as usize;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_MAX_MATCHES as u64) as usize;
 
         // Resolve path
         let resolved_path = self.resolve_path(search_path);
@@ -136,7 +135,8 @@ impl AgentTool for GrepTool {
                     truncated: false,
                     total_matches: 0,
                     max_matches: limit,
-                }).unwrap_or_default(),
+                })
+                .unwrap_or_default(),
                 terminate: false,
             });
         }
@@ -288,7 +288,8 @@ impl AgentTool for GrepTool {
                 truncated,
                 total_matches,
                 max_matches: limit,
-            }).unwrap_or_default(),
+            })
+            .unwrap_or_default(),
             terminate: false,
         })
     }

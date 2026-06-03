@@ -1,5 +1,5 @@
-use coding_agent::tools::{EditTool, EditToolOptions};
 use agent_core::tool::AgentTool;
+use coding_agent::tools::{EditTool, EditToolOptions};
 use tempfile::TempDir;
 use tokio::fs;
 

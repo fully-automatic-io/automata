@@ -217,7 +217,9 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub fn empty() -> Self { Self::default() }
+    pub fn empty() -> Self {
+        Self::default()
+    }
 
     pub fn add(&mut self, other: &Usage) {
         self.input += other.input;
@@ -252,7 +254,12 @@ pub struct ModelCost {
 
 impl Default for ModelCost {
     fn default() -> Self {
-        Self { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 }
+        Self {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        }
     }
 }
 
@@ -263,11 +270,19 @@ impl Default for ModelCost {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelCompat {
     /// Force adaptive thinking (`thinking.type = "adaptive"`) regardless of id.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "forceAdaptiveThinking")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "forceAdaptiveThinking"
+    )]
     pub force_adaptive_thinking: Option<bool>,
     /// Whether the model accepts the Anthropic `temperature` field. Claude
     /// Opus 4.7+ reject non-default temperature values.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "supportsTemperature")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "supportsTemperature"
+    )]
     pub supports_temperature: Option<bool>,
 }
 
@@ -312,7 +327,11 @@ impl Model {
     /// Cap `requested` so it never exceeds either the model's `max_tokens` or
     /// `context_window - input_tokens_estimate`.
     pub fn cap_output_budget(&self, requested: Option<u32>, input_tokens_estimate: u64) -> u32 {
-        let model_cap = if self.max_tokens > 0 { self.max_tokens } else { u64::MAX };
+        let model_cap = if self.max_tokens > 0 {
+            self.max_tokens
+        } else {
+            u64::MAX
+        };
         let context_cap = self.context_window.saturating_sub(input_tokens_estimate);
         let asked = requested.map(u64::from).unwrap_or(model_cap);
         let capped = asked.min(model_cap).min(context_cap.max(1));
@@ -322,9 +341,13 @@ impl Model {
     /// Clamp `reasoning` to a level this model supports. Models without
     /// reasoning return None. `Some(ThinkingLevel::Off)` also collapses to None.
     pub fn clamp_reasoning(&self, reasoning: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
-        if !self.reasoning { return None; }
+        if !self.reasoning {
+            return None;
+        }
         let level = reasoning?;
-        if level == ThinkingLevel::Off { return None; }
+        if level == ThinkingLevel::Off {
+            return None;
+        }
         Some(level)
     }
 }
@@ -362,7 +385,9 @@ impl From<&Model> for ModelInfo {
 }
 
 impl From<Model> for ModelInfo {
-    fn from(m: Model) -> Self { Self::from(&m) }
+    fn from(m: Model) -> Self {
+        Self::from(&m)
+    }
 }
 
 // ============================================================================
@@ -419,7 +444,9 @@ pub enum MessageContent {
 }
 
 impl Default for MessageContent {
-    fn default() -> Self { Self::Blocks(vec![]) }
+    fn default() -> Self {
+        Self::Blocks(vec![])
+    }
 }
 
 impl MessageContent {
@@ -429,7 +456,9 @@ impl MessageContent {
             Self::Blocks(b) => b,
         }
     }
-    pub fn as_blocks(&self) -> Vec<ContentBlock> { self.clone().into_blocks() }
+    pub fn as_blocks(&self) -> Vec<ContentBlock> {
+        self.clone().into_blocks()
+    }
 }
 
 // ============================================================================
@@ -461,7 +490,11 @@ pub enum AgentMessage {
         usage: Usage,
         #[serde(rename = "stopReason")]
         stop_reason: StopReason,
-        #[serde(rename = "errorMessage", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "errorMessage",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         error_message: Option<String>,
         #[serde(default)]
         timestamp: u64,
@@ -512,11 +545,19 @@ pub enum AgentMessage {
         cancelled: bool,
         #[serde(default)]
         truncated: bool,
-        #[serde(rename = "fullOutputPath", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "fullOutputPath",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         full_output_path: Option<String>,
         #[serde(default)]
         timestamp: u64,
-        #[serde(rename = "excludeFromContext", default, skip_serializing_if = "std::ops::Not::not")]
+        #[serde(
+            rename = "excludeFromContext",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
         exclude_from_context: bool,
     },
 
@@ -577,7 +618,11 @@ impl AgentMessage {
 
     /// Returns the assistant content array if this is an assistant message.
     pub fn assistant_content(&self) -> Option<&[ContentBlock]> {
-        if let Self::Assistant { content, .. } = self { Some(content) } else { None }
+        if let Self::Assistant { content, .. } = self {
+            Some(content)
+        } else {
+            None
+        }
     }
 
     /// Returns the assistant `errorMessage` field if set.
@@ -591,7 +636,11 @@ impl AgentMessage {
 
     /// Returns the assistant `stopReason` if this is an assistant message.
     pub fn stop_reason(&self) -> Option<StopReason> {
-        if let Self::Assistant { stop_reason, .. } = self { Some(*stop_reason) } else { None }
+        if let Self::Assistant { stop_reason, .. } = self {
+            Some(*stop_reason)
+        } else {
+            None
+        }
     }
 
     /// Wire-format stop reason (`"stop"`, `"error"`, ...) for legacy callers.
@@ -701,11 +750,19 @@ pub struct AnthropicOptions {
     /// model id. `None` falls back to substring matching on the model id.
     /// Set explicitly for custom Anthropic-compatible aliases (Bedrock,
     /// Cloudflare AI Gateway, Fireworks, etc.).
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "forceAdaptiveThinking")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "forceAdaptiveThinking"
+    )]
     pub force_adaptive_thinking: Option<bool>,
     /// Whether the model accepts the `temperature` field. `None` falls back to
     /// substring matching on the model id. Claude Opus 4.7+ set this `false`.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "supportsTemperature")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "supportsTemperature"
+    )]
     pub supports_temperature: Option<bool>,
 }
 
@@ -717,13 +774,21 @@ pub struct OpenaiOptions {
     /// hints instead of the native `prompt_cache_retention` parameter. Set
     /// for OpenAI-compatible endpoints that proxy to Anthropic (DeepSeek,
     /// Cloudflare Workers AI, Together AI, etc.).
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "anthropicCacheControl")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "anthropicCacheControl"
+    )]
     pub anthropic_cache_control: Option<bool>,
 }
 
 impl LlmRequest {
     pub fn new(model: impl Into<String>, messages: Vec<AgentMessage>) -> Self {
-        Self { model: model.into(), messages, ..Default::default() }
+        Self {
+            model: model.into(),
+            messages,
+            ..Default::default()
+        }
     }
 }
 
@@ -878,57 +943,63 @@ pub struct TurnUpdate {
     pub messages: Vec<AgentMessage>,
 }
 
-
 // ============================================================================
 // Hook type aliases — small named closure types for AgentLoopConfig.
 // ============================================================================
 
 pub type ConvertToLlmFn = Arc<
-    dyn Fn(Vec<AgentMessage>)
-            -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
-        + Send + Sync,
+    dyn Fn(Vec<AgentMessage>) -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+        + Send
+        + Sync,
 >;
 pub type TransformContextFn = Arc<
-    dyn Fn(Vec<AgentMessage>, Option<CancellationToken>)
-            -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
-        + Send + Sync,
+    dyn Fn(
+            Vec<AgentMessage>,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+        + Send
+        + Sync,
 >;
-pub type GetApiKeyFn = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
-        + Send + Sync,
->;
-pub type GetMessagesFn = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
-        + Send + Sync,
->;
+pub type GetApiKeyFn =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+pub type GetMessagesFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>> + Send + Sync>;
 pub type BeforeToolCallFn = Arc<
-    dyn Fn(BeforeToolCallContext, Option<CancellationToken>)
-            -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
-        + Send + Sync,
+    dyn Fn(
+            BeforeToolCallContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
+        + Send
+        + Sync,
 >;
 pub type AfterToolCallFn = Arc<
-    dyn Fn(AfterToolCallContext, Option<CancellationToken>)
-            -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
-        + Send + Sync,
+    dyn Fn(
+            AfterToolCallContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
+        + Send
+        + Sync,
 >;
 pub type ShouldStopAfterTurnFn = Arc<
-    dyn Fn(ShouldStopAfterTurnContext, Option<CancellationToken>)
-            -> Pin<Box<dyn Future<Output = bool> + Send>>
-        + Send + Sync,
+    dyn Fn(
+            ShouldStopAfterTurnContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send>>
+        + Send
+        + Sync,
 >;
 pub type PrepareNextTurnFn = Arc<
-    dyn Fn(PrepareNextTurnContext, Option<CancellationToken>)
-            -> Pin<Box<dyn Future<Output = Option<TurnUpdate>> + Send>>
-        + Send + Sync,
+    dyn Fn(
+            PrepareNextTurnContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Option<TurnUpdate>> + Send>>
+        + Send
+        + Sync,
 >;
-pub type OnPayloadFn = Arc<
-    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send + Sync,
->;
-pub type OnResponseFn = Arc<
-    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send + Sync,
->;
+pub type OnPayloadFn =
+    Arc<dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type OnResponseFn =
+    Arc<dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 // ============================================================================
 // AgentLoopConfig
@@ -1052,21 +1123,43 @@ impl AgentState {
         }
     }
 
-    pub fn system_prompt(&self) -> &str { &self.system_prompt }
-    pub fn set_system_prompt(&mut self, prompt: String) { self.system_prompt = prompt; }
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+    pub fn set_system_prompt(&mut self, prompt: String) {
+        self.system_prompt = prompt;
+    }
 
-    pub fn model(&self) -> &ModelInfo { &self.model }
-    pub fn set_model(&mut self, model: ModelInfo) { self.model = model; }
+    pub fn model(&self) -> &ModelInfo {
+        &self.model
+    }
+    pub fn set_model(&mut self, model: ModelInfo) {
+        self.model = model;
+    }
 
-    pub fn thinking_level(&self) -> ThinkingLevel { self.thinking_level }
-    pub fn set_thinking_level(&mut self, level: ThinkingLevel) { self.thinking_level = level; }
+    pub fn thinking_level(&self) -> ThinkingLevel {
+        self.thinking_level
+    }
+    pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
+        self.thinking_level = level;
+    }
 
-    pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> { self.tools.clone() }
-    pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) { self.tools = tools; }
+    pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.tools.clone()
+    }
+    pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
+        self.tools = tools;
+    }
 
-    pub fn messages(&self) -> Vec<AgentMessage> { self.messages.clone() }
-    pub fn set_messages(&mut self, messages: Vec<AgentMessage>) { self.messages = messages; }
-    pub fn push_message(&mut self, message: AgentMessage) { self.messages.push(message); }
+    pub fn messages(&self) -> Vec<AgentMessage> {
+        self.messages.clone()
+    }
+    pub fn set_messages(&mut self, messages: Vec<AgentMessage>) {
+        self.messages = messages;
+    }
+    pub fn push_message(&mut self, message: AgentMessage) {
+        self.messages.push(message);
+    }
 
     /// Fold an [`crate::event::AgentEvent`] into the running state. Mirrors
     /// pi-mono's `Agent.processEvents`: tracks the streaming message, appends
@@ -1149,7 +1242,10 @@ mod tests {
 
     #[test]
     fn test_tool_execution_mode_serde() {
-        assert_eq!(serde_json::to_string(&ToolExecutionMode::Sequential).unwrap(), r#""sequential""#);
+        assert_eq!(
+            serde_json::to_string(&ToolExecutionMode::Sequential).unwrap(),
+            r#""sequential""#
+        );
         assert_eq!(serde_json::to_string(&ToolExecutionMode::Parallel).unwrap(), r#""parallel""#);
     }
 
@@ -1195,7 +1291,12 @@ mod tests {
 
     #[test]
     fn test_cap_output_budget_within_limits() {
-        let m = Model { reasoning: true, max_tokens: 16384, context_window: 200000, ..Default::default() };
+        let m = Model {
+            reasoning: true,
+            max_tokens: 16384,
+            context_window: 200000,
+            ..Default::default()
+        };
         assert_eq!(m.cap_output_budget(Some(4000), 1000), 4000);
     }
 
@@ -1208,8 +1309,12 @@ mod tests {
     #[test]
     fn test_stop_reason_round_trip() {
         for r in [
-            StopReason::EndTurn, StopReason::MaxTokens, StopReason::StopSequence,
-            StopReason::ToolUse, StopReason::ContentFilter, StopReason::Error,
+            StopReason::EndTurn,
+            StopReason::MaxTokens,
+            StopReason::StopSequence,
+            StopReason::ToolUse,
+            StopReason::ContentFilter,
+            StopReason::Error,
             StopReason::Aborted,
         ] {
             assert_eq!(StopReason::from_wire_str(r.as_wire_str()), Some(r));
@@ -1224,8 +1329,12 @@ mod tests {
     #[test]
     fn test_thinking_level_round_trip() {
         for l in [
-            ThinkingLevel::Off, ThinkingLevel::Minimal, ThinkingLevel::Low,
-            ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::XHigh,
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
         ] {
             assert_eq!(ThinkingLevel::from_wire_str(l.as_str()), Some(l));
         }
@@ -1238,7 +1347,9 @@ mod tests {
         let json = r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"api":"anthropic","provider":"p","model":"m","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}"#;
         let m: AgentMessage = serde_json::from_str(json).unwrap();
         match m {
-            AgentMessage::Assistant { stop_reason, .. } => assert_eq!(stop_reason, StopReason::EndTurn),
+            AgentMessage::Assistant { stop_reason, .. } => {
+                assert_eq!(stop_reason, StopReason::EndTurn)
+            }
             _ => panic!("expected Assistant"),
         }
     }
@@ -1292,11 +1403,20 @@ mod tests {
 
     #[test]
     fn test_usage_add() {
-        let mut a = Usage { input: 100, output: 50, total_tokens: 150, ..Default::default() };
-        let b = Usage { input: 200, output: 100, total_tokens: 300, ..Default::default() };
+        let mut a = Usage {
+            input: 100,
+            output: 50,
+            total_tokens: 150,
+            ..Default::default()
+        };
+        let b = Usage {
+            input: 200,
+            output: 100,
+            total_tokens: 300,
+            ..Default::default()
+        };
         a.add(&b);
         assert_eq!(a.input, 300);
         assert_eq!(a.total_tokens, 450);
     }
 }
-

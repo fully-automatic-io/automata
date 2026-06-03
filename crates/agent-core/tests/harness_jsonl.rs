@@ -1,11 +1,11 @@
 use agent_core::agent_loop::{StreamFn, StreamFnInput};
 use agent_core::event::EventStream;
-use agent_core::harness::{
-    AgentHarness, HarnessConfig, HarnessPhase, JsonlSessionRepo, Session,
-    InMemorySessionStorage,
-};
 use agent_core::harness::agent_harness::AgentHarnessOptions;
-use agent_core::types::{AgentMessage, ThinkingLevel};
+use agent_core::harness::{
+    AgentHarness, HarnessConfig, HarnessPhase, InMemorySessionStorage, JsonlSessionRepo, Session,
+};
+use agent_core::tool::{AgentTool, ToolDefinitionWrapper};
+use agent_core::types::{AgentMessage, AgentToolResult, ThinkingLevel};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -31,6 +31,26 @@ fn make_options() -> AgentHarnessOptions {
         on_payload: None,
         on_response: None,
     }
+}
+
+fn named_tool(name: &str) -> Arc<dyn AgentTool> {
+    Arc::new(ToolDefinitionWrapper {
+        name: name.to_string(),
+        label: name.to_string(),
+        description: format!("{} tool", name),
+        parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+        execution_mode_override: None,
+        prepare_arguments_fn: None,
+        execute_fn: Arc::new(|_, _, _, _| {
+            Box::pin(async move {
+                Ok(AgentToolResult {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    details: serde_json::Value::Null,
+                    terminate: false,
+                })
+            })
+        }),
+    })
 }
 
 #[tokio::test]
@@ -128,6 +148,49 @@ async fn test_harness_set_model_persists_to_session() {
     assert_eq!(m.model_id, "gpt-4o");
 }
 
+#[tokio::test]
+async fn test_session_active_tools_change_restores_context() {
+    use agent_core::harness::session::{InMemorySessionStorage, Session, SessionTreeEntry};
+
+    let storage = InMemorySessionStorage::new(None);
+    let mut session = Session::new(Box::new(storage));
+    session
+        .append_active_tools_change(vec!["read".into(), "bash".into()])
+        .await
+        .unwrap();
+
+    let ctx = session.build_context().await.unwrap();
+    assert_eq!(ctx.active_tool_names, Some(vec!["read".into(), "bash".into()]));
+
+    let entries = session.storage().get_entries().await;
+    let json = serde_json::to_value(entries.last().unwrap()).unwrap();
+    assert_eq!(json["type"], "active_tools_change");
+    assert_eq!(json["activeToolNames"], serde_json::json!(["read", "bash"]));
+    assert!(matches!(entries.last(), Some(SessionTreeEntry::ActiveToolsChange { .. })));
+}
+
+#[tokio::test]
+async fn test_harness_active_tool_names_persist_and_filter() {
+    use agent_core::harness::session::SessionTreeEntry;
+
+    let harness = make_idle_harness();
+    harness.set_active_tools(vec![named_tool("read"), named_tool("bash")]).await;
+    assert_eq!(harness.active_tool_names().await, vec!["read".to_string(), "bash".to_string()]);
+    assert_eq!(harness.active_tools().await.len(), 2);
+
+    harness.set_active_tool_names(vec!["read".into()]).await.unwrap();
+    assert_eq!(harness.active_tool_names().await, vec!["read".to_string()]);
+    assert_eq!(harness.active_tools().await.len(), 1);
+
+    let ctx = harness.build_context().await.unwrap();
+    assert_eq!(ctx.active_tool_names, Some(vec!["read".to_string()]));
+    let entries = harness.session().lock().await.storage().get_entries().await;
+    assert!(entries.iter().any(|entry| matches!(entry,
+        SessionTreeEntry::ActiveToolsChange { active_tool_names, .. }
+        if active_tool_names == &vec!["read".to_string()]
+    )));
+}
+
 fn make_idle_harness() -> AgentHarness {
     let storage = InMemorySessionStorage::new(None);
     let session = Session::new(Box::new(storage));
@@ -147,10 +210,15 @@ fn make_idle_harness() -> AgentHarness {
 async fn test_record_custom_writes_through_when_idle() {
     use agent_core::harness::session::SessionTreeEntry;
     let harness = make_idle_harness();
-    let id = harness.record_custom("artifact", Some(serde_json::json!({"k": "v"}))).await.unwrap();
+    let id = harness
+        .record_custom("artifact", Some(serde_json::json!({"k": "v"})))
+        .await
+        .unwrap();
     assert!(!id.is_empty(), "idle path should return real id");
     let entries = harness.session().lock().await.storage().get_entries().await;
-    let found = entries.iter().any(|e| matches!(e, SessionTreeEntry::Custom { id: eid, .. } if eid == &id));
+    let found = entries
+        .iter()
+        .any(|e| matches!(e, SessionTreeEntry::Custom { id: eid, .. } if eid == &id));
     assert!(found, "Custom entry should be persisted directly");
 }
 
@@ -178,18 +246,28 @@ async fn test_record_label_attaches_and_clears() {
 
     harness.record_label(&target_id, Some("important".into())).await.unwrap();
     let entries = harness.session().lock().await.storage().get_entries().await;
-    let labelled = entries.iter().filter(|e| matches!(e,
-        SessionTreeEntry::Label { target_id: t, label: Some(l), .. }
-        if t == &target_id && l == "important"
-    )).count();
+    let labelled = entries
+        .iter()
+        .filter(|e| {
+            matches!(e,
+                SessionTreeEntry::Label { target_id: t, label: Some(l), .. }
+                if t == &target_id && l == "important"
+            )
+        })
+        .count();
     assert_eq!(labelled, 1);
 
     // Clearing the label is a separate Label entry with `label = None`.
     harness.record_label(&target_id, None).await.unwrap();
     let entries = harness.session().lock().await.storage().get_entries().await;
-    let cleared = entries.iter().filter(|e| matches!(e,
-        SessionTreeEntry::Label { target_id: t, label: None, .. } if t == &target_id
-    )).count();
+    let cleared = entries
+        .iter()
+        .filter(|e| {
+            matches!(e,
+                SessionTreeEntry::Label { target_id: t, label: None, .. } if t == &target_id
+            )
+        })
+        .count();
     assert_eq!(cleared, 1);
 }
 
@@ -240,8 +318,10 @@ async fn test_navigate_tree_rejects_when_not_idle() {
 
 // ─── Phase 1.5: post-run state machine ───────────────────────────────────────
 
-use agent_core::harness::{PostRunDecision};
-use agent_core::harness::compaction::{CompactionError, CompactionSettings, StreamFn as CompactionStreamFn};
+use agent_core::harness::PostRunDecision;
+use agent_core::harness::compaction::{
+    CompactionError, CompactionSettings, StreamFn as CompactionStreamFn,
+};
 use agent_core::types::{Api, ContentBlock, StopReason, Usage};
 
 fn err_assistant(msg: &str, model_provider: &str, model_id: &str) -> AgentMessage {
@@ -258,7 +338,9 @@ fn err_assistant(msg: &str, model_provider: &str, model_id: &str) -> AgentMessag
 }
 
 fn dummy_compaction_stream_fn() -> CompactionStreamFn {
-    Box::new(|_msgs, _system| Box::pin(async move { Ok::<String, CompactionError>("summary".into()) }))
+    Box::new(|_msgs, _system| {
+        Box::pin(async move { Ok::<String, CompactionError>("summary".into()) })
+    })
 }
 
 #[tokio::test]
@@ -274,16 +356,20 @@ async fn test_post_run_stop_when_no_message() {
 #[tokio::test]
 async fn test_post_run_retry_on_transient_error() {
     let harness = make_idle_harness();
-    harness.set_last_assistant_for_test(Some(err_assistant(
-        "503 service unavailable",
-        "anthropic",
-        "claude-sonnet-4-6",
-    ))).await;
-    harness.set_retry_settings(agent_core::auto_retry::RetrySettings {
-        enabled: true,
-        max_retries: 2,
-        base_delay_ms: 1,
-    }).await;
+    harness
+        .set_last_assistant_for_test(Some(err_assistant(
+            "503 service unavailable",
+            "anthropic",
+            "claude-sonnet-4-6",
+        )))
+        .await;
+    harness
+        .set_retry_settings(agent_core::auto_retry::RetrySettings {
+            enabled: true,
+            max_retries: 2,
+            base_delay_ms: 1,
+        })
+        .await;
 
     let dec = harness
         .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
@@ -296,11 +382,13 @@ async fn test_post_run_retry_on_transient_error() {
 #[tokio::test]
 async fn test_post_run_retry_exhausts_after_max_attempts() {
     let harness = make_idle_harness();
-    harness.set_retry_settings(agent_core::auto_retry::RetrySettings {
-        enabled: true,
-        max_retries: 1,  // Only 1 retry allowed.
-        base_delay_ms: 1,
-    }).await;
+    harness
+        .set_retry_settings(agent_core::auto_retry::RetrySettings {
+            enabled: true,
+            max_retries: 1, // Only 1 retry allowed.
+            base_delay_ms: 1,
+        })
+        .await;
     let err = err_assistant("rate limit", "anthropic", "claude-sonnet-4-6");
 
     // First call: retry succeeds.
@@ -355,11 +443,11 @@ async fn test_post_run_overflow_triggers_compacted_retry_once() {
 
 #[tokio::test]
 async fn test_post_run_overflow_skipped_for_different_model() {
-    let harness = make_idle_harness();  // Configured with claude-sonnet-4-6
+    let harness = make_idle_harness(); // Configured with claude-sonnet-4-6
     let overflow = AgentMessage::Assistant {
         content: vec![],
         api: Api::Anthropic,
-        provider: "openai".into(),       // ← different model
+        provider: "openai".into(), // ← different model
         model: "gpt-4o".into(),
         usage: Usage::default(),
         stop_reason: StopReason::Error,
@@ -412,7 +500,9 @@ async fn test_post_run_reset_recovery_state_on_new_execute_turn() {
         timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
     };
     harness.set_last_assistant_for_test(Some(overflow)).await;
-    let _ = harness.check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn()).await;
+    let _ = harness
+        .check_post_run(&CompactionSettings::default(), &dummy_compaction_stream_fn())
+        .await;
     assert!(harness.overflow_recovery_attempted_for_test().await);
 
     // execute_turn must reset the gate.
@@ -463,8 +553,8 @@ async fn test_abort_with_empty_queues_returns_empty_result() {
 
 #[tokio::test]
 async fn test_auto_compaction_runs_on_execute_turn_when_last_aborted() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use agent_core::harness::AutoCompactionConfig;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // Verify wiring: when set_auto_compaction is configured, execute_turn
     // calls into check_pre_prompt → check_post_run_inner. We can't easily
@@ -575,7 +665,12 @@ async fn test_check_post_run_drains_queued_followups() {
         api: Api::Anthropic,
         provider: "anthropic".into(),
         model: "claude-sonnet-4-6".into(),
-        usage: Usage { input: 1, output: 1, total_tokens: 2, ..Default::default() },
+        usage: Usage {
+            input: 1,
+            output: 1,
+            total_tokens: 2,
+            ..Default::default()
+        },
         stop_reason: StopReason::EndTurn,
         error_message: None,
         timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,

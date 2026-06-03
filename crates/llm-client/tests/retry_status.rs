@@ -1,23 +1,32 @@
-use llm_client::retry::{format_http_error, retry_delay, should_retry};
 use llm_client::provider::LlmError;
+use llm_client::retry::{format_http_error, retry_delay, should_retry};
 use std::time::Duration;
 
 #[test]
 fn test_http_503_triggers_retry() {
-    let err = LlmError::Http { status: 503, message: format_http_error(503, "Service Unavailable") };
+    let err = LlmError::Http {
+        status: 503,
+        message: format_http_error(503, "Service Unavailable"),
+    };
     assert!(should_retry(&err));
     assert!(err.to_string().starts_with("HTTP error 503: HTTP 503:"));
 }
 
 #[test]
 fn test_http_429_triggers_retry() {
-    let err = LlmError::Http { status: 429, message: format_http_error(429, "Too Many Requests") };
+    let err = LlmError::Http {
+        status: 429,
+        message: format_http_error(429, "Too Many Requests"),
+    };
     assert!(should_retry(&err));
 }
 
 #[test]
 fn test_http_400_does_not_retry() {
-    let err = LlmError::Http { status: 400, message: format_http_error(400, "Bad Request") };
+    let err = LlmError::Http {
+        status: 400,
+        message: format_http_error(400, "Bad Request"),
+    };
     assert!(!should_retry(&err));
 }
 

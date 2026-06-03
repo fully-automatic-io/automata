@@ -1,9 +1,8 @@
-
 use crate::provider::{AuthMethod, LlmError, LlmProvider, LlmStream, ProviderConfig};
 use crate::streaming::{Delta, LlmEvent, MessageDelta as StreamMessageDelta, StreamError};
 use crate::types::{
-    ContentPart, LlmMessage, LlmRequest, LlmResponse, MessageContent, StopReason,
-    ThinkingBudgets, ThinkingLevel, Usage,
+    ContentPart, LlmMessage, LlmRequest, LlmResponse, MessageContent, StopReason, ThinkingBudgets,
+    ThinkingLevel, Usage,
 };
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -20,11 +19,16 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// Resolve adaptive vs budget thinking. Explicit `force` overrides; otherwise
 /// fall back to substring matching on the model id.
 fn resolve_adaptive_thinking(model_id: &str, force: Option<bool>) -> bool {
-    if let Some(b) = force { return b; }
+    if let Some(b) = force {
+        return b;
+    }
     let m = model_id;
-    m.contains("opus-4-6") || m.contains("opus-4.6")
-        || m.contains("opus-4-7") || m.contains("opus-4.7")
-        || m.contains("sonnet-4-6") || m.contains("sonnet-4.6")
+    m.contains("opus-4-6")
+        || m.contains("opus-4.6")
+        || m.contains("opus-4-7")
+        || m.contains("opus-4.7")
+        || m.contains("sonnet-4-6")
+        || m.contains("sonnet-4.6")
 }
 
 /// Substring fallback for `supports_temperature` when a model carries no
@@ -32,13 +36,15 @@ fn resolve_adaptive_thinking(model_id: &str, force: Option<bool>) -> bool {
 /// (mirrors pi-mono's `model.compat?.supportsTemperature ?? true`).
 fn substring_supports_temperature(model_id: &str) -> bool {
     let m = model_id;
-    !(m.contains("opus-4-7") || m.contains("opus-4.7")
-        || m.contains("opus-4-8") || m.contains("opus-4.8"))
+    !(m.contains("opus-4-7")
+        || m.contains("opus-4.7")
+        || m.contains("opus-4-8")
+        || m.contains("opus-4.8"))
 }
 
 fn map_thinking_level_to_anthropic_effort(level: ThinkingLevel) -> &'static str {
     match level {
-        ThinkingLevel::Off => "low",      // never reached (filtered by caller)
+        ThinkingLevel::Off => "low", // never reached (filtered by caller)
         ThinkingLevel::Minimal => "low",
         ThinkingLevel::Low => "low",
         ThinkingLevel::Medium => "medium",
@@ -54,16 +60,13 @@ fn pick_thinking_budget(level: ThinkingLevel, budgets: Option<&ThinkingBudgets>)
         ThinkingLevel::Low => b.low,
         ThinkingLevel::Medium => b.medium,
         ThinkingLevel::High => b.high,
-        ThinkingLevel::XHigh => b.high,  // no separate xhigh slot; high suffices
+        ThinkingLevel::XHigh => b.high, // no separate xhigh slot; high suffices
         ThinkingLevel::Off => None,
     }
 }
 
 fn needs_interleaved_thinking_beta(body: &serde_json::Value) -> bool {
-    body.get("thinking")
-        .and_then(|t| t.get("type"))
-        .and_then(|t| t.as_str())
-        == Some("enabled")
+    body.get("thinking").and_then(|t| t.get("type")).and_then(|t| t.as_str()) == Some("enabled")
 }
 
 pub struct AnthropicProvider {
@@ -85,16 +88,19 @@ impl AnthropicProvider {
     }
 
     fn build_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
-        let messages: Vec<serde_json::Value> = request.messages.iter()
-            .filter_map(convert_message)
-            .collect();
+        let messages: Vec<serde_json::Value> =
+            request.messages.iter().filter_map(convert_message).collect();
 
-        let tools: Vec<serde_json::Value> = request.tools.iter()
-            .map(|t| json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.input_schema,
-            }))
+        let tools: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
             .collect();
 
         let mut body = json!({
@@ -123,20 +129,22 @@ impl AnthropicProvider {
         // be suppressed below (the two are mutually exclusive).
         let mut thinking_active = false;
         if let Some(level) = request.reasoning_effort
-            && level != ThinkingLevel::Off {
-                let force = request.anthropic_options()
-                    .and_then(|o| o.force_adaptive_thinking);
-                if resolve_adaptive_thinking(&request.model, force) {
-                    body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
-                    body["output_config"] = json!({
-                        "effort": map_thinking_level_to_anthropic_effort(level),
-                    });
-                    thinking_active = true;
-                } else if let Some(budget) = pick_thinking_budget(level, request.thinking_budgets.as_ref()) {
-                    body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-                    thinking_active = true;
-                }
+            && level != ThinkingLevel::Off
+        {
+            let force = request.anthropic_options().and_then(|o| o.force_adaptive_thinking);
+            if resolve_adaptive_thinking(&request.model, force) {
+                body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+                body["output_config"] = json!({
+                    "effort": map_thinking_level_to_anthropic_effort(level),
+                });
+                thinking_active = true;
+            } else if let Some(budget) =
+                pick_thinking_budget(level, request.thinking_budgets.as_ref())
+            {
+                body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+                thinking_active = true;
             }
+        }
 
         // Temperature is incompatible with extended thinking and is rejected
         // outright by Claude Opus 4.7+. Prefer the model's `supportsTemperature`
@@ -148,14 +156,19 @@ impl AnthropicProvider {
             .unwrap_or_else(|| substring_supports_temperature(&request.model));
         if let Some(temp) = request.temperature
             && !thinking_active
-            && supports_temperature {
-                body["temperature"] = json!(temp);
-            }
+            && supports_temperature
+        {
+            body["temperature"] = json!(temp);
+        }
 
         body
     }
 
-    async fn send_with_retry(&self, body: serde_json::Value, _stream: bool) -> Result<reqwest::Response, LlmError> {
+    async fn send_with_retry(
+        &self,
+        body: serde_json::Value,
+        _stream: bool,
+    ) -> Result<reqwest::Response, LlmError> {
         use crate::retry::{format_http_error, retry_delay, should_retry};
         let mut last_err: Option<LlmError> = None;
         for attempt in 0..=self.config.max_retries {
@@ -166,7 +179,8 @@ impl AnthropicProvider {
                 };
                 tokio::time::sleep(retry_delay(attempt - 1, 500, Some(30_000), after)).await;
             }
-            let req = self.client
+            let req = self
+                .client
                 .post(self.base_url())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json");
@@ -189,17 +203,24 @@ impl AnthropicProvider {
                 Ok(r) => {
                     let status = r.status().as_u16();
                     if status == 429 {
-                        let secs = r.headers().get("retry-after")
+                        let secs = r
+                            .headers()
+                            .get("retry-after")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(5);
                         last_err = Some(LlmError::RateLimit { retry_after_secs: secs });
                         continue;
                     }
-                    if status == 401 { return Err(LlmError::AuthError); }
+                    if status == 401 {
+                        return Err(LlmError::AuthError);
+                    }
                     let body = r.text().await.unwrap_or_default();
                     // Prefix status onto message body so the retry layer (and callers) can match (52e13870).
-                    let err = LlmError::Http { status, message: format_http_error(status, &body) };
+                    let err = LlmError::Http {
+                        status,
+                        message: format_http_error(status, &body),
+                    };
                     if should_retry(&err) {
                         last_err = Some(err);
                         continue;
@@ -337,13 +358,21 @@ fn parse_anthropic_sse(event_type: &str, data: &str) -> Option<LlmEvent> {
                     text: d.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 },
                 "input_json_delta" => Delta::InputJsonDelta {
-                    partial_json: d.get("partial_json").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    partial_json: d
+                        .get("partial_json")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 },
                 "thinking_delta" => Delta::ThinkingDelta {
                     thinking: d.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 },
                 "signature_delta" => Delta::SignatureDelta {
-                    signature: d.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    signature: d
+                        .get("signature")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 },
                 _ => return None,
             };
@@ -354,11 +383,13 @@ fn parse_anthropic_sse(event_type: &str, data: &str) -> Option<LlmEvent> {
             Some(LlmEvent::ContentBlockStop { index })
         }
         "message_delta" => {
-            let stop_reason = payload.get("delta")
+            let stop_reason = payload
+                .get("delta")
                 .and_then(|d| d.get("stop_reason"))
                 .and_then(|v| v.as_str())
                 .map(parse_stop_reason);
-            let stop_sequence = payload.get("delta")
+            let stop_sequence = payload
+                .get("delta")
                 .and_then(|d| d.get("stop_sequence"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
@@ -368,7 +399,10 @@ fn parse_anthropic_sse(event_type: &str, data: &str) -> Option<LlmEvent> {
                 input: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 output: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 cache_read: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cache_write: u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_write: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 total_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
                     + u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 cost: Default::default(),
@@ -383,8 +417,16 @@ fn parse_anthropic_sse(event_type: &str, data: &str) -> Option<LlmEvent> {
             let err = payload.get("error")?;
             Some(LlmEvent::Error {
                 error: StreamError {
-                    error_type: err.get("type").and_then(|v| v.as_str()).unwrap_or("error").to_string(),
-                    message: err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error").to_string(),
+                    error_type: err
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("error")
+                        .to_string(),
+                    message: err
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error")
+                        .to_string(),
                 },
             })
         }
@@ -416,10 +458,12 @@ impl LlmProvider for AnthropicProvider {
             cache_read_input_tokens: u64,
         }
 
-        let api_resp: ApiResponse = resp.json().await
-            .map_err(|e| LlmError::SerializationError(e.to_string()))?;
+        let api_resp: ApiResponse =
+            resp.json().await.map_err(|e| LlmError::SerializationError(e.to_string()))?;
 
-        let content: Vec<ContentPart> = api_resp.content.into_iter()
+        let content: Vec<ContentPart> = api_resp
+            .content
+            .into_iter()
             .filter_map(|v| {
                 let t = v.get("type")?.as_str()?;
                 match t {
@@ -478,7 +522,10 @@ mod tests {
     }
 
     fn req(model: &str) -> LlmRequest {
-        LlmRequest { model: model.into(), ..Default::default() }
+        LlmRequest {
+            model: model.into(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -496,9 +543,7 @@ mod tests {
     fn budget_thinking_for_older_claude() {
         let mut r = req("claude-sonnet-4-5");
         r.reasoning_effort = Some(ThinkingLevel::High);
-        r.thinking_budgets = Some(ThinkingBudgets {
-            high: Some(8192), ..Default::default()
-        });
+        r.thinking_budgets = Some(ThinkingBudgets { high: Some(8192), ..Default::default() });
         let body = provider().build_body(&r, false);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
@@ -536,9 +581,7 @@ mod tests {
         // Adaptive-id model forced into budget mode.
         let mut r = req("claude-opus-4-7");
         r.reasoning_effort = Some(ThinkingLevel::High);
-        r.thinking_budgets = Some(ThinkingBudgets {
-            high: Some(4096), ..Default::default()
-        });
+        r.thinking_budgets = Some(ThinkingBudgets { high: Some(4096), ..Default::default() });
         r.provider_options = Some(ProviderOptions::Anthropic(AnthropicOptions {
             force_adaptive_thinking: Some(false),
             ..Default::default()

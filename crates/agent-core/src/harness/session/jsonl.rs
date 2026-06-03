@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
 use super::types::{
-    InMemorySessionStorage, Session, SessionError, SessionMetadata, SessionStorage, SessionTreeEntry,
+    InMemorySessionStorage, Session, SessionError, SessionMetadata, SessionStorage,
+    SessionTreeEntry,
 };
 use super::uuid::{now_iso, uuidv7};
 
@@ -61,13 +62,15 @@ impl JsonlSessionStorage {
             cwd: cwd.to_string(),
             parent_session: parent_session_path.map(|s| s.to_string()),
         };
-        let header_line = serde_json::to_string(&header)
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
+        let header_line =
+            serde_json::to_string(&header).map_err(|e| SessionError::Storage(e.to_string()))?;
         if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
         }
-        tokio::fs::write(&file_path, format!("{}\n", header_line)).await
+        tokio::fs::write(&file_path, format!("{}\n", header_line))
+            .await
             .map_err(|e| SessionError::Storage(e.to_string()))?;
 
         let metadata = JsonlSessionMetadata {
@@ -87,11 +90,13 @@ impl JsonlSessionStorage {
     /// Open an existing JSONL session file.
     pub async fn open(file_path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let file_path = file_path.as_ref().to_path_buf();
-        let content = tokio::fs::read_to_string(&file_path).await
+        let content = tokio::fs::read_to_string(&file_path)
+            .await
             .map_err(|e| SessionError::Storage(e.to_string()))?;
         let mut lines = content.lines().filter(|l| !l.trim().is_empty());
 
-        let header_line = lines.next()
+        let header_line = lines
+            .next()
             .ok_or_else(|| SessionError::InvalidSession("missing header".into()))?;
         let header: SessionHeader = serde_json::from_str(header_line)
             .map_err(|e| SessionError::InvalidSession(e.to_string()))?;
@@ -133,7 +138,8 @@ impl JsonlSessionStorage {
             .open(&self.file_path)
             .await
             .map_err(|e| SessionError::Storage(e.to_string()))?;
-        file.write_all(format!("{}\n", line).as_bytes()).await
+        file.write_all(format!("{}\n", line).as_bytes())
+            .await
             .map_err(|e| SessionError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -162,8 +168,8 @@ impl SessionStorage for JsonlSessionStorage {
             timestamp: now_iso(),
             target_id: leaf_id.clone(),
         };
-        let line = serde_json::to_string(&entry)
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
+        let line =
+            serde_json::to_string(&entry).map_err(|e| SessionError::Storage(e.to_string()))?;
         self.append_line(&line).await?;
         self.inner.set_leaf_id(leaf_id).await
     }
@@ -173,8 +179,8 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn append_entry(&mut self, entry: SessionTreeEntry) -> Result<(), SessionError> {
-        let line = serde_json::to_string(&entry)
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
+        let line =
+            serde_json::to_string(&entry).map_err(|e| SessionError::Storage(e.to_string()))?;
         self.append_line(&line).await?;
         self.inner.append_entry(entry).await
     }
@@ -191,7 +197,10 @@ impl SessionStorage for JsonlSessionStorage {
         self.inner.get_label(id).await
     }
 
-    async fn get_path_to_root(&self, leaf_id: Option<&str>) -> Result<Vec<SessionTreeEntry>, SessionError> {
+    async fn get_path_to_root(
+        &self,
+        leaf_id: Option<&str>,
+    ) -> Result<Vec<SessionTreeEntry>, SessionError> {
         self.inner.get_path_to_root(leaf_id).await
     }
 
@@ -210,13 +219,13 @@ pub struct JsonlSessionRepo {
 
 impl JsonlSessionRepo {
     pub fn new(sessions_root: impl AsRef<Path>) -> Self {
-        Self { sessions_root: sessions_root.as_ref().to_path_buf() }
+        Self {
+            sessions_root: sessions_root.as_ref().to_path_buf(),
+        }
     }
 
     fn encode_cwd(cwd: &str) -> String {
-        format!("--{}--",
-            cwd.trim_start_matches(['/', '\\'])
-               .replace(['/', '\\', ':'], "-"))
+        format!("--{}--", cwd.trim_start_matches(['/', '\\']).replace(['/', '\\', ':'], "-"))
     }
 
     async fn session_dir(&self, cwd: &str) -> PathBuf {
@@ -237,7 +246,8 @@ impl JsonlSessionRepo {
         let id = id.unwrap_or_else(uuidv7);
         let timestamp = now_iso();
         let dir = self.session_dir(cwd).await;
-        tokio::fs::create_dir_all(&dir).await
+        tokio::fs::create_dir_all(&dir)
+            .await
             .map_err(|e| SessionError::Storage(e.to_string()))?;
         let path = self.session_file_path(cwd, &id, &timestamp).await;
         let storage = JsonlSessionStorage::create(&path, cwd, &id, parent_session_path).await?;
@@ -270,9 +280,10 @@ impl JsonlSessionRepo {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let p = entry.path();
                     if p.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                        && let Ok(storage) = JsonlSessionStorage::open(&p).await {
-                            sessions.push(storage.metadata.clone());
-                        }
+                        && let Ok(storage) = JsonlSessionStorage::open(&p).await
+                    {
+                        sessions.push(storage.metadata.clone());
+                    }
                 }
             }
         }
@@ -290,16 +301,18 @@ impl JsonlSessionRepo {
         parent_session_path: Option<&str>,
     ) -> Result<Session, SessionError> {
         let source_storage = JsonlSessionStorage::open(&source_path).await?;
-        let entries_to_fork = get_entries_to_fork(&source_storage, fork_at_entry_id, position).await?;
+        let entries_to_fork =
+            get_entries_to_fork(&source_storage, fork_at_entry_id, position).await?;
 
         let new_id = new_id.unwrap_or_else(uuidv7);
         let timestamp = now_iso();
         let dir = self.session_dir(cwd).await;
-        tokio::fs::create_dir_all(&dir).await
+        tokio::fs::create_dir_all(&dir)
+            .await
             .map_err(|e| SessionError::Storage(e.to_string()))?;
         let path = self.session_file_path(cwd, &new_id, &timestamp).await;
-        let parent = parent_session_path
-            .or_else(|| Some(source_path.as_ref().to_str().unwrap_or("")));
+        let parent =
+            parent_session_path.or_else(|| Some(source_path.as_ref().to_str().unwrap_or("")));
         let mut storage = JsonlSessionStorage::create(&path, cwd, &new_id, parent).await?;
         for entry in entries_to_fork {
             storage.append_entry(entry).await?;
@@ -316,7 +329,9 @@ async fn get_entries_to_fork(
     let Some(entry_id) = entry_id else {
         return Ok(storage.get_entries().await);
     };
-    let target = storage.get_entry(entry_id).await
+    let target = storage
+        .get_entry(entry_id)
+        .await
         .ok_or_else(|| SessionError::InvalidForkTarget(format!("Entry {} not found", entry_id)))?;
     let effective_leaf_id = if position == Some("at") {
         Some(target.id().to_string())
@@ -325,9 +340,10 @@ async fn get_entries_to_fork(
         if !matches!(&target, SessionTreeEntry::Message { message, .. }
             if matches!(message, crate::types::AgentMessage::User { .. }))
         {
-            return Err(SessionError::InvalidForkTarget(
-                format!("Entry {} is not a user message", entry_id)
-            ));
+            return Err(SessionError::InvalidForkTarget(format!(
+                "Entry {} is not a user message",
+                entry_id
+            )));
         }
         target.parent_id().map(|s| s.to_string())
     };

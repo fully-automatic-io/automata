@@ -1,4 +1,6 @@
-use agent_core::harness::compaction::{prepare_compaction, CompactionPreparation, CompactionSettings};
+use agent_core::harness::compaction::{
+    CompactionPreparation, CompactionSettings, prepare_compaction,
+};
 use agent_core::harness::session::{InMemorySessionStorage, Session};
 use agent_core::types::{AgentMessage, ContentBlock, MessageContent, StopReason, Usage};
 
@@ -8,16 +10,22 @@ async fn test_compaction_prepare_returns_preparation_or_none() {
     for i in 0..5u64 {
         let msg = if i % 2 == 0 {
             AgentMessage::User {
-                content: MessageContent::Blocks(vec![ContentBlock::Text { text: format!("message {}", i) }]),
+                content: MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: format!("message {}", i),
+                }]),
                 timestamp: i * 1000,
                 metadata: None,
             }
         } else {
             AgentMessage::Assistant {
                 content: vec![ContentBlock::Text { text: format!("message {}", i) }],
-                api: agent_core::types::Api::Anthropic, provider: "t".into(), model: "m".into(),
-                usage: Usage::default(), stop_reason: StopReason::EndTurn,
-                error_message: None, timestamp: i * 1000,
+                api: agent_core::types::Api::Anthropic,
+                provider: "t".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                error_message: None,
+                timestamp: i * 1000,
             }
         };
         session.append_message(msg).await.unwrap();

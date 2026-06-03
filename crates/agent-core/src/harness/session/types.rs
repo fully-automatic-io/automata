@@ -38,6 +38,15 @@ pub enum SessionTreeEntry {
         #[serde(rename = "modelId")]
         model_id: String,
     },
+    #[serde(rename = "active_tools_change")]
+    ActiveToolsChange {
+        id: String,
+        #[serde(rename = "parentId")]
+        parent_id: Option<String>,
+        timestamp: String,
+        #[serde(rename = "activeToolNames")]
+        active_tool_names: Vec<String>,
+    },
     #[serde(rename = "compaction")]
     Compaction {
         id: String,
@@ -136,6 +145,7 @@ impl SessionTreeEntry {
             Self::Message { id, .. } => id,
             Self::ThinkingLevelChange { id, .. } => id,
             Self::ModelChange { id, .. } => id,
+            Self::ActiveToolsChange { id, .. } => id,
             Self::Compaction { id, .. } => id,
             Self::BranchSummary { id, .. } => id,
             Self::Custom { id, .. } => id,
@@ -152,6 +162,7 @@ impl SessionTreeEntry {
             Self::Message { .. } => "message",
             Self::ThinkingLevelChange { .. } => "thinking_level_change",
             Self::ModelChange { .. } => "model_change",
+            Self::ActiveToolsChange { .. } => "active_tools_change",
             Self::Compaction { .. } => "compaction",
             Self::BranchSummary { .. } => "branch_summary",
             Self::Custom { .. } => "custom",
@@ -167,6 +178,7 @@ impl SessionTreeEntry {
             Self::Message { parent_id, .. } => parent_id.as_deref(),
             Self::ThinkingLevelChange { parent_id, .. } => parent_id.as_deref(),
             Self::ModelChange { parent_id, .. } => parent_id.as_deref(),
+            Self::ActiveToolsChange { parent_id, .. } => parent_id.as_deref(),
             Self::Compaction { parent_id, .. } => parent_id.as_deref(),
             Self::BranchSummary { parent_id, .. } => parent_id.as_deref(),
             Self::Custom { parent_id, .. } => parent_id.as_deref(),
@@ -182,6 +194,7 @@ impl SessionTreeEntry {
             Self::Message { timestamp, .. }
             | Self::ThinkingLevelChange { timestamp, .. }
             | Self::ModelChange { timestamp, .. }
+            | Self::ActiveToolsChange { timestamp, .. }
             | Self::Compaction { timestamp, .. }
             | Self::BranchSummary { timestamp, .. }
             | Self::Custom { timestamp, .. }
@@ -220,6 +233,7 @@ pub struct SessionContext {
     pub messages: Vec<AgentMessage>,
     pub thinking_level: ThinkingLevel,
     pub model: Option<ModelRef>,
+    pub active_tool_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +245,7 @@ pub struct ModelRef {
 pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContext {
     let mut thinking_level = ThinkingLevel::Off;
     let mut model: Option<ModelRef> = None;
+    let mut active_tool_names: Option<Vec<String>> = None;
     let mut compaction_idx: Option<usize> = None;
     let mut compaction_summary = String::new();
     let mut compaction_tokens_before = 0u64;
@@ -243,15 +258,30 @@ pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContex
                 thinking_level = *tl;
             }
             SessionTreeEntry::ModelChange { provider, model_id, .. } => {
-                model = Some(ModelRef { provider: provider.clone(), model_id: model_id.clone() });
+                model = Some(ModelRef {
+                    provider: provider.clone(),
+                    model_id: model_id.clone(),
+                });
+            }
+            SessionTreeEntry::ActiveToolsChange { active_tool_names: names, .. } => {
+                active_tool_names = Some(names.clone());
             }
             SessionTreeEntry::Message {
                 message: AgentMessage::Assistant { provider, model: model_id, .. },
                 ..
             } => {
-                model = Some(ModelRef { provider: provider.clone(), model_id: model_id.clone() });
+                model = Some(ModelRef {
+                    provider: provider.clone(),
+                    model_id: model_id.clone(),
+                });
             }
-            SessionTreeEntry::Compaction { summary, tokens_before, first_kept_entry_id, timestamp, .. } => {
+            SessionTreeEntry::Compaction {
+                summary,
+                tokens_before,
+                first_kept_entry_id,
+                timestamp,
+                ..
+            } => {
                 compaction_idx = Some(i);
                 compaction_summary = summary.clone();
                 compaction_tokens_before = *tokens_before;
@@ -288,7 +318,12 @@ pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContex
         }
     }
 
-    SessionContext { messages, thinking_level, model }
+    SessionContext {
+        messages,
+        thinking_level,
+        model,
+        active_tool_names,
+    }
 }
 
 fn parse_timestamp_millis(s: &str) -> u64 {
@@ -300,7 +335,14 @@ fn parse_timestamp_millis(s: &str) -> u64 {
 fn append_message_from_entry(entry: &SessionTreeEntry, messages: &mut Vec<AgentMessage>) {
     match entry {
         SessionTreeEntry::Message { message, .. } => messages.push(message.clone()),
-        SessionTreeEntry::CustomMessage { custom_type, content, display, details, timestamp, .. } => {
+        SessionTreeEntry::CustomMessage {
+            custom_type,
+            content,
+            display,
+            details,
+            timestamp,
+            ..
+        } => {
             messages.push(AgentMessage::Custom {
                 custom_type: custom_type.clone(),
                 content: content.clone(),
@@ -309,7 +351,9 @@ fn append_message_from_entry(entry: &SessionTreeEntry, messages: &mut Vec<AgentM
                 timestamp: parse_timestamp_millis(timestamp),
             });
         }
-        SessionTreeEntry::BranchSummary { summary, from_id, timestamp, .. } if !summary.is_empty() => {
+        SessionTreeEntry::BranchSummary { summary, from_id, timestamp, .. }
+            if !summary.is_empty() =>
+        {
             messages.push(AgentMessage::BranchSummary {
                 summary: summary.clone(),
                 from_id: from_id.clone(),
@@ -334,7 +378,10 @@ pub trait SessionStorage: Send + Sync {
     async fn get_entry(&self, id: &str) -> Option<SessionTreeEntry>;
     async fn find_entries_by_type(&self, entry_type: &str) -> Vec<SessionTreeEntry>;
     async fn get_label(&self, id: &str) -> Option<String>;
-    async fn get_path_to_root(&self, leaf_id: Option<&str>) -> Result<Vec<SessionTreeEntry>, SessionError>;
+    async fn get_path_to_root(
+        &self,
+        leaf_id: Option<&str>,
+    ) -> Result<Vec<SessionTreeEntry>, SessionError>;
     async fn get_entries(&self) -> Vec<SessionTreeEntry>;
 }
 
@@ -392,7 +439,10 @@ impl Session {
         self.storage.get_path_to_root(leaf_id.as_deref()).await
     }
 
-    pub async fn get_branch_from(&self, entry_id: &str) -> Result<Vec<SessionTreeEntry>, SessionError> {
+    pub async fn get_branch_from(
+        &self,
+        entry_id: &str,
+    ) -> Result<Vec<SessionTreeEntry>, SessionError> {
         self.storage.get_path_to_root(Some(entry_id)).await
     }
 
@@ -415,37 +465,67 @@ impl Session {
     pub async fn append_message(&mut self, message: AgentMessage) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::Message {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            message,
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::Message {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                message,
+            })
+            .await?;
         Ok(id)
     }
 
-    pub async fn append_thinking_level_change(&mut self, level: ThinkingLevel) -> Result<String, SessionError> {
+    pub async fn append_thinking_level_change(
+        &mut self,
+        level: ThinkingLevel,
+    ) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::ThinkingLevelChange {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            thinking_level: level,
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::ThinkingLevelChange {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                thinking_level: level,
+            })
+            .await?;
         Ok(id)
     }
 
-    pub async fn append_model_change(&mut self, provider: &str, model_id: &str) -> Result<String, SessionError> {
+    pub async fn append_model_change(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::ModelChange {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            provider: provider.to_string(),
-            model_id: model_id.to_string(),
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::ModelChange {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                provider: provider.to_string(),
+                model_id: model_id.to_string(),
+            })
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn append_active_tools_change(
+        &mut self,
+        active_tool_names: Vec<String>,
+    ) -> Result<String, SessionError> {
+        let id = self.storage.create_entry_id().await;
+        let parent_id = self.storage.get_leaf_id().await;
+        self.storage
+            .append_entry(SessionTreeEntry::ActiveToolsChange {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                active_tool_names,
+            })
+            .await?;
         Ok(id)
     }
 
@@ -459,16 +539,18 @@ impl Session {
     ) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::Compaction {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            summary: summary.to_string(),
-            first_kept_entry_id: first_kept_entry_id.to_string(),
-            tokens_before,
-            details,
-            from_hook,
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::Compaction {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                summary: summary.to_string(),
+                first_kept_entry_id: first_kept_entry_id.to_string(),
+                tokens_before,
+                details,
+                from_hook,
+            })
+            .await?;
         Ok(id)
     }
 
@@ -481,27 +563,31 @@ impl Session {
     ) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::BranchSummary {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            from_id: from_id.to_string(),
-            summary: summary.to_string(),
-            details,
-            from_hook,
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::BranchSummary {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                from_id: from_id.to_string(),
+                summary: summary.to_string(),
+                details,
+                from_hook,
+            })
+            .await?;
         Ok(id)
     }
 
     pub async fn append_session_name(&mut self, name: &str) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::SessionInfo {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            name: Some(name.trim().to_string()),
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::SessionInfo {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                name: Some(name.trim().to_string()),
+            })
+            .await?;
         Ok(id)
     }
 
@@ -512,13 +598,15 @@ impl Session {
     ) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::Custom {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            custom_type: custom_type.to_string(),
-            data,
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::Custom {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                custom_type: custom_type.to_string(),
+                data,
+            })
+            .await?;
         Ok(id)
     }
 
@@ -531,15 +619,17 @@ impl Session {
     ) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::CustomMessage {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            custom_type: custom_type.to_string(),
-            content,
-            display,
-            details,
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::CustomMessage {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                custom_type: custom_type.to_string(),
+                content,
+                display,
+                details,
+            })
+            .await?;
         Ok(id)
     }
 
@@ -550,13 +640,15 @@ impl Session {
     ) -> Result<String, SessionError> {
         let id = self.storage.create_entry_id().await;
         let parent_id = self.storage.get_leaf_id().await;
-        self.storage.append_entry(SessionTreeEntry::Label {
-            id: id.clone(),
-            parent_id,
-            timestamp: now_iso(),
-            target_id: target_id.to_string(),
-            label,
-        }).await?;
+        self.storage
+            .append_entry(SessionTreeEntry::Label {
+                id: id.clone(),
+                parent_id,
+                timestamp: now_iso(),
+                target_id: target_id.to_string(),
+                label,
+            })
+            .await?;
         Ok(id)
     }
 
@@ -566,21 +658,24 @@ impl Session {
         summary: Option<BranchSummaryOptions>,
     ) -> Result<Option<String>, SessionError> {
         if let Some(id) = entry_id
-            && self.storage.get_entry(id).await.is_none() {
-                return Err(SessionError::NotFound(format!("Entry {} not found", id)));
-            }
+            && self.storage.get_entry(id).await.is_none()
+        {
+            return Err(SessionError::NotFound(format!("Entry {} not found", id)));
+        }
         self.storage.set_leaf_id(entry_id.map(|s| s.to_string())).await?;
         if let Some(opts) = summary {
             let sid = self.storage.create_entry_id().await;
-            self.storage.append_entry(SessionTreeEntry::BranchSummary {
-                id: sid.clone(),
-                parent_id: entry_id.map(|s| s.to_string()),
-                timestamp: now_iso(),
-                from_id: entry_id.unwrap_or("root").to_string(),
-                summary: opts.summary,
-                details: opts.details,
-                from_hook: opts.from_hook,
-            }).await?;
+            self.storage
+                .append_entry(SessionTreeEntry::BranchSummary {
+                    id: sid.clone(),
+                    parent_id: entry_id.map(|s| s.to_string()),
+                    timestamp: now_iso(),
+                    from_id: entry_id.unwrap_or("root").to_string(),
+                    summary: opts.summary,
+                    details: opts.details,
+                    from_hook: opts.from_hook,
+                })
+                .await?;
             return Ok(Some(sid));
         }
         Ok(None)
@@ -608,10 +703,8 @@ pub struct InMemorySessionStorage {
 
 impl InMemorySessionStorage {
     pub fn new(metadata: Option<SessionMetadata>) -> Self {
-        let metadata = metadata.unwrap_or_else(|| SessionMetadata {
-            id: uuidv7(),
-            created_at: now_iso(),
-        });
+        let metadata =
+            metadata.unwrap_or_else(|| SessionMetadata { id: uuidv7(), created_at: now_iso() });
         Self {
             metadata,
             entries: vec![],
@@ -647,8 +740,12 @@ impl InMemorySessionStorage {
 fn update_label_cache(labels: &mut HashMap<String, String>, entry: &SessionTreeEntry) {
     if let SessionTreeEntry::Label { target_id, label, .. } = entry {
         match label.as_ref().map(|l| l.trim()) {
-            Some(l) if !l.is_empty() => { labels.insert(target_id.clone(), l.to_string()); }
-            _ => { labels.remove(target_id); }
+            Some(l) if !l.is_empty() => {
+                labels.insert(target_id.clone(), l.to_string());
+            }
+            _ => {
+                labels.remove(target_id);
+            }
         }
     }
 }
@@ -675,9 +772,10 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn set_leaf_id(&mut self, leaf_id: Option<String>) -> Result<(), SessionError> {
         if let Some(ref id) = leaf_id
-            && !self.by_id.contains_key(id) {
-                return Err(SessionError::NotFound(format!("Entry {} not found", id)));
-            }
+            && !self.by_id.contains_key(id)
+        {
+            return Err(SessionError::NotFound(format!("Entry {} not found", id)));
+        }
         let entry_id = generate_entry_id(&self.by_id);
         let entry = SessionTreeEntry::Leaf {
             id: entry_id.clone(),
@@ -715,22 +813,26 @@ impl SessionStorage for InMemorySessionStorage {
     }
 
     async fn find_entries_by_type(&self, entry_type: &str) -> Vec<SessionTreeEntry> {
-        self.entries.iter()
-            .filter(|e| e.entry_type() == entry_type)
-            .cloned()
-            .collect()
+        self.entries.iter().filter(|e| e.entry_type() == entry_type).cloned().collect()
     }
 
     async fn get_label(&self, id: &str) -> Option<String> {
         self.labels_by_id.get(id).cloned()
     }
 
-    async fn get_path_to_root(&self, leaf_id: Option<&str>) -> Result<Vec<SessionTreeEntry>, SessionError> {
-        let Some(leaf_id) = leaf_id else { return Ok(vec![]); };
+    async fn get_path_to_root(
+        &self,
+        leaf_id: Option<&str>,
+    ) -> Result<Vec<SessionTreeEntry>, SessionError> {
+        let Some(leaf_id) = leaf_id else {
+            return Ok(vec![]);
+        };
         let mut path = vec![];
         let mut current_id = leaf_id.to_string();
         loop {
-            let idx = self.by_id.get(&current_id)
+            let idx = self
+                .by_id
+                .get(&current_id)
                 .ok_or_else(|| SessionError::NotFound(format!("Entry {} not found", current_id)))?;
             let entry = &self.entries[*idx];
             path.push(entry.clone());
@@ -759,7 +861,10 @@ pub struct InMemorySessionRepo {
 
 impl InMemorySessionRepo {
     pub fn new() -> Self {
-        Self { sessions: HashMap::new(), metadata: HashMap::new() }
+        Self {
+            sessions: HashMap::new(),
+            metadata: HashMap::new(),
+        }
     }
 
     pub fn create_session(&mut self, id: Option<String>) -> Session {
@@ -775,10 +880,15 @@ impl InMemorySessionRepo {
     pub fn open_session(&self, id: &str) -> Option<Session> {
         let meta = self.metadata.get(id)?.clone();
         let entries = self.sessions.get(id)?.clone();
-        Some(Session::new(Box::new(InMemorySessionStorage::with_entries(Some(meta), entries))))
+        Some(Session::new(Box::new(InMemorySessionStorage::with_entries(
+            Some(meta),
+            entries,
+        ))))
     }
 }
 
 impl Default for InMemorySessionRepo {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
