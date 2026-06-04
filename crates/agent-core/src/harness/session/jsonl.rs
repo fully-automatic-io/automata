@@ -132,6 +132,14 @@ impl JsonlSessionStorage {
         Ok(Self { metadata, inner, file_path })
     }
 
+    pub fn metadata(&self) -> &JsonlSessionMetadata {
+        &self.metadata
+    }
+
+    pub fn file_path(&self) -> &Path {
+        &self.file_path
+    }
+
     async fn append_line(&self, line: &str) -> Result<(), SessionError> {
         let mut file = tokio::fs::OpenOptions::new()
             .append(true)

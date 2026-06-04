@@ -6,8 +6,11 @@ pub mod models;
 pub mod prompt;
 pub mod provider;
 pub mod resource;
+pub mod runtime;
 pub mod sdk;
+pub mod services;
 pub mod session;
+pub mod session_manager;
 pub mod slash;
 
 pub use auth::AuthStorage;
@@ -32,11 +35,20 @@ pub use resource::{
     DefaultResourceLoader, ResourceDiagnostic, ResourceDiagnosticKind, ResourceLoaderOptions,
     ResourceSet, context_files_for_prompt, load_project_context_files,
 };
-pub use sdk::{AgentSessionHandle, CreateAgentSessionOptions, create_agent_session};
+pub use runtime::{AgentSessionRuntime, AgentSessionRuntimeOptions};
+pub use sdk::{
+    AgentSessionHandle, CreateAgentSessionFromServicesOptions, CreateAgentSessionOptions,
+    create_agent_session, create_agent_session_from_services,
+};
+pub use services::{
+    AgentSessionServices, AgentSessionServicesOptions, SessionDiagnostic, SessionDiagnosticKind,
+    create_agent_session_services,
+};
 pub use session::{
     BuildToolsOptions, CodingAgentSession, DEFAULT_TOOL_NAMES, SessionOptions, build_tools,
     build_tools_with_options,
 };
+pub use session_manager::{ForkPosition, ManagedSession, ManagedSessionMetadata, SessionManager};
 pub use slash::{
     SlashCommandInfo, SlashCommandSource, SourceInfo, SourceOrigin, SourceScope,
     builtin_slash_commands,

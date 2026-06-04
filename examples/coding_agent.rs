@@ -7,7 +7,7 @@ use agent_core::types::{AgentMessage, ContentBlock};
 use coding_agent::tools::{
     EditTool, EditToolOptions, ReadTool, ReadToolOptions, WriteTool, WriteToolOptions,
 };
-use coding_agent::{CreateAgentSessionOptions, create_agent_session};
+use coding_agent::{CreateAgentSessionOptions, SessionManager, create_agent_session};
 use tempfile::TempDir;
 
 #[tokio::main]
@@ -22,7 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(&agent_dir)?;
 
     let cwd = cwd_path.to_string_lossy().to_string();
-    let agent_dir_string = agent_dir.to_string_lossy().to_string();
 
     std::fs::write(
         agent_dir.join("settings.json"),
@@ -56,10 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("-----------------");
 
     let mut handle = create_agent_session(CreateAgentSessionOptions {
-        cwd: cwd.clone(),
-        agent_dir: Some(agent_dir_string),
-        session_path: None,
-        sessions_root: None,
+        cwd: cwd_path.clone(),
+        agent_dir: Some(agent_dir.clone()),
+        session: SessionManager::create(),
         model: None,
         api_key: Some("sk-example-runtime-override".into()),
         thinking_level: None,

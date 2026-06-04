@@ -7,10 +7,21 @@ pub mod tools;
 
 // End-to-end session entry point.
 pub use core::provider::{Auth, ProviderBuild, build_provider};
-pub use core::sdk::{AgentSessionHandle, CreateAgentSessionOptions, create_agent_session};
+pub use core::runtime::{AgentSessionRuntime, AgentSessionRuntimeOptions};
+pub use core::sdk::{
+    AgentSessionHandle, CreateAgentSessionFromServicesOptions, CreateAgentSessionOptions,
+    create_agent_session, create_agent_session_from_services,
+};
+pub use core::services::{
+    AgentSessionServices, AgentSessionServicesOptions, SessionDiagnostic, SessionDiagnosticKind,
+    create_agent_session_services,
+};
 pub use core::session::{
     BuildToolsOptions, CodingAgentSession, DEFAULT_TOOL_NAMES, SessionOptions, build_tools,
     build_tools_with_options,
+};
+pub use core::session_manager::{
+    ForkPosition, ManagedSession, ManagedSessionMetadata, SessionManager,
 };
 
 // Custom message types and conversion now live in agent-core.
