@@ -996,8 +996,11 @@ pub type PrepareNextTurnFn = Arc<
         + Send
         + Sync,
 >;
-pub type OnPayloadFn =
-    Arc<dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type OnPayloadFn = Arc<
+    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>
+        + Send
+        + Sync,
+>;
 pub type OnResponseFn =
     Arc<dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 

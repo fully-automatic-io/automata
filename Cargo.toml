@@ -3,6 +3,7 @@ members = [
     "crates/agent-core",
     "crates/llm-client",
     "crates/coding-agent",
+    "crates/coding-agent-plugin-sdk",
 ]
 resolver = "2"
 
@@ -29,4 +30,3 @@ chrono = { version = "0.4", features = ["serde"] }
 # via `[lints] workspace = true`. The tree is clippy-clean; keep it that way.
 [workspace.lints.clippy]
 all = "warn"
-

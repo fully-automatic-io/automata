@@ -1,0 +1,18 @@
+[package]
+name = "coding-agent-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+authors = ["Automata Contributors"]
+description = "Rust SDK for Automata coding-agent Wasmtime component plugins"
+license = "MIT"
+repository = "https://github.com/fully-automatic-io/automata"
+keywords = ["ai", "agent", "plugin", "wasm", "component"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+wit-bindgen = "0.51"

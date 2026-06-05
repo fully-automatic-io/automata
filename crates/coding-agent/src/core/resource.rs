@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use agent_core::harness::prompt_templates::{PromptTemplate, load_prompt_templates_from_dir};
 
 use super::prompt::{ContextFile, LoadedContextFile, Skill};
-use crate::extensions::{LoadExtensionsResult, discover_and_load_extensions};
+use crate::extensions::{
+    ExtensionEvent, LoadExtensionsResult, SessionLifecycleReason, discover_and_load_extensions,
+    dispatch_loaded_extensions,
+};
 use crate::settings::SettingsManager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,21 +122,33 @@ impl DefaultResourceLoader {
             load_prompt_paths(&self.prompt_paths(), &mut diagnostics)
         };
 
+        let mut extension_append_system_prompt = Vec::new();
         let extensions = if self.options.no_extensions {
             None
         } else {
-            Some(discover_and_load_extensions(
+            let loaded = discover_and_load_extensions(
                 &self.options.extension_paths,
                 &self.options.cwd.to_string_lossy(),
                 Some(&self.options.agent_dir.to_string_lossy()),
-            ))
+            );
+            let resource_updates = dispatch_loaded_extensions(
+                &loaded,
+                &ExtensionEvent::ResourcesDiscover {
+                    cwd: self.options.cwd.to_string_lossy().to_string(),
+                    reason: SessionLifecycleReason::Startup,
+                },
+            );
+            for (_, update) in resource_updates {
+                collect_extension_prompt_updates(&update, &mut extension_append_system_prompt);
+            }
+            Some(loaded)
         };
 
         let system_prompt =
             self.options.system_prompt.as_deref().and_then(|source| {
                 resolve_prompt_source(source, "system prompt", &mut diagnostics)
             });
-        let append_system_prompt = self
+        let mut append_system_prompt: Vec<String> = self
             .options
             .append_system_prompt
             .iter()
@@ -141,6 +156,7 @@ impl DefaultResourceLoader {
                 resolve_prompt_source(source, "append system prompt", &mut diagnostics)
             })
             .collect();
+        append_system_prompt.extend(extension_append_system_prompt);
 
         self.resources = ResourceSet {
             extensions,
@@ -172,6 +188,19 @@ impl DefaultResourceLoader {
             self.options.prompt_paths.iter().map(|p| resolve_against(&self.options.cwd, p)),
         );
         dedupe_paths(paths)
+    }
+}
+
+fn collect_extension_prompt_updates(value: &serde_json::Value, output: &mut Vec<String>) {
+    if let Some(prompt) = value.get("systemPrompt").and_then(|value| value.as_str()) {
+        output.push(prompt.to_string());
+    }
+    match value.get("appendSystemPrompt") {
+        Some(serde_json::Value::String(prompt)) => output.push(prompt.clone()),
+        Some(serde_json::Value::Array(prompts)) => {
+            output.extend(prompts.iter().filter_map(|value| value.as_str().map(ToOwned::to_owned)));
+        }
+        _ => {}
     }
 }
 

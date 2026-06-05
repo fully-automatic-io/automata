@@ -329,10 +329,36 @@ impl AgentLoop<'_> {
             self.config.api_key.clone()
         };
 
+        let mut stream_model = model.clone();
+        let mut stream_system_prompt = context.system_prompt.clone();
+        let mut stream_messages = llm_messages;
+
+        if let Some(ref hook) = self.config.on_payload {
+            let payload = serde_json::json!({
+                "model": stream_model.id.clone(),
+                "system": stream_system_prompt.clone(),
+                "messages": stream_messages.clone(),
+                "transport": format!("{:?}", self.config.transport).to_lowercase(),
+            });
+            if let Some(updated) = hook(payload).await {
+                if let Some(model_id) = updated.get("model").and_then(|value| value.as_str()) {
+                    stream_model.id = model_id.to_string();
+                }
+                if let Some(system) = updated.get("system").and_then(|value| value.as_str()) {
+                    stream_system_prompt = system.to_string();
+                }
+                if let Some(messages) = updated.get("messages")
+                    && let Ok(parsed) = serde_json::from_value(messages.clone())
+                {
+                    stream_messages = parsed;
+                }
+            }
+        }
+
         let stream_input = StreamFnInput {
-            model: model.clone(),
-            system_prompt: context.system_prompt.clone(),
-            messages: llm_messages,
+            model: stream_model,
+            system_prompt: stream_system_prompt,
+            messages: stream_messages,
             tools: context.tools.clone(),
             api_key: resolved_api_key,
             signal: signal.clone(),
@@ -345,16 +371,6 @@ impl AgentLoop<'_> {
             max_tokens: self.config.max_tokens,
             provider_options: self.config.provider_options.clone(),
         };
-
-        if let Some(ref hook) = self.config.on_payload {
-            let payload = serde_json::json!({
-                "model": stream_input.model.id,
-                "system": stream_input.system_prompt,
-                "messages": stream_input.messages,
-                "transport": format!("{:?}", stream_input.transport).to_lowercase(),
-            });
-            hook(payload).await;
-        }
 
         let response = match (self.stream_fn)(stream_input).await {
             Ok(stream) => stream,

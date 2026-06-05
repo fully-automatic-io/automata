@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::extensions::{collect_registered_providers, extension_agent_tools};
 use crate::models::ModelRegistry;
 use crate::settings::SettingsManager;
 use agent_core::harness::session::{Session, SessionError, SessionTreeEntry};
 use agent_core::tool::AgentTool;
+use agent_core::types::{Api, ModelCost};
 use agent_core::types::{Model, ThinkingLevel};
 
 use super::auth::AuthStorage;
@@ -140,10 +142,14 @@ pub async fn create_agent_session_from_services(
         agent_dir,
         mut auth,
         settings,
-        models,
+        mut models,
         resources,
         diagnostics,
     } = services;
+
+    if let Some(extensions) = &resources.extensions {
+        register_extension_providers(&mut models, collect_registered_providers(extensions));
+    }
 
     let managed_session = session.open_session(&cwd, &agent_dir).await?;
     let mut session = managed_session.session;
@@ -190,6 +196,8 @@ pub async fn create_agent_session_from_services(
     };
 
     let cwd_string = cwd.to_string_lossy().to_string();
+    let extension_tools =
+        resources.extensions.as_ref().map(extension_agent_tools).unwrap_or_default();
     let built_tools = build_tools_with_options(
         &cwd_string,
         &tool_selection,
@@ -197,6 +205,7 @@ pub async fn create_agent_session_from_services(
         BuildToolsOptions {
             shell_path: settings.get_shell_path().map(ToOwned::to_owned),
             shell_command_prefix: settings.get_shell_command_prefix().map(ToOwned::to_owned),
+            extension_tools,
         },
     )
     .map_err(|err| SessionError::InvalidArgument(err.to_string()))?;
@@ -229,6 +238,49 @@ pub async fn create_agent_session_from_services(
         cwd,
         agent_dir,
     })
+}
+
+fn register_extension_providers(
+    models: &mut ModelRegistry,
+    providers: std::collections::HashMap<String, crate::extensions::ProviderConfig>,
+) {
+    for (provider_name, provider) in providers {
+        models.register_provider(
+            provider_name.clone(),
+            crate::models::ProviderConfig {
+                api_key: provider.api_key.clone(),
+                base_url: provider.base_url.clone(),
+                api: provider.api.as_deref().and_then(Api::from_wire_str),
+                headers: provider.headers.clone().unwrap_or_default(),
+                auth_header: provider.auth_header,
+            },
+        );
+        for model in provider.models.unwrap_or_default() {
+            models.register_model(agent_core::types::Model {
+                id: model.id,
+                name: model.name,
+                api: model
+                    .api
+                    .as_deref()
+                    .and_then(Api::from_wire_str)
+                    .or_else(|| provider.api.as_deref().and_then(Api::from_wire_str))
+                    .unwrap_or_default(),
+                provider: provider_name.clone(),
+                base_url: provider.base_url.clone().unwrap_or_default(),
+                reasoning: model.reasoning,
+                input: model.input,
+                cost: ModelCost {
+                    input: model.cost.input,
+                    output: model.cost.output,
+                    cache_read: model.cost.cache_read,
+                    cache_write: model.cost.cache_write,
+                },
+                context_window: model.context_window,
+                max_tokens: model.max_tokens,
+                compat: Default::default(),
+            });
+        }
+    }
 }
 
 fn select_model(

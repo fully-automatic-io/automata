@@ -1,0 +1,9 @@
+package automata:plugin;
+
+world extension {
+  import host-action: func(action-json: string) -> result<string, string>;
+
+  export register: func() -> result<string, string>;
+  export on-event: func(event-json: string) -> result<option<string>, string>;
+  export invoke-tool: func(request-json: string) -> result<string, string>;
+}

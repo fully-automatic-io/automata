@@ -6,7 +6,7 @@
 // coding tools, and the system prompt. Callers drive it with `prompt(text)`
 // and observe progress by subscribing to `HarnessEvent`s.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent_core::auto_retry::RetrySettings;
@@ -24,6 +24,12 @@ use llm_client::provider::LlmProvider;
 use tokio_util::sync::CancellationToken;
 
 use super::provider::{Auth, ProviderBuild, build_provider};
+use crate::extensions::{
+    ExtensionEvent, ExtensionRunner, LoadExtensionsResult, SessionLifecycleReason,
+    extension_after_tool_call_hook, extension_agent_tools, extension_before_tool_call_hook,
+    extension_on_payload_hook, extension_on_response_hook, extension_transform_context_hook,
+    subscribe_extension_harness_events,
+};
 use crate::stream_bridge::create_stream_fn;
 use crate::tools::{
     BashTool, BashToolOptions, EditTool, EditToolOptions, FindTool, GrepTool, LsTool, ReadTool,
@@ -247,6 +253,14 @@ impl ToolSelection {
         &self,
         restored_names: Option<Vec<String>>,
     ) -> Result<Vec<ToolName>, ToolSelectionError> {
+        self.active_names_with_extensions(restored_names, &[])
+    }
+
+    pub fn active_names_with_extensions(
+        &self,
+        restored_names: Option<Vec<String>>,
+        extension_names: &[String],
+    ) -> Result<Vec<ToolName>, ToolSelectionError> {
         let base = if self.restore_session
             && self.allow.is_none()
             && let Some(restored_names) = restored_names
@@ -256,7 +270,17 @@ impl ToolSelection {
         } else if let Some(allow) = &self.allow {
             allow.clone()
         } else {
-            self.preset.tools().iter().copied().map(ToolName::from).collect()
+            let mut names =
+                self.preset.tools().iter().copied().map(ToolName::from).collect::<Vec<_>>();
+            if matches!(self.preset, ToolPreset::Coding | ToolPreset::All) {
+                names.extend(
+                    extension_names
+                        .iter()
+                        .map(|name| ToolName::new(name.clone()))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            names
         };
 
         let excluded: HashSet<&str> = self.exclude.iter().map(ToolName::as_str).collect();
@@ -297,10 +321,21 @@ pub struct BuiltTools {
     pub names: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct BuildToolsOptions {
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
+    pub extension_tools: Vec<Arc<dyn AgentTool>>,
+}
+
+impl std::fmt::Debug for BuildToolsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildToolsOptions")
+            .field("shell_path", &self.shell_path)
+            .field("shell_command_prefix", &self.shell_command_prefix)
+            .field("extension_tool_count", &self.extension_tools.len())
+            .finish()
+    }
 }
 
 /// Build the selected built-in coding tools for `cwd`.
@@ -315,7 +350,12 @@ pub fn build_tools_with_options(
     restored_names: Option<Vec<String>>,
     options: BuildToolsOptions,
 ) -> Result<BuiltTools, ToolSelectionError> {
-    let names = selection.active_names(restored_names)?;
+    let extension_names = options
+        .extension_tools
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+    let names = selection.active_names_with_extensions(restored_names, &extension_names)?;
     build_tools_from_names(cwd, &names, options)
 }
 
@@ -326,29 +366,40 @@ pub fn build_tools_from_names(
 ) -> Result<BuiltTools, ToolSelectionError> {
     let mut tools: Vec<Arc<dyn AgentTool>> = Vec::with_capacity(names.len());
     let mut tool_names = Vec::with_capacity(names.len());
+    let extension_tools = options
+        .extension_tools
+        .iter()
+        .map(|tool| (tool.name().to_string(), tool.clone()))
+        .collect::<HashMap<_, _>>();
     for name in names {
-        let builtin = BuiltinTool::try_from(name.as_str())?;
-        let tool: Arc<dyn AgentTool> = match builtin {
-            BuiltinTool::Read => {
-                Arc::new(ReadTool::new(cwd.to_string(), ReadToolOptions::default()))
-            }
-            BuiltinTool::Bash => Arc::new(BashTool::new(
-                cwd.to_string(),
-                BashToolOptions {
-                    shell_path: options.shell_path.clone(),
-                    command_prefix: options.shell_command_prefix.clone(),
-                    ..Default::default()
-                },
-            )),
-            BuiltinTool::Edit => {
-                Arc::new(EditTool::new(cwd.to_string(), EditToolOptions::default()))
-            }
-            BuiltinTool::Write => {
-                Arc::new(WriteTool::new(cwd.to_string(), WriteToolOptions::default()))
-            }
-            BuiltinTool::Grep => Arc::new(GrepTool::new(cwd.to_string())),
-            BuiltinTool::Find => Arc::new(FindTool::new(cwd.to_string())),
-            BuiltinTool::Ls => Arc::new(LsTool::new(cwd.to_string())),
+        let tool: Arc<dyn AgentTool> = match BuiltinTool::try_from(name.as_str()) {
+            Ok(builtin) => match builtin {
+                BuiltinTool::Read => {
+                    Arc::new(ReadTool::new(cwd.to_string(), ReadToolOptions::default()))
+                }
+                BuiltinTool::Bash => Arc::new(BashTool::new(
+                    cwd.to_string(),
+                    BashToolOptions {
+                        shell_path: options.shell_path.clone(),
+                        command_prefix: options.shell_command_prefix.clone(),
+                        ..Default::default()
+                    },
+                )),
+                BuiltinTool::Edit => {
+                    Arc::new(EditTool::new(cwd.to_string(), EditToolOptions::default()))
+                }
+                BuiltinTool::Write => {
+                    Arc::new(WriteTool::new(cwd.to_string(), WriteToolOptions::default()))
+                }
+                BuiltinTool::Grep => Arc::new(GrepTool::new(cwd.to_string())),
+                BuiltinTool::Find => Arc::new(FindTool::new(cwd.to_string())),
+                BuiltinTool::Ls => Arc::new(LsTool::new(cwd.to_string())),
+            },
+            Err(ToolSelectionError::UnknownTool(_)) => extension_tools
+                .get(name.as_str())
+                .cloned()
+                .ok_or_else(|| ToolSelectionError::UnknownTool(name.as_str().to_string()))?,
+            Err(err) => return Err(err),
         };
         tools.push(tool);
         tool_names.push(name.as_str().to_string());
@@ -426,6 +477,8 @@ pub struct SessionOptions {
     /// Built-in tool selection. Defaults to the coding preset and restores
     /// active tools from persisted sessions when available.
     pub tools: ToolSelection,
+    /// Wasmtime component extensions already loaded by the resource layer.
+    pub extensions: Option<LoadExtensionsResult>,
     /// Compaction policy. Auto-compaction is wired only when `Some`.
     pub compaction: Option<CompactionSettings>,
     /// Transient-error retry policy.
@@ -444,6 +497,7 @@ impl SessionOptions {
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
             tools: ToolSelection::default(),
+            extensions: None,
             compaction: Some(CompactionSettings::default()),
             retry: RetrySettings::default(),
         }
@@ -496,6 +550,7 @@ impl CodingAgentSession {
             system_prompt,
             thinking_level,
             tools,
+            extensions,
             compaction,
             retry,
             ..
@@ -503,6 +558,12 @@ impl CodingAgentSession {
 
         let stream_fn = create_stream_fn(provider.clone(), model.clone());
         let compaction_stream_fn = make_compaction_stream_fn(provider, model.id.clone());
+        let extension_tools = extensions.as_ref().map(extension_agent_tools).unwrap_or_default();
+        let extension_runner = extensions.map(|extensions| {
+            let mut runner = ExtensionRunner::new();
+            runner.load(extensions);
+            Arc::new(runner)
+        });
 
         let harness = AgentHarness::new(
             session,
@@ -517,17 +578,35 @@ impl CodingAgentSession {
             AgentHarnessOptions {
                 stream_fn,
                 convert_to_llm: None,
-                transform_context: None,
-                before_tool_call: None,
-                after_tool_call: None,
+                transform_context: extension_runner
+                    .as_ref()
+                    .map(|runner| extension_transform_context_hook(runner.clone())),
+                before_tool_call: extension_runner
+                    .as_ref()
+                    .map(|runner| extension_before_tool_call_hook(runner.clone())),
+                after_tool_call: extension_runner
+                    .as_ref()
+                    .map(|runner| extension_after_tool_call_hook(runner.clone())),
                 should_stop_after_turn: None,
                 prepare_next_turn: None,
-                on_payload: None,
-                on_response: None,
+                on_payload: extension_runner
+                    .as_ref()
+                    .map(|runner| extension_on_payload_hook(runner.clone())),
+                on_response: extension_runner
+                    .as_ref()
+                    .map(|runner| extension_on_response_hook(runner.clone())),
             },
         );
 
-        let built_tools = build_tools(&cwd, &tools)?;
+        let built_tools = build_tools_with_options(
+            &cwd,
+            &tools,
+            None,
+            BuildToolsOptions {
+                extension_tools,
+                ..BuildToolsOptions::default()
+            },
+        )?;
 
         let compaction_settings = compaction.clone().unwrap_or_default();
         let compaction_stream_fn = Arc::new(compaction_stream_fn);
@@ -545,6 +624,13 @@ impl CodingAgentSession {
                     stream_fn: compaction_stream_fn.clone(),
                 }))
                 .await;
+        }
+        if let Some(runner) = &extension_runner {
+            let _ = runner.dispatch_event(&ExtensionEvent::SessionStart {
+                reason: SessionLifecycleReason::Startup,
+                previous_session_file: None,
+            });
+            subscribe_extension_harness_events(&harness, runner.clone()).await;
         }
 
         Ok(Self {
@@ -642,6 +728,28 @@ mod tests {
         assert_eq!(
             names.iter().map(ToolName::as_str).collect::<Vec<_>>(),
             vec!["read", "bash", "edit", "write"]
+        );
+    }
+
+    #[test]
+    fn coding_preset_includes_extension_tools() {
+        let names = ToolSelection::default()
+            .active_names_with_extensions(None, &["project_status".to_string()])
+            .unwrap();
+        assert_eq!(
+            names.iter().map(ToolName::as_str).collect::<Vec<_>>(),
+            vec!["read", "bash", "edit", "write", "project_status"]
+        );
+    }
+
+    #[test]
+    fn read_only_preset_excludes_extension_tools_by_default() {
+        let names = ToolSelection::read_only()
+            .active_names_with_extensions(None, &["project_status".to_string()])
+            .unwrap();
+        assert_eq!(
+            names.iter().map(ToolName::as_str).collect::<Vec<_>>(),
+            vec!["read", "grep", "find", "ls"]
         );
     }
 
