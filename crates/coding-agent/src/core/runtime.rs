@@ -4,6 +4,7 @@ use agent_core::harness::session::{Session, SessionError};
 
 use super::sdk::{AgentSessionHandle, CreateAgentSessionOptions, create_agent_session};
 use super::services::SessionDiagnostic;
+use super::session::ToolSelection;
 use super::session_manager::{ForkPosition, SessionManager};
 
 pub struct AgentSessionRuntimeOptions {
@@ -13,7 +14,7 @@ pub struct AgentSessionRuntimeOptions {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub thinking_level: Option<agent_core::types::ThinkingLevel>,
-    pub allowed_tools: Option<Vec<String>>,
+    pub tools: ToolSelection,
 }
 
 impl AgentSessionRuntimeOptions {
@@ -25,7 +26,7 @@ impl AgentSessionRuntimeOptions {
             model: None,
             api_key: None,
             thinking_level: None,
-            allowed_tools: None,
+            tools: ToolSelection::default(),
         }
     }
 }
@@ -41,7 +42,7 @@ struct RuntimeFixedOptions {
     model: Option<String>,
     api_key: Option<String>,
     thinking_level: Option<agent_core::types::ThinkingLevel>,
-    allowed_tools: Option<Vec<String>>,
+    tools: ToolSelection,
 }
 
 impl AgentSessionRuntime {
@@ -51,7 +52,7 @@ impl AgentSessionRuntime {
             model: options.model.clone(),
             api_key: options.api_key.clone(),
             thinking_level: options.thinking_level,
-            allowed_tools: options.allowed_tools.clone(),
+            tools: options.tools.clone(),
         };
         let handle = create_agent_session(CreateAgentSessionOptions {
             cwd: options.cwd,
@@ -60,7 +61,7 @@ impl AgentSessionRuntime {
             model: options.model,
             api_key: options.api_key,
             thinking_level: options.thinking_level,
-            allowed_tools: options.allowed_tools,
+            tools: options.tools,
         })
         .await?;
         Ok(Self { handle, options: fixed })
@@ -145,7 +146,7 @@ impl AgentSessionRuntime {
             model: self.options.model.clone(),
             api_key: self.options.api_key.clone(),
             thinking_level: self.options.thinking_level,
-            allowed_tools: self.options.allowed_tools.clone(),
+            tools: self.options.tools.clone(),
         })
         .await?;
         Ok(())
@@ -175,7 +176,7 @@ mod tests {
             model: None,
             api_key: None,
             thinking_level: None,
-            allowed_tools: None,
+            tools: ToolSelection::default(),
         })
         .await
         .unwrap();
@@ -188,7 +189,7 @@ mod tests {
             model: None,
             api_key: None,
             thinking_level: None,
-            allowed_tools: None,
+            tools: ToolSelection::default(),
         })
         .await
         .unwrap();

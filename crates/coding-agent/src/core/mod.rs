@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod sdk;
 pub mod services;
 pub mod session;
+pub mod session_cwd;
 pub mod session_manager;
 pub mod slash;
 
@@ -45,8 +46,14 @@ pub use services::{
     create_agent_session_services,
 };
 pub use session::{
-    BuildToolsOptions, CodingAgentSession, DEFAULT_TOOL_NAMES, SessionOptions, build_tools,
+    ALL_BUILTIN_TOOLS, BuildToolsOptions, BuiltTools, BuiltinTool, CodingAgentSession,
+    DEFAULT_ACTIVE_TOOLS, READ_ONLY_TOOLS, SessionBuildError, SessionOptions, ToolName, ToolPreset,
+    ToolSelection, ToolSelectionError, build_tools, build_tools_from_names,
     build_tools_with_options,
+};
+pub use session_cwd::{
+    SessionCwdIssue, assert_session_cwd_exists, format_missing_session_cwd_error,
+    format_missing_session_cwd_prompt, missing_session_cwd_issue,
 };
 pub use session_manager::{ForkPosition, ManagedSession, ManagedSessionMetadata, SessionManager};
 pub use slash::{

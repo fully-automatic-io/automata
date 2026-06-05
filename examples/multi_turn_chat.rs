@@ -24,7 +24,7 @@ use agent_core::types::{
     Transport,
 };
 use coding_agent::stream_bridge::create_stream_fn;
-use coding_agent::{Auth, ProviderBuild, build_provider, build_tools};
+use coding_agent::{Auth, BuiltinTool, ProviderBuild, ToolSelection, build_provider, build_tools};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 fn truncate(s: &str, n: usize) -> String {
@@ -95,10 +95,10 @@ async fn build_harness(cwd: &str, endpoint: &str, token: &str, model_id: &str) -
         },
     );
 
-    let tool_names = ["bash", "ls"];
-    let tools = build_tools(cwd, &tool_names);
+    let built_tools = build_tools(cwd, &ToolSelection::only([BuiltinTool::Bash, BuiltinTool::Ls]))
+        .expect("build tools");
     harness
-        .set_tools(tools, Some(tool_names.iter().map(|name| (*name).to_string()).collect()))
+        .set_tools(built_tools.tools, Some(built_tools.names))
         .await
         .expect("set active tools");
     harness.set_model_info(ModelInfo::from(&model)).await;

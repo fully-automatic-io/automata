@@ -9,7 +9,7 @@
 use agent_core::event::AgentEvent;
 use agent_core::harness::HarnessEvent;
 use agent_core::types::{Api, ContentBlock, Model, ModelCost};
-use coding_agent::{Auth, CodingAgentSession, SessionOptions};
+use coding_agent::{Auth, BuiltinTool, CodingAgentSession, SessionOptions, ToolSelection};
 
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -55,13 +55,20 @@ async fn main() {
     let mut options = SessionOptions::new(cwd.clone(), model, token);
     options.base_url = Some(endpoint);
     options.auth = Auth::Bearer;
-    options.tools = Some(vec!["bash".into(), "write".into(), "read".into(), "ls".into()]);
+    options.tools = ToolSelection::only([
+        BuiltinTool::Bash,
+        BuiltinTool::Write,
+        BuiltinTool::Read,
+        BuiltinTool::Ls,
+    ]);
     options.system_prompt = format!(
         "你是一个编程助手，工作目录已经设置为 {cwd}。\n\
          可以用 bash/write/read/ls 工具完成任务。每一步只做必要操作，完成后用一句话总结。"
     );
 
-    let session = CodingAgentSession::builder(options).await;
+    let session = CodingAgentSession::builder(options)
+        .await
+        .expect("build DeepSeek coding session");
 
     session
         .subscribe(|event, _signal| async move {

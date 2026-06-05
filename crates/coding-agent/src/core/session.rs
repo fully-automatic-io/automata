@@ -6,6 +6,7 @@
 // coding tools, and the system prompt. Callers drive it with `prompt(text)`
 // and observe progress by subscribing to `HarnessEvent`s.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use agent_core::auto_retry::RetrySettings;
@@ -29,8 +30,272 @@ use crate::tools::{
     ReadToolOptions, WriteTool, WriteToolOptions,
 };
 
-/// The default tool set, in display order.
-pub const DEFAULT_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinTool {
+    Read,
+    Bash,
+    Edit,
+    Write,
+    Grep,
+    Find,
+    Ls,
+}
+
+impl BuiltinTool {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Bash => "bash",
+            Self::Edit => "edit",
+            Self::Write => "write",
+            Self::Grep => "grep",
+            Self::Find => "find",
+            Self::Ls => "ls",
+        }
+    }
+}
+
+impl std::fmt::Display for BuiltinTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl TryFrom<&str> for BuiltinTool {
+    type Error = ToolSelectionError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "read" => Ok(Self::Read),
+            "bash" => Ok(Self::Bash),
+            "edit" => Ok(Self::Edit),
+            "write" => Ok(Self::Write),
+            "grep" => Ok(Self::Grep),
+            "find" => Ok(Self::Find),
+            "ls" => Ok(Self::Ls),
+            other => Err(ToolSelectionError::UnknownTool(other.to_string())),
+        }
+    }
+}
+
+pub const ALL_BUILTIN_TOOLS: [BuiltinTool; 7] = [
+    BuiltinTool::Read,
+    BuiltinTool::Bash,
+    BuiltinTool::Edit,
+    BuiltinTool::Write,
+    BuiltinTool::Grep,
+    BuiltinTool::Find,
+    BuiltinTool::Ls,
+];
+
+pub const DEFAULT_ACTIVE_TOOLS: [BuiltinTool; 4] =
+    [BuiltinTool::Read, BuiltinTool::Bash, BuiltinTool::Edit, BuiltinTool::Write];
+
+pub const READ_ONLY_TOOLS: [BuiltinTool; 4] =
+    [BuiltinTool::Read, BuiltinTool::Grep, BuiltinTool::Find, BuiltinTool::Ls];
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolName(String);
+
+impl ToolName {
+    pub fn new(name: impl Into<String>) -> Result<Self, ToolSelectionError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(ToolSelectionError::EmptyToolName);
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<BuiltinTool> for ToolName {
+    fn from(tool: BuiltinTool) -> Self {
+        Self(tool.name().to_string())
+    }
+}
+
+impl std::fmt::Display for ToolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPreset {
+    Coding,
+    ReadOnly,
+    All,
+    None,
+}
+
+impl ToolPreset {
+    fn tools(self) -> &'static [BuiltinTool] {
+        match self {
+            Self::Coding => &DEFAULT_ACTIVE_TOOLS,
+            Self::ReadOnly => &READ_ONLY_TOOLS,
+            Self::All => &ALL_BUILTIN_TOOLS,
+            Self::None => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSelection {
+    preset: ToolPreset,
+    allow: Option<Vec<ToolName>>,
+    exclude: Vec<ToolName>,
+    restore_session: bool,
+}
+
+impl Default for ToolSelection {
+    fn default() -> Self {
+        Self {
+            preset: ToolPreset::Coding,
+            allow: None,
+            exclude: Vec::new(),
+            restore_session: true,
+        }
+    }
+}
+
+impl ToolSelection {
+    pub fn preset(preset: ToolPreset) -> Self {
+        Self {
+            preset,
+            allow: None,
+            exclude: Vec::new(),
+            restore_session: false,
+        }
+    }
+
+    pub fn restore_or(preset: ToolPreset) -> Self {
+        Self {
+            restore_session: true,
+            ..Self::preset(preset)
+        }
+    }
+
+    pub fn coding() -> Self {
+        Self::preset(ToolPreset::Coding)
+    }
+
+    pub fn read_only() -> Self {
+        Self::preset(ToolPreset::ReadOnly)
+    }
+
+    pub fn all() -> Self {
+        Self::preset(ToolPreset::All)
+    }
+
+    pub fn none() -> Self {
+        Self::preset(ToolPreset::None)
+    }
+
+    pub fn only<I, T>(tools: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<ToolName>,
+    {
+        Self {
+            preset: ToolPreset::None,
+            allow: Some(tools.into_iter().map(Into::into).collect()),
+            exclude: Vec::new(),
+            restore_session: false,
+        }
+    }
+
+    pub fn from_names<I, S>(names: I) -> Result<Self, ToolSelectionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let names = names
+            .into_iter()
+            .map(|name| ToolName::new(name.as_ref().to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_unique_tool_names(&names)?;
+        Ok(Self {
+            preset: ToolPreset::None,
+            allow: Some(names),
+            exclude: Vec::new(),
+            restore_session: false,
+        })
+    }
+
+    pub fn exclude<I, T>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<ToolName>,
+    {
+        self.exclude = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn restore_session(mut self, restore_session: bool) -> Self {
+        self.restore_session = restore_session;
+        self
+    }
+
+    pub fn active_names(
+        &self,
+        restored_names: Option<Vec<String>>,
+    ) -> Result<Vec<ToolName>, ToolSelectionError> {
+        let base = if self.restore_session
+            && self.allow.is_none()
+            && let Some(restored_names) = restored_names
+            && !restored_names.is_empty()
+        {
+            restored_names.into_iter().map(ToolName::new).collect::<Result<Vec<_>, _>>()?
+        } else if let Some(allow) = &self.allow {
+            allow.clone()
+        } else {
+            self.preset.tools().iter().copied().map(ToolName::from).collect()
+        };
+
+        let excluded: HashSet<&str> = self.exclude.iter().map(ToolName::as_str).collect();
+        let active = base
+            .into_iter()
+            .filter(|name| !excluded.contains(name.as_str()))
+            .collect::<Vec<_>>();
+        validate_unique_tool_names(&active)?;
+        Ok(active)
+    }
+
+    pub fn should_write_active_tools(&self, has_restored_tools: bool) -> bool {
+        self.allow.is_some() || !self.restore_session || !has_restored_tools
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToolSelectionError {
+    #[error("tool name cannot be empty")]
+    EmptyToolName,
+    #[error("duplicate tool name: {0}")]
+    DuplicateTool(String),
+    #[error("unknown tool: {0}")]
+    UnknownTool(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionBuildError {
+    #[error(transparent)]
+    ToolSelection(#[from] ToolSelectionError),
+    #[error(transparent)]
+    Harness(#[from] HarnessError),
+}
+
+#[derive(Clone)]
+pub struct BuiltTools {
+    pub tools: Vec<Arc<dyn AgentTool>>,
+    pub names: Vec<String>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct BuildToolsOptions {
@@ -38,22 +303,36 @@ pub struct BuildToolsOptions {
     pub shell_command_prefix: Option<String>,
 }
 
-/// Build the built-in coding tools for `cwd`, filtered to `names`.
-pub fn build_tools(cwd: &str, names: &[&str]) -> Vec<Arc<dyn AgentTool>> {
-    build_tools_with_options(cwd, names, BuildToolsOptions::default())
+/// Build the selected built-in coding tools for `cwd`.
+pub fn build_tools(cwd: &str, selection: &ToolSelection) -> Result<BuiltTools, ToolSelectionError> {
+    build_tools_with_options(cwd, selection, None, BuildToolsOptions::default())
 }
 
 /// Build the built-in coding tools with runtime settings applied.
 pub fn build_tools_with_options(
     cwd: &str,
-    names: &[&str],
+    selection: &ToolSelection,
+    restored_names: Option<Vec<String>>,
     options: BuildToolsOptions,
-) -> Vec<Arc<dyn AgentTool>> {
+) -> Result<BuiltTools, ToolSelectionError> {
+    let names = selection.active_names(restored_names)?;
+    build_tools_from_names(cwd, &names, options)
+}
+
+pub fn build_tools_from_names(
+    cwd: &str,
+    names: &[ToolName],
+    options: BuildToolsOptions,
+) -> Result<BuiltTools, ToolSelectionError> {
     let mut tools: Vec<Arc<dyn AgentTool>> = Vec::with_capacity(names.len());
+    let mut tool_names = Vec::with_capacity(names.len());
     for name in names {
-        let tool: Arc<dyn AgentTool> = match *name {
-            "read" => Arc::new(ReadTool::new(cwd.to_string(), ReadToolOptions::default())),
-            "bash" => Arc::new(BashTool::new(
+        let builtin = BuiltinTool::try_from(name.as_str())?;
+        let tool: Arc<dyn AgentTool> = match builtin {
+            BuiltinTool::Read => {
+                Arc::new(ReadTool::new(cwd.to_string(), ReadToolOptions::default()))
+            }
+            BuiltinTool::Bash => Arc::new(BashTool::new(
                 cwd.to_string(),
                 BashToolOptions {
                     shell_path: options.shell_path.clone(),
@@ -61,16 +340,30 @@ pub fn build_tools_with_options(
                     ..Default::default()
                 },
             )),
-            "edit" => Arc::new(EditTool::new(cwd.to_string(), EditToolOptions::default())),
-            "write" => Arc::new(WriteTool::new(cwd.to_string(), WriteToolOptions::default())),
-            "grep" => Arc::new(GrepTool::new(cwd.to_string())),
-            "find" => Arc::new(FindTool::new(cwd.to_string())),
-            "ls" => Arc::new(LsTool::new(cwd.to_string())),
-            _ => continue,
+            BuiltinTool::Edit => {
+                Arc::new(EditTool::new(cwd.to_string(), EditToolOptions::default()))
+            }
+            BuiltinTool::Write => {
+                Arc::new(WriteTool::new(cwd.to_string(), WriteToolOptions::default()))
+            }
+            BuiltinTool::Grep => Arc::new(GrepTool::new(cwd.to_string())),
+            BuiltinTool::Find => Arc::new(FindTool::new(cwd.to_string())),
+            BuiltinTool::Ls => Arc::new(LsTool::new(cwd.to_string())),
         };
         tools.push(tool);
+        tool_names.push(name.as_str().to_string());
     }
-    tools
+    Ok(BuiltTools { tools, names: tool_names })
+}
+
+fn validate_unique_tool_names(names: &[ToolName]) -> Result<(), ToolSelectionError> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            return Err(ToolSelectionError::DuplicateTool(name.as_str().to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Build a compaction summarization callback backed by a provider's
@@ -130,8 +423,9 @@ pub struct SessionOptions {
     pub system_prompt: String,
     /// Reasoning level (clamped to the model's capability).
     pub thinking_level: ThinkingLevel,
-    /// Tool names to enable. Defaults to [`DEFAULT_TOOL_NAMES`] when `None`.
-    pub tools: Option<Vec<String>>,
+    /// Built-in tool selection. Defaults to the coding preset and restores
+    /// active tools from persisted sessions when available.
+    pub tools: ToolSelection,
     /// Compaction policy. Auto-compaction is wired only when `Some`.
     pub compaction: Option<CompactionSettings>,
     /// Transient-error retry policy.
@@ -149,7 +443,7 @@ impl SessionOptions {
             auth: Auth::Native,
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
-            tools: None,
+            tools: ToolSelection::default(),
             compaction: Some(CompactionSettings::default()),
             retry: RetrySettings::default(),
         }
@@ -168,14 +462,17 @@ impl CodingAgentSession {
     /// Build a session over an in-memory transcript. For a persisted session,
     /// construct a [`Session`] from a `JsonlSessionRepo` and call
     /// [`CodingAgentSession::with_session`].
-    pub async fn builder(options: SessionOptions) -> Self {
+    pub async fn builder(options: SessionOptions) -> Result<Self, SessionBuildError> {
         let session = Session::new(Box::new(InMemorySessionStorage::new(None)));
         Self::with_session(session, options).await
     }
 
     /// Build a session over a caller-provided [`Session`] (e.g. a persisted
     /// JSONL session opened or created via a repo).
-    pub async fn with_session(session: Session, options: SessionOptions) -> Self {
+    pub async fn with_session(
+        session: Session,
+        options: SessionOptions,
+    ) -> Result<Self, SessionBuildError> {
         let provider = build_provider(ProviderBuild {
             model: &options.model,
             api_key: options.api_key.clone(),
@@ -192,7 +489,7 @@ impl CodingAgentSession {
         session: Session,
         provider: Arc<dyn LlmProvider>,
         options: SessionOptions,
-    ) -> Self {
+    ) -> Result<Self, SessionBuildError> {
         let SessionOptions {
             cwd,
             model,
@@ -230,17 +527,13 @@ impl CodingAgentSession {
             },
         );
 
-        let tool_names: Vec<&str> = tools
-            .as_ref()
-            .map(|v| v.iter().map(String::as_str).collect())
-            .unwrap_or_else(|| DEFAULT_TOOL_NAMES.to_vec());
-        let built_tools = build_tools(&cwd, &tool_names);
+        let built_tools = build_tools(&cwd, &tools)?;
 
         let compaction_settings = compaction.clone().unwrap_or_default();
         let compaction_stream_fn = Arc::new(compaction_stream_fn);
 
         // Thread resources + recovery policy through the harness.
-        harness.set_active_tools(built_tools).await;
+        harness.set_tools(built_tools.tools, Some(built_tools.names)).await?;
         harness.set_model_info(ModelInfo::from(&model)).await;
         harness.set_retry_settings(retry).await;
         // Wire the pre-prompt auto-compaction check only when enabled, so an
@@ -254,11 +547,11 @@ impl CodingAgentSession {
                 .await;
         }
 
-        Self {
+        Ok(Self {
             harness,
             compaction_settings,
             compaction_stream_fn,
-        }
+        })
     }
 
     /// The harness powering this session. Use it to subscribe to events,
@@ -336,5 +629,29 @@ impl CodingAgentSession {
     /// Set/override stream options (temperature, max_tokens, headers, ...).
     pub async fn set_stream_options(&self, options: StreamOptions) {
         self.harness.set_stream_options(options).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_tool_selection_uses_coding_preset() {
+        let names = ToolSelection::default().active_names(None).unwrap();
+        assert_eq!(
+            names.iter().map(ToolName::as_str).collect::<Vec<_>>(),
+            vec!["read", "bash", "edit", "write"]
+        );
+    }
+
+    #[test]
+    fn tool_selection_rejects_unknown_names() {
+        let selection = ToolSelection::from_names(["read", "missing"]).unwrap();
+        let err = match build_tools("/tmp", &selection) {
+            Ok(_) => panic!("expected unknown tool to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ToolSelectionError::UnknownTool(name) if name == "missing"));
     }
 }

@@ -144,7 +144,8 @@ async fn prompt_drives_tool_call_then_answers() {
         provider,
         options,
     )
-    .await;
+    .await
+    .unwrap();
 
     let messages = session.prompt("create the marker file").await.unwrap();
 

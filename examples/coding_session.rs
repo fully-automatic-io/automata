@@ -13,7 +13,7 @@
 use agent_core::event::AgentEvent;
 use agent_core::harness::HarnessEvent;
 use agent_core::types::{Api, ContentBlock, Model, ModelCost};
-use coding_agent::{Auth, CodingAgentSession, SessionOptions};
+use coding_agent::{Auth, BuiltinTool, CodingAgentSession, SessionOptions, ToolSelection};
 
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -58,12 +58,18 @@ async fn main() {
     let mut options = SessionOptions::new(cwd.clone(), model, token);
     options.base_url = Some(endpoint);
     options.auth = Auth::Bearer; // DeepSeek's relay wants a bearer token.
+    options.tools = ToolSelection::only([
+        BuiltinTool::Bash,
+        BuiltinTool::Write,
+        BuiltinTool::Read,
+        BuiltinTool::Ls,
+    ]);
     options.system_prompt = format!(
         "You are a coding assistant. Working directory: {cwd}. \
          Use the bash/write/read/ls tools to complete tasks one step at a time."
     );
 
-    let session = CodingAgentSession::builder(options).await;
+    let session = CodingAgentSession::builder(options).await.expect("build coding session");
 
     session
         .subscribe(|event, _signal| async move {

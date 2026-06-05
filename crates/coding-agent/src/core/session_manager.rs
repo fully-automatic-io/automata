@@ -5,6 +5,8 @@ use agent_core::harness::session::{
     SessionError,
 };
 
+use super::session_cwd::{SessionCwdIssue, assert_session_cwd_exists, missing_session_cwd_issue};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkPosition {
     Before,
@@ -152,12 +154,29 @@ impl SessionManager {
 
     pub async fn effective_cwd(&self, fallback_cwd: &Path) -> Result<PathBuf, SessionError> {
         match self {
-            Self::Open { cwd_override: Some(cwd), .. } => Ok(cwd.clone()),
-            Self::Open { path, .. } => {
+            Self::Open { path, cwd_override } => {
                 let storage = JsonlSessionStorage::open(path).await?;
-                Ok(PathBuf::from(&storage.metadata().cwd))
+                let cwd =
+                    open_session_cwd(storage.metadata(), cwd_override.as_deref(), fallback_cwd);
+                assert_session_cwd_exists(Some(path), &cwd, fallback_cwd)?;
+                Ok(cwd)
             }
             _ => Ok(fallback_cwd.to_path_buf()),
+        }
+    }
+
+    pub async fn missing_cwd_issue(
+        &self,
+        fallback_cwd: &Path,
+    ) -> Result<Option<SessionCwdIssue>, SessionError> {
+        match self {
+            Self::Open { path, cwd_override } => {
+                let storage = JsonlSessionStorage::open(path).await?;
+                let cwd =
+                    open_session_cwd(storage.metadata(), cwd_override.as_deref(), fallback_cwd);
+                Ok(missing_session_cwd_issue(Some(path), &cwd, fallback_cwd))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -196,12 +215,11 @@ impl SessionManager {
                 let jsonl_metadata = storage.metadata().clone();
                 let file_path = storage.file_path().to_path_buf();
                 let session = Session::new(Box::new(storage));
-                let metadata = metadata_from_jsonl(
-                    jsonl_metadata,
-                    cwd_override.clone(),
-                    Some(file_path),
-                    None,
-                );
+                let cwd_override = cwd_override
+                    .clone()
+                    .or_else(|| jsonl_metadata.cwd.is_empty().then(|| cwd.to_path_buf()));
+                let metadata =
+                    metadata_from_jsonl(jsonl_metadata, cwd_override, Some(file_path), None);
                 Ok(ManagedSession { session, metadata })
             }
             Self::ContinueRecent { sessions_root } => {
@@ -276,6 +294,20 @@ impl ManagedSessionMetadata {
 
 fn resolve_sessions_root(agent_dir: &Path, configured: Option<&Path>) -> PathBuf {
     configured.map(Path::to_path_buf).unwrap_or_else(|| agent_dir.join("sessions"))
+}
+
+fn open_session_cwd(
+    metadata: &JsonlSessionMetadata,
+    cwd_override: Option<&Path>,
+    fallback_cwd: &Path,
+) -> PathBuf {
+    cwd_override.map(Path::to_path_buf).unwrap_or_else(|| {
+        if metadata.cwd.is_empty() {
+            fallback_cwd.to_path_buf()
+        } else {
+            PathBuf::from(&metadata.cwd)
+        }
+    })
 }
 
 async fn metadata_for_created(
@@ -384,5 +416,58 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, SessionError::InvalidSession(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_session_cwd_without_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fallback_cwd = dir.path().join("repo");
+        let missing_cwd = dir.path().join("missing");
+        let path = dir.path().join("session.jsonl");
+        std::fs::create_dir_all(&fallback_cwd).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session","version":3,"id":"session","timestamp":"2026-01-01T00:00:00Z","cwd":"{}"}}"#,
+                missing_cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let result = SessionManager::open(&path).effective_cwd(&fallback_cwd).await;
+        let err = match result {
+            Ok(_) => panic!("expected missing cwd to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, SessionError::InvalidArgument(message) if message.contains("Stored session working directory does not exist"))
+        );
+    }
+
+    #[tokio::test]
+    async fn open_with_cwd_override_uses_override_metadata() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fallback_cwd = dir.path().join("repo");
+        let missing_cwd = dir.path().join("missing");
+        let agent_dir = dir.path().join("agent");
+        let path = dir.path().join("session.jsonl");
+        std::fs::create_dir_all(&fallback_cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session","version":3,"id":"session","timestamp":"2026-01-01T00:00:00Z","cwd":"{}"}}"#,
+                missing_cwd.display()
+            ),
+        )
+        .unwrap();
+
+        let manager = SessionManager::open(&path).with_cwd_override(&fallback_cwd);
+        let effective_cwd = manager.effective_cwd(&fallback_cwd).await.unwrap();
+        let managed = manager.open_session(&effective_cwd, &agent_dir).await.unwrap();
+
+        assert_eq!(effective_cwd, fallback_cwd);
+        assert_eq!(managed.metadata.cwd, fallback_cwd);
     }
 }

@@ -7,7 +7,9 @@ use agent_core::types::{AgentMessage, ContentBlock};
 use coding_agent::tools::{
     EditTool, EditToolOptions, ReadTool, ReadToolOptions, WriteTool, WriteToolOptions,
 };
-use coding_agent::{CreateAgentSessionOptions, SessionManager, create_agent_session};
+use coding_agent::{
+    BuiltinTool, CreateAgentSessionOptions, SessionManager, ToolSelection, create_agent_session,
+};
 use tempfile::TempDir;
 
 #[tokio::main]
@@ -61,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         model: None,
         api_key: Some("sk-example-runtime-override".into()),
         thinking_level: None,
-        allowed_tools: Some(vec!["read".into(), "write".into(), "ls".into()]),
+        tools: ToolSelection::only([BuiltinTool::Read, BuiltinTool::Write, BuiltinTool::Ls]),
     })
     .await?;
 
@@ -84,7 +86,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert!(prompt.contains("rust-review"));
     println!("  ✓ Built system prompt from settings/resources");
 
-    handle.session.append_active_tools_change(handle.tool_names.clone()).await?;
     handle.session.append_message(AgentMessage::user_text("hello sdk")).await?;
     let sdk_context = handle.session.build_context().await?;
     assert_eq!(sdk_context.active_tool_names, Some(handle.tool_names.clone()));

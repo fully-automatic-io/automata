@@ -17,8 +17,14 @@ pub use core::services::{
     create_agent_session_services,
 };
 pub use core::session::{
-    BuildToolsOptions, CodingAgentSession, DEFAULT_TOOL_NAMES, SessionOptions, build_tools,
+    ALL_BUILTIN_TOOLS, BuildToolsOptions, BuiltTools, BuiltinTool, CodingAgentSession,
+    DEFAULT_ACTIVE_TOOLS, READ_ONLY_TOOLS, SessionBuildError, SessionOptions, ToolName, ToolPreset,
+    ToolSelection, ToolSelectionError, build_tools, build_tools_from_names,
     build_tools_with_options,
+};
+pub use core::session_cwd::{
+    SessionCwdIssue, assert_session_cwd_exists, format_missing_session_cwd_error,
+    format_missing_session_cwd_prompt, missing_session_cwd_issue,
 };
 pub use core::session_manager::{
     ForkPosition, ManagedSession, ManagedSessionMetadata, SessionManager,

@@ -393,6 +393,8 @@ pub trait SessionStorage: Send + Sync {
 pub enum SessionError {
     #[error("Session not found: {0}")]
     NotFound(String),
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("Invalid session: {0}")]
     InvalidSession(String),
     #[error("Invalid entry: {0}")]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::models::ModelRegistry;
 use crate::settings::SettingsManager;
-use agent_core::harness::session::{Session, SessionError};
+use agent_core::harness::session::{Session, SessionError, SessionTreeEntry};
 use agent_core::tool::AgentTool;
 use agent_core::types::{Model, ThinkingLevel};
 
@@ -16,7 +16,7 @@ use super::services::{
     build_system_prompt_from_resources, create_agent_session_services, default_agent_dir,
     resolve_path,
 };
-use super::session::{BuildToolsOptions, DEFAULT_TOOL_NAMES, build_tools_with_options};
+use super::session::{BuildToolsOptions, ToolSelection, build_tools_with_options};
 use super::session_manager::{ManagedSessionMetadata, SessionManager};
 
 pub struct CreateAgentSessionOptions {
@@ -26,7 +26,7 @@ pub struct CreateAgentSessionOptions {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub thinking_level: Option<ThinkingLevel>,
-    pub allowed_tools: Option<Vec<String>>,
+    pub tools: ToolSelection,
 }
 
 impl CreateAgentSessionOptions {
@@ -38,7 +38,7 @@ impl CreateAgentSessionOptions {
             model: None,
             api_key: None,
             thinking_level: None,
-            allowed_tools: None,
+            tools: ToolSelection::default(),
         }
     }
 }
@@ -49,7 +49,7 @@ pub struct CreateAgentSessionFromServicesOptions {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub thinking_level: Option<ThinkingLevel>,
-    pub allowed_tools: Option<Vec<String>>,
+    pub tools: ToolSelection,
 }
 
 pub struct AgentSessionHandle {
@@ -59,6 +59,7 @@ pub struct AgentSessionHandle {
     pub models: ModelRegistry,
     pub auth: AuthStorage,
     pub selected_model: Option<Model>,
+    pub model_fallback_message: Option<String>,
     pub selected_thinking_level: ThinkingLevel,
     pub resources: ResourceSet,
     pub tools: Vec<Arc<dyn AgentTool>>,
@@ -117,7 +118,7 @@ pub async fn create_agent_session(
         model: opts.model,
         api_key: opts.api_key,
         thinking_level: opts.thinking_level,
-        allowed_tools: opts.allowed_tools,
+        tools: opts.tools,
     })
     .await
 }
@@ -131,7 +132,7 @@ pub async fn create_agent_session_from_services(
         model,
         api_key,
         thinking_level,
-        allowed_tools,
+        tools: tool_selection,
     } = opts;
 
     let AgentSessionServices {
@@ -145,8 +146,18 @@ pub async fn create_agent_session_from_services(
     } = services;
 
     let managed_session = session.open_session(&cwd, &agent_dir).await?;
-    let session_context = managed_session.session.build_context().await?;
-    let selected_model = select_model(
+    let mut session = managed_session.session;
+    let session_branch = session.get_branch().await?;
+    let session_context = session.build_context().await?;
+    let has_existing_session = !session_context.messages.is_empty();
+    let has_thinking_entry = session_branch
+        .iter()
+        .any(|entry| matches!(entry, SessionTreeEntry::ThinkingLevelChange { .. }));
+    let has_active_tools_entry = session_branch
+        .iter()
+        .any(|entry| matches!(entry, SessionTreeEntry::ActiveToolsChange { .. }));
+
+    let (selected_model, model_fallback_message) = select_model(
         &models,
         &settings,
         model.as_deref(),
@@ -170,41 +181,50 @@ pub async fn create_agent_session_from_services(
         auth.set_runtime_api_key(&selected_provider, api_key);
     }
 
-    let selected_thinking_level = selected_model
-        .as_ref()
-        .map(|model| {
-            clamp_thinking_level(
-                thinking_level.unwrap_or_else(|| settings.get_thinking_level()),
-                model.reasoning,
-            )
-        })
-        .unwrap_or_else(|| thinking_level.unwrap_or_else(|| settings.get_thinking_level()));
+    let selected_thinking_level = match selected_model.as_ref() {
+        Some(model) => clamp_thinking_level(
+            thinking_level.unwrap_or_else(|| settings.get_thinking_level()),
+            model.reasoning,
+        ),
+        None => ThinkingLevel::Off,
+    };
 
-    let tool_names = allowed_tools
-        .or(session_context.active_tool_names)
-        .unwrap_or_else(|| DEFAULT_TOOL_NAMES.iter().map(|name| (*name).to_string()).collect());
-    let tool_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let cwd_string = cwd.to_string_lossy().to_string();
-    let tools = build_tools_with_options(
+    let built_tools = build_tools_with_options(
         &cwd_string,
-        &tool_refs,
+        &tool_selection,
+        session_context.active_tool_names,
         BuildToolsOptions {
             shell_path: settings.get_shell_path().map(ToOwned::to_owned),
             shell_command_prefix: settings.get_shell_command_prefix().map(ToOwned::to_owned),
         },
-    );
+    )
+    .map_err(|err| SessionError::InvalidArgument(err.to_string()))?;
+
+    if !has_existing_session {
+        if let Some(model) = selected_model.as_ref() {
+            session.append_model_change(&model.provider, &model.id).await?;
+        }
+    }
+    if !has_existing_session || !has_thinking_entry {
+        session.append_thinking_level_change(selected_thinking_level).await?;
+    }
+    if tool_selection.should_write_active_tools(has_active_tools_entry) {
+        session.append_active_tools_change(built_tools.names.clone()).await?;
+    }
 
     Ok(AgentSessionHandle {
-        session: managed_session.session,
+        session,
         session_metadata: managed_session.metadata,
         settings,
         models,
         auth,
         selected_model,
+        model_fallback_message,
         selected_thinking_level,
         resources,
-        tools,
-        tool_names,
+        tools: built_tools.tools,
+        tool_names: built_tools.names,
         diagnostics,
         cwd,
         agent_dir,
@@ -216,23 +236,81 @@ fn select_model(
     settings: &SettingsManager,
     explicit_model: Option<&str>,
     session_model: Option<(&str, &str)>,
-) -> Option<Model> {
-    if let Some(model_id) = explicit_model.or_else(|| settings.get_model())
+) -> (Option<Model>, Option<String>) {
+    if let Some(model_id) = explicit_model
         && let Some(model) = find_model(models, settings.get_provider(), model_id)
     {
-        return Some(model);
+        return (Some(model), None);
     }
 
-    if let Some((provider, model_id)) = session_model
-        && let Some(model) = find_model(models, Some(provider), model_id)
+    let mut fallback_message = None;
+    if let Some((provider, model_id)) = session_model {
+        if let Some(model) = find_model(models, Some(provider), model_id) {
+            return (Some(model), None);
+        }
+        fallback_message = Some(format!("Could not restore model {}/{}", provider, model_id));
+    }
+
+    if let Some(model_id) = settings.get_model()
+        && let Some(model) = find_model(models, settings.get_provider(), model_id)
     {
-        return Some(model);
+        if let Some(message) = &mut fallback_message {
+            *message = format!("{}. Using {}/{}", message, model.provider, model.id);
+        }
+        return (Some(model), fallback_message);
     }
 
     let provider = settings.get_provider().unwrap_or("anthropic");
-    default_model_for_provider(provider)
+    let model = default_model_for_provider(provider)
         .and_then(|model_id| find_model(models, Some(provider), model_id))
-        .or_else(|| models.list_models().into_iter().next().cloned())
+        .or_else(|| models.list_models().into_iter().next().cloned());
+    if let (Some(message), Some(model)) = (&mut fallback_message, model.as_ref()) {
+        *message = format!("{}. Using {}/{}", message, model.provider, model.id);
+    }
+    (model, fallback_message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BuiltinTool;
+
+    #[tokio::test]
+    async fn create_session_persists_initial_runtime_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().join("repo");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"provider":"anthropic","model":"claude-sonnet-4-6"}"#,
+        )
+        .unwrap();
+
+        let handle = create_agent_session(CreateAgentSessionOptions {
+            cwd,
+            agent_dir: Some(agent_dir),
+            session: SessionManager::in_memory(),
+            model: None,
+            api_key: None,
+            thinking_level: None,
+            tools: ToolSelection::only([BuiltinTool::Read]),
+        })
+        .await
+        .unwrap();
+
+        let context = handle.session.build_context().await.unwrap();
+        let selected_model = handle.selected_model.as_ref().unwrap();
+        assert_eq!(
+            context
+                .model
+                .as_ref()
+                .map(|model| (model.provider.as_str(), model.model_id.as_str())),
+            Some((selected_model.provider.as_str(), selected_model.id.as_str()))
+        );
+        assert_eq!(context.active_tool_names, Some(vec!["read".to_string()]));
+    }
 }
 
 fn find_model(models: &ModelRegistry, provider: Option<&str>, model_id: &str) -> Option<Model> {
