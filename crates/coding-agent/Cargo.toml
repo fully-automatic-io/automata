@@ -15,7 +15,6 @@ workspace = true
 [dependencies]
 agent-core = { path = "../agent-core" }
 llm-client = { path = "../llm-client" }
-coding-agent-plugin-sdk = { path = "../coding-agent-plugin-sdk" }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
