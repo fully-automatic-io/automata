@@ -1,3 +1,4 @@
+use agent_core::harness::resolve_shell_config;
 use agent_core::tool::AgentTool;
 use agent_core::types::{
     AgentToolResult, AgentToolUpdateCallback, ContentBlock, ToolExecutionMode,
@@ -159,9 +160,9 @@ impl BashOperations for LocalBashOperations {
         cwd: &str,
         options: BashExecOptions,
     ) -> Result<BashExecResult, Box<dyn std::error::Error + Send + Sync>> {
-        let shell = self.shell_path.as_deref().unwrap_or("/bin/bash");
-        let mut cmd = Command::new(shell);
-        cmd.arg("-c")
+        let shell = resolve_shell_config(self.shell_path.as_deref())?;
+        let mut cmd = Command::new(&shell.shell);
+        cmd.args(&shell.args)
             .arg(command)
             .current_dir(cwd)
             .stdout(std::process::Stdio::piped())
@@ -500,5 +501,47 @@ mod tests {
             "expected partial to contain command output, got: {:?}",
             last
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_bash_operations_uses_configured_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shell_path = dir.path().join("custom-shell");
+        std::fs::write(
+            &shell_path,
+            "#!/bin/sh\nprintf 'arg1=%s\\n' \"$1\"\nprintf 'cmd=%s\\n' \"$2\"\nexec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&shell_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shell_path, perms).unwrap();
+
+        let chunks: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunks_for_callback = chunks.clone();
+        let operations = LocalBashOperations::new(Some(shell_path.to_string_lossy().to_string()));
+        let result = operations
+            .exec(
+                "printf configured",
+                dir.path().to_str().unwrap(),
+                BashExecOptions {
+                    on_data: Arc::new(move |data| {
+                        chunks_for_callback.lock().unwrap().push(data);
+                    }),
+                    signal: None,
+                    timeout: None,
+                    env: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        let output = String::from_utf8_lossy(&chunks.lock().unwrap().concat()).to_string();
+        assert!(output.contains("arg1=-c"), "{output}");
+        assert!(output.contains("cmd=printf configured"), "{output}");
+        assert!(output.contains("configured"), "{output}");
     }
 }

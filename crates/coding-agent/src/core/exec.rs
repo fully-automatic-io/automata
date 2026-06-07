@@ -1,3 +1,4 @@
+use agent_core::harness::resolve_shell_config;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -13,6 +14,7 @@ pub struct ExecOptions {
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub timeout_secs: Option<u64>,
+    pub shell_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -23,8 +25,9 @@ pub struct ExecResult {
 }
 
 pub async fn exec_command(command: &str, opts: ExecOptions) -> Result<ExecResult, String> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
+    let shell = resolve_shell_config(opts.shell_path.as_deref()).map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(&shell.shell);
+    cmd.args(&shell.args)
         .arg(command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -73,9 +76,9 @@ pub struct BashExecutorOptions {
 }
 
 pub async fn execute_bash(command: &str, opts: BashExecutorOptions) -> Result<BashResult, String> {
-    let shell = opts.shell_path.as_deref().unwrap_or("/bin/bash");
-    let mut cmd = Command::new(shell);
-    cmd.arg("-c")
+    let shell = resolve_shell_config(opts.shell_path.as_deref()).map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(&shell.shell);
+    cmd.args(&shell.args)
         .arg(command)
         .current_dir(&opts.cwd)
         .stdout(std::process::Stdio::piped())
@@ -159,21 +162,10 @@ fn detached_pids() -> &'static Mutex<Vec<u32>> {
     DETACHED_PIDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-#[derive(Debug, Clone)]
-pub struct ShellConfig {
-    pub shell: String,
-    pub args: Vec<String>,
-}
+pub type ShellConfig = agent_core::harness::ShellConfig;
 
-pub fn get_shell_config(shell_path: Option<&str>) -> ShellConfig {
-    if let Some(path) = shell_path {
-        return ShellConfig {
-            shell: path.to_string(),
-            args: vec!["-c".to_string()],
-        };
-    }
-    let shell = env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
-    ShellConfig { shell, args: vec!["-c".to_string()] }
+pub fn get_shell_config(shell_path: Option<&str>) -> Result<ShellConfig, String> {
+    resolve_shell_config(shell_path).map_err(|e| e.to_string())
 }
 
 pub fn get_shell_env() -> HashMap<String, String> {
@@ -242,7 +234,7 @@ pub fn cleanup_detached_processes() {
 // ── shell_config path helper (used by BashTool) ───────────────────────────────
 
 pub fn resolve_shell_path() -> Option<String> {
-    env::var("SHELL").ok().filter(|s| !s.is_empty())
+    resolve_shell_config(None).ok().map(|config| config.shell)
 }
 
 #[cfg(test)]
@@ -251,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_get_shell_config() {
-        let config = get_shell_config(None);
+        let config = get_shell_config(None).unwrap();
         assert!(!config.shell.is_empty());
         assert!(!config.args.is_empty());
     }

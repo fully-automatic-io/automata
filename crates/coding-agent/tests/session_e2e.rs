@@ -172,3 +172,56 @@ async fn prompt_drives_tool_call_then_answers() {
         .any(|m| matches!(m, agent_core::types::AgentMessage::ToolResult { .. }));
     assert!(has_tool_result, "transcript should include a tool result");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_uses_configured_shell_and_prefix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = dir.path().to_string_lossy().to_string();
+    let marker = dir.path().join("marker.txt").to_string_lossy().to_string();
+    let shell_marker = dir.path().join("custom-shell-used.txt");
+    let prefix_marker = dir.path().join("prefix-used.txt");
+    let shell_path = dir.path().join("custom-shell");
+
+    std::fs::write(
+        &shell_path,
+        format!(
+            "#!/bin/sh\nprintf used > {}\nexec /bin/sh \"$@\"\n",
+            shell_quote(&shell_marker.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&shell_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shell_path, perms).unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new(marker.clone()));
+    let mut options = SessionOptions::new(cwd, stub_model(), "unused");
+    options.system_prompt = "You are a test agent.".into();
+    options.auth = Auth::Native;
+    options.compaction = None;
+    options.shell_path = Some(shell_path.to_string_lossy().to_string());
+    options.shell_command_prefix =
+        Some(format!("printf prefix > {}", shell_quote(&prefix_marker.to_string_lossy())));
+
+    let session = CodingAgentSession::with_provider(
+        Session::new(Box::new(InMemorySessionStorage::new(None))),
+        provider,
+        options,
+    )
+    .await
+    .unwrap();
+
+    session.prompt("create the marker file").await.unwrap();
+
+    assert!(std::path::Path::new(&marker).exists());
+    assert!(shell_marker.exists(), "configured shell should have been invoked");
+    assert!(prefix_marker.exists(), "configured command prefix should have run");
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}

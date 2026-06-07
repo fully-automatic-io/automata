@@ -19,7 +19,10 @@ pub use compaction::{
     extract_file_ops_from_message, format_file_operations, generate_branch_summary,
     prepare_compaction, serialize_conversation,
 };
-pub use env::{EnvError, ExecResult, FileInfo, FileKind, NativeEnv};
+pub use env::{
+    EnvError, ExecResult, FileInfo, FileKind, NativeEnv, NativeEnvOptions, ShellConfig,
+    resolve_shell_config,
+};
 pub use messages::{
     BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, BashExecutionMessage, BranchSummaryMessage,
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CompactionSummaryMessage,

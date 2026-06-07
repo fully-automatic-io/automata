@@ -477,6 +477,10 @@ pub struct SessionOptions {
     /// Built-in tool selection. Defaults to the coding preset and restores
     /// active tools from persisted sessions when available.
     pub tools: ToolSelection,
+    /// Optional shell executable used by the bash tool.
+    pub shell_path: Option<String>,
+    /// Optional prefix prepended to every bash command.
+    pub shell_command_prefix: Option<String>,
     /// Wasmtime component extensions already loaded by the resource layer.
     pub extensions: Option<LoadExtensionsResult>,
     /// Compaction policy. Auto-compaction is wired only when `Some`.
@@ -497,6 +501,8 @@ impl SessionOptions {
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
             tools: ToolSelection::default(),
+            shell_path: None,
+            shell_command_prefix: None,
             extensions: None,
             compaction: Some(CompactionSettings::default()),
             retry: RetrySettings::default(),
@@ -550,6 +556,8 @@ impl CodingAgentSession {
             system_prompt,
             thinking_level,
             tools,
+            shell_path,
+            shell_command_prefix,
             extensions,
             compaction,
             retry,
@@ -604,7 +612,8 @@ impl CodingAgentSession {
             None,
             BuildToolsOptions {
                 extension_tools,
-                ..BuildToolsOptions::default()
+                shell_path,
+                shell_command_prefix,
             },
         )?;
 

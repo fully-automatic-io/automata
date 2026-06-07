@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "model": "claude-sonnet-4-6",
             "system_prompt": "You are Automata's coding assistant.",
             "append_system_prompt": ["Keep answers concise and cite touched files."],
+            "shell_path": std::env::var("SHELL").ok(),
             "shell_command_prefix": "set -e"
         })
         .to_string(),

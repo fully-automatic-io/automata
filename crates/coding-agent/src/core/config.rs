@@ -1,3 +1,4 @@
+use agent_core::harness::resolve_shell_config;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -16,8 +17,9 @@ pub fn resolve_config_value(value: &str) -> Result<String, String> {
         if let Some(cached) = map.get(cmd) {
             return Ok(cached.clone());
         }
-        let output = std::process::Command::new("sh")
-            .arg("-c")
+        let shell = resolve_shell_config(None).map_err(|e| e.to_string())?;
+        let output = std::process::Command::new(&shell.shell)
+            .args(&shell.args)
             .arg(cmd)
             .output()
             .map_err(|e| format!("Failed to run command `{}`: {}", cmd, e))?;

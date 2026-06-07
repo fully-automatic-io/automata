@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -57,13 +58,32 @@ pub struct ExecResult {
     pub exit_code: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellConfig {
+    pub shell: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeEnvOptions {
+    pub shell_path: Option<String>,
+}
+
 pub struct NativeEnv {
     pub cwd: String,
+    shell_path: Option<String>,
 }
 
 impl NativeEnv {
     pub fn new(cwd: impl Into<String>) -> Self {
-        Self { cwd: cwd.into() }
+        Self::with_options(cwd, NativeEnvOptions::default())
+    }
+
+    pub fn with_options(cwd: impl Into<String>, options: NativeEnvOptions) -> Self {
+        Self {
+            cwd: cwd.into(),
+            shell_path: options.shell_path,
+        }
     }
 
     fn resolve(&self, path: &str) -> PathBuf {
@@ -242,10 +262,10 @@ impl NativeEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<ExecResult, EnvError> {
         let work_dir = cwd.map(|c| self.resolve(c)).unwrap_or_else(|| PathBuf::from(&self.cwd));
-        let shell = find_shell().await?;
+        let shell = resolve_shell_config(self.shell_path.as_deref())?;
 
-        let mut cmd = Command::new(&shell);
-        cmd.arg("-c")
+        let mut cmd = Command::new(&shell.shell);
+        cmd.args(&shell.args)
             .arg(command)
             .current_dir(&work_dir)
             .stdout(std::process::Stdio::piped())
@@ -314,20 +334,145 @@ fn kill_pid(pid: Option<u32>) {
         .spawn();
 }
 
-async fn find_shell() -> Result<String, EnvError> {
-    if cfg!(unix) {
-        if tokio::fs::metadata("/bin/bash").await.is_ok() {
-            return Ok("/bin/bash".to_string());
+pub fn resolve_shell_config(shell_path: Option<&str>) -> Result<ShellConfig, EnvError> {
+    let path_env = std::env::var_os("PATH");
+    resolve_shell_config_with(shell_path, ShellPlatform::current(), path_env.as_deref(), |path| {
+        path.exists()
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellPlatform {
+    Unix,
+    Windows,
+}
+
+impl ShellPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
         }
-        return Ok("sh".to_string());
     }
-    // Windows: look for Git bash
-    for candidate in
-        &[r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"]
-    {
-        if tokio::fs::metadata(candidate).await.is_ok() {
-            return Ok(candidate.to_string());
+}
+
+fn resolve_shell_config_with<F>(
+    shell_path: Option<&str>,
+    platform: ShellPlatform,
+    path_env: Option<&OsStr>,
+    path_exists: F,
+) -> Result<ShellConfig, EnvError>
+where
+    F: Fn(&Path) -> bool,
+{
+    if let Some(path) = shell_path.filter(|path| !path.is_empty()) {
+        let shell = Path::new(path);
+        if path_exists(shell) {
+            return Ok(shell_config(path));
+        }
+        return Err(EnvError::ShellUnavailable(format!("Custom shell path not found: {}", path)));
+    }
+
+    match platform {
+        ShellPlatform::Unix => {
+            if path_exists(Path::new("/bin/bash")) {
+                return Ok(shell_config("/bin/bash"));
+            }
+            if let Some(shell) = find_on_path("bash", path_env, &path_exists) {
+                return Ok(shell_config(shell));
+            }
+            Ok(shell_config("sh"))
+        }
+        ShellPlatform::Windows => {
+            let candidates = windows_git_bash_candidates();
+            for candidate in &candidates {
+                if path_exists(Path::new(candidate)) {
+                    return Ok(shell_config(candidate));
+                }
+            }
+            if let Some(shell) = find_on_path("bash.exe", path_env, &path_exists) {
+                return Ok(shell_config(shell));
+            }
+            Err(EnvError::ShellUnavailable(format!(
+                "No bash shell found. Searched Git Bash in: {}",
+                candidates.join(", ")
+            )))
         }
     }
-    Err(EnvError::ShellUnavailable("No bash shell found".to_string()))
+}
+
+fn shell_config(shell: impl Into<String>) -> ShellConfig {
+    ShellConfig {
+        shell: shell.into(),
+        args: vec!["-c".to_string()],
+    }
+}
+
+fn find_on_path<F>(program: &str, path_env: Option<&OsStr>, path_exists: &F) -> Option<String>
+where
+    F: Fn(&Path) -> bool,
+{
+    let path_env = path_env?;
+    for dir in std::env::split_paths(path_env) {
+        let candidate = dir.join(program);
+        if path_exists(&candidate) {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn windows_git_bash_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        candidates.push(format!("{}\\Git\\bin\\bash.exe", program_files.to_string_lossy()));
+    }
+    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+        candidates.push(format!("{}\\Git\\bin\\bash.exe", program_files_x86.to_string_lossy()));
+    }
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn explicit_shell_path_wins() {
+        let config =
+            resolve_shell_config_with(Some("/custom/bash"), ShellPlatform::Unix, None, |path| {
+                path == Path::new("/custom/bash")
+            })
+            .unwrap();
+        assert_eq!(config.shell, "/custom/bash");
+        assert_eq!(config.args, vec!["-c"]);
+    }
+
+    #[test]
+    fn missing_explicit_shell_path_errors() {
+        let err =
+            resolve_shell_config_with(Some("/missing/bash"), ShellPlatform::Unix, None, |_| false)
+                .unwrap_err();
+        assert!(matches!(err, EnvError::ShellUnavailable(_)));
+    }
+
+    #[test]
+    fn unix_shell_resolution_finds_bash_on_path() {
+        let path_env = OsString::from("/termux/bin:/other/bin");
+        let config =
+            resolve_shell_config_with(None, ShellPlatform::Unix, Some(&path_env), |path| {
+                path == Path::new("/termux/bin/bash")
+            })
+            .unwrap();
+        assert_eq!(config.shell, "/termux/bin/bash");
+    }
+
+    #[test]
+    fn unix_shell_resolution_falls_back_to_sh() {
+        let config = resolve_shell_config_with(None, ShellPlatform::Unix, None, |_| false).unwrap();
+        assert_eq!(config.shell, "sh");
+        assert_eq!(config.args, vec!["-c"]);
+    }
 }
