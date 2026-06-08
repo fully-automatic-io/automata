@@ -1004,7 +1004,7 @@ impl AgentHarness {
             .await?;
         // The agent loop drains both queues before emitting agent_end; any
         // messages still queued here were enqueued by agent_end listeners and
-        // need a continuation to be processed. (pi-mono fix a29a7902.)
+        // need a continuation to be processed.
         if decision == PostRunDecision::Stop && self.has_queued_messages().await {
             return Ok(PostRunDecision::DrainQueues);
         }

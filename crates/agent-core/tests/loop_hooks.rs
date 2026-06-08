@@ -1,5 +1,5 @@
 // Tests for the agent loop's per-turn hook ordering and prepare_next_turn
-// config-snapshot semantics (pi-mono agent-loop.ts:218-251 parity).
+// config-snapshot semantics.
 
 use agent_core::agent_loop::{
     AgentEventSink, AgentLoop, AssistantMessageEventStream, StreamFn, StreamFnInput,

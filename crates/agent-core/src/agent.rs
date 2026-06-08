@@ -171,7 +171,7 @@ impl Agent {
     }
 
     /// Clear the transcript, runtime state (streaming / pending tool calls /
-    /// error), and both queues. Mirrors pi-mono `Agent.reset`.
+    /// error), and both queues.
     pub fn reset(&self) {
         self.state.lock().unwrap().reset_runtime();
         self.clear_all_queues();
@@ -358,8 +358,7 @@ impl Agent {
                 let state = state.clone();
                 let cancel = cancel.clone();
                 Box::pin(async move {
-                    // Fold the event into the agent's own state before
-                    // dispatching, mirroring pi-mono's `processEvents`.
+                    // Fold the event into the agent's own state before dispatching.
                     state.lock().unwrap().apply_event(&event);
                     let list_copy: Vec<EventListener> = listeners.lock().unwrap().clone();
                     for listener in list_copy.iter() {

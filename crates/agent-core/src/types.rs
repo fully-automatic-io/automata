@@ -264,7 +264,7 @@ impl Default for ModelCost {
 }
 
 /// API-specific compatibility flags that override the provider's default
-/// behaviour for a given model. Mirrors pi-mono's `compat` object; only the
+/// behaviour for a given model. Mirrors the catalog `compat` object; only the
 /// flags the Rust providers actually consume are modelled. Unset flags fall
 /// back to substring matching on the model id (see the Anthropic provider).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -704,6 +704,11 @@ pub struct LlmRequest {
     pub openai_response_includes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_retention: Option<CacheRetention>,
+    /// Optional pricing metadata for providers that can calculate usage cost
+    /// while streaming. Request conversion only knows the model id, so callers
+    /// that own a catalog `Model` can thread its cost here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_cost: Option<ModelCost>,
     /// Anthropic adaptive-thinking budgets keyed by `ThinkingLevel`. Only
     /// consumed when the resolved thinking mode is "budget" (older Claude 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -930,7 +935,7 @@ pub struct PrepareNextTurnContext {
 /// Config snapshot returned by [`PrepareNextTurnFn`]. Any `Some` field
 /// overrides the loop's state for the next turn; `None` keeps the current
 /// value. `messages` are injected (as pending) before the next assistant
-/// response. Mirrors pi-mono's `AgentLoopTurnUpdate`.
+/// response. Mirrors the agent-loop turn update contract.
 #[derive(Clone, Default)]
 pub struct TurnUpdate {
     /// Replace the working context (messages + tools + system prompt).
@@ -1164,10 +1169,9 @@ impl AgentState {
         self.messages.push(message);
     }
 
-    /// Fold an [`crate::event::AgentEvent`] into the running state. Mirrors
-    /// pi-mono's `Agent.processEvents`: tracks the streaming message, appends
-    /// finalized messages, maintains the pending-tool-call set, and captures
-    /// the last turn's error message.
+    /// Fold an [`crate::event::AgentEvent`] into the running state: track the
+    /// streaming message, append finalized messages, maintain the
+    /// pending-tool-call set, and capture the last turn's error message.
     pub fn apply_event(&mut self, event: &crate::event::AgentEvent) {
         use crate::event::AgentEvent;
         match event {
@@ -1204,8 +1208,7 @@ impl AgentState {
     }
 
     /// Clear transcript, streaming/runtime state, and error. Queue clearing is
-    /// the `Agent`'s responsibility (it owns the queues). Mirrors pi-mono
-    /// `Agent.reset`.
+    /// the `Agent`'s responsibility because it owns the queues.
     pub fn reset_runtime(&mut self) {
         self.messages.clear();
         self.is_streaming = false;

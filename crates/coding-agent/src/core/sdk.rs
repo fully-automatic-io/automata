@@ -12,13 +12,17 @@ use agent_core::types::{Model, ThinkingLevel};
 use super::auth::AuthStorage;
 use super::config::resolve_config_value;
 use super::models::{clamp_thinking_level, default_model_for_provider};
+use super::provider::Auth;
 use super::resource::ResourceSet;
 use super::services::{
     AgentSessionServices, AgentSessionServicesOptions, SessionDiagnostic,
     build_system_prompt_from_resources, create_agent_session_services, default_agent_dir,
     resolve_path,
 };
-use super::session::{BuildToolsOptions, ToolSelection, build_tools_with_options};
+use super::session::{
+    BuildToolsOptions, CodingAgentSession, SessionBuildError, SessionOptions, ToolSelection,
+    build_tools_with_options,
+};
 use super::session_manager::{ManagedSessionMetadata, SessionManager};
 
 pub struct CreateAgentSessionOptions {
@@ -92,6 +96,32 @@ impl AgentSessionHandle {
             &self.tools,
             &self.tool_names,
         )
+    }
+
+    pub async fn into_coding_session(self) -> Result<CodingAgentSession, SessionBuildError> {
+        let model = self.selected_model.clone().ok_or(SessionBuildError::NoModelSelected)?;
+        let api_key = self
+            .api_key_for_model(&model.id)
+            .ok_or_else(|| SessionBuildError::NoApiKey(model.provider.clone()))?;
+        let system_prompt = self.system_prompt();
+        let tools = ToolSelection::from_names(self.tool_names.iter().map(String::as_str))?;
+        let base_url = (!model.base_url.is_empty()).then(|| model.base_url.clone());
+        let shell_path = self.settings.get_shell_path().map(ToOwned::to_owned);
+        let shell_command_prefix = self.settings.get_shell_command_prefix().map(ToOwned::to_owned);
+        let extensions = self.resources.extensions;
+
+        let mut options =
+            SessionOptions::new(self.cwd.to_string_lossy().to_string(), model, api_key);
+        options.base_url = base_url;
+        options.auth = Auth::Native;
+        options.system_prompt = system_prompt;
+        options.thinking_level = self.selected_thinking_level;
+        options.tools = tools;
+        options.shell_path = shell_path;
+        options.shell_command_prefix = shell_command_prefix;
+        options.extensions = extensions;
+
+        CodingAgentSession::with_session(self.session, options).await
     }
 }
 
@@ -362,6 +392,103 @@ mod tests {
             Some((selected_model.provider.as_str(), selected_model.id.as_str()))
         );
         assert_eq!(context.active_tool_names, Some(vec!["read".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn handle_converts_into_runnable_coding_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().join("repo");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"provider":"anthropic","model":"claude-sonnet-4-6"}"#,
+        )
+        .unwrap();
+
+        let handle = create_agent_session(CreateAgentSessionOptions {
+            cwd,
+            agent_dir: Some(agent_dir),
+            session: SessionManager::in_memory(),
+            model: None,
+            api_key: Some("sk-test".into()),
+            thinking_level: None,
+            tools: ToolSelection::only([BuiltinTool::Read]),
+        })
+        .await
+        .unwrap();
+
+        let coding_session = handle.into_coding_session().await.unwrap();
+        let context = coding_session.harness().build_context().await.unwrap();
+        assert_eq!(context.active_tool_names, Some(vec!["read".to_string()]));
+        assert_eq!(
+            context
+                .model
+                .as_ref()
+                .map(|model| (model.provider.as_str(), model.model_id.as_str())),
+            Some(("anthropic", "claude-sonnet-4-6"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_uses_agent_dir_sessions_by_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().join("repo");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"provider":"anthropic","model":"claude-sonnet-4-6"}"#,
+        )
+        .unwrap();
+
+        let handle = create_agent_session(CreateAgentSessionOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            session: SessionManager::create(),
+            model: None,
+            api_key: None,
+            thinking_level: None,
+            tools: ToolSelection::only([BuiltinTool::Read]),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(handle.session_metadata.cwd, cwd);
+        assert_eq!(handle.session_metadata.sessions_root, Some(agent_dir.join("sessions")));
+        assert!(handle.session_metadata.path.as_ref().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn create_session_preserves_explicit_session_manager_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().join("repo");
+        let agent_dir = dir.path().join("agent");
+        let sessions_root = dir.path().join("custom-sessions");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"provider":"anthropic","model":"claude-sonnet-4-6"}"#,
+        )
+        .unwrap();
+
+        let handle = create_agent_session(CreateAgentSessionOptions {
+            cwd,
+            agent_dir: Some(agent_dir),
+            session: SessionManager::create_in(&sessions_root),
+            model: None,
+            api_key: None,
+            thinking_level: None,
+            tools: ToolSelection::only([BuiltinTool::Read]),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(handle.session_metadata.sessions_root, Some(sessions_root.clone()));
+        assert!(handle.session_metadata.path.as_ref().unwrap().starts_with(&sessions_root));
     }
 }
 

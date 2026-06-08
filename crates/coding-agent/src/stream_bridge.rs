@@ -80,6 +80,14 @@ pub fn convert_sse_stream(
                 }
                 Ok(LlmEvent::ContentBlockDelta { index, delta }) => match delta {
                     Delta::TextDelta { text } => {
+                        let created = partial.content.len() <= index;
+                        partial.ensure_block_at(index);
+                        if created {
+                            stream_clone.push(AssistantMessageEvent::TextStart {
+                                content_index: index,
+                                partial: partial.clone(),
+                            });
+                        }
                         if let Some(PartialContentBlock::Text { text: t, .. }) =
                             partial.content.get_mut(index)
                         {
@@ -112,7 +120,7 @@ pub fn convert_sse_stream(
                         {
                             let buf = pj.get_or_insert_with(String::new);
                             buf.push_str(&partial_json);
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(buf) {
+                            if let Some(parsed) = parse_tool_arguments(buf) {
                                 *arguments = parsed;
                             }
                         }
@@ -209,6 +217,65 @@ pub fn convert_sse_stream(
     stream
 }
 
+fn parse_tool_arguments(input: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(input)
+        .or_else(|_| serde_json::from_str(&repair_json_string_literals(input)))
+        .ok()
+}
+
+fn repair_json_string_literals(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut pending_escape = false;
+
+    for ch in input.chars() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            output.push(ch);
+            continue;
+        }
+
+        if pending_escape {
+            match ch {
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u' => {
+                    output.push('\\');
+                    output.push(ch);
+                }
+                _ => {
+                    output.push('\\');
+                    output.push('\\');
+                    output.push(ch);
+                }
+            }
+            pending_escape = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => pending_escape = true,
+            '"' => {
+                in_string = false;
+                output.push(ch);
+            }
+            '\t' => output.push_str("\\t"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            ch if ch.is_control() => {
+                output.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            _ => output.push(ch),
+        }
+    }
+
+    if pending_escape {
+        output.push_str("\\\\");
+    }
+
+    output
+}
+
 /// Derive `ProviderOptions` from a model's catalog `compat` flags so the
 /// provider sees data-driven overrides (adaptive thinking, temperature
 /// support) instead of relying on substring matching. Returns `None` when the
@@ -255,6 +322,7 @@ pub fn create_stream_fn(provider: Arc<dyn LlmProvider>, model: Model) -> StreamF
                 max_tokens: input.max_tokens,
                 temperature: input.temperature,
                 reasoning_effort: input.reasoning,
+                model_cost: Some(model.cost.clone()),
                 thinking_budgets: input.thinking_budgets,
                 // Caller-supplied options win; otherwise derive them from the
                 // model's catalog `compat` flags so provider behaviour
@@ -326,5 +394,87 @@ mod tests {
             ..Default::default()
         };
         assert!(compat_to_provider_options(&model).is_none());
+    }
+
+    fn llm_stream(events: Vec<LlmEvent>) -> llm_client::LlmStream {
+        Box::pin(futures::stream::iter(
+            events.into_iter().map(Ok::<LlmEvent, llm_client::provider::LlmError>),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_delta_only_text_stream_finalizes_content() {
+        let stream = llm_stream(vec![
+            LlmEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta::TextDelta { text: "hello".into() },
+            },
+            LlmEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta::TextDelta { text: " world".into() },
+            },
+            LlmEvent::MessageStop,
+        ]);
+
+        let assistant_stream =
+            convert_sse_stream(stream, Api::Openai, "deepseek".into(), "deepseek-chat".into());
+        let final_message = assistant_stream.wait_for_result().await;
+
+        match final_message {
+            AgentMessage::Assistant { content, .. } => {
+                assert!(
+                    matches!(content.first(), Some(ContentBlock::Text { text }) if text == "hello world")
+                );
+            }
+            _ => panic!("expected assistant message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_json_delta_repairs_invalid_escapes() {
+        let stream = llm_stream(vec![
+            LlmEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::ToolCall {
+                    id: "toolu-test".into(),
+                    name: "edit".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+            LlmEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta::InputJsonDelta {
+                    partial_json: "{\"path\":\"A\\H\",\"text\":\"col1\tcol2\"}".into(),
+                },
+            },
+            LlmEvent::ContentBlockStop { index: 0 },
+            LlmEvent::MessageDelta {
+                delta: llm_client::streaming::MessageDelta {
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_sequence: None,
+                },
+                usage: None,
+            },
+            LlmEvent::MessageStop,
+        ]);
+
+        let assistant_stream =
+            convert_sse_stream(stream, Api::Anthropic, "anthropic".into(), "claude-test".into());
+        let final_message = assistant_stream.wait_for_result().await;
+
+        match final_message {
+            AgentMessage::Assistant { content, stop_reason, .. } => {
+                assert_eq!(stop_reason, StopReason::ToolUse);
+                assert!(matches!(
+                    content.first(),
+                    Some(ContentBlock::ToolCall { arguments, .. })
+                        if arguments == &serde_json::json!({
+                            "path": "A\\H",
+                            "text": "col1\tcol2"
+                        })
+                ));
+            }
+            _ => panic!("expected assistant message"),
+        }
     }
 }

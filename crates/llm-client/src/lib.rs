@@ -19,7 +19,7 @@ pub use providers::openai::OpenAIProvider;
 pub use retry::{format_http_error, retry_delay, should_retry};
 pub use streaming::{AssistantMessageEvent, LlmEvent};
 pub use types::{
-    CacheRetention, ContentPart, Context, LlmMessage, LlmRequest, LlmResponse, MessageContent,
-    Model, ModelCost, SimpleStreamOptions, StopReason, ThinkingBudgets, ToolDefinition, Transport,
-    Usage, UsageCost,
+    CacheRetention, ContentPart, Context, Cost, LlmMessage, LlmRequest, LlmResponse,
+    MessageContent, Model, ModelCost, SimpleStreamOptions, StopReason, ThinkingBudgets,
+    ToolDefinition, Transport, Usage, UsageCost,
 };

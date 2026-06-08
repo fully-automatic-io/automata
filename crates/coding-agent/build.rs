@@ -1,9 +1,9 @@
 // Compile-time model-catalog generation.
 //
 // Reads the checked-in `models.json` and emits a `builtin_models()` function
-// (into OUT_DIR) returning `agent_core::types::Model` literals. The Rust
-// equivalent of pi-mono's `models.generated.ts`: the catalog data is
-// reviewable JSON, and the generated code is regenerated whenever it changes.
+// (into OUT_DIR) returning `agent_core::types::Model` literals. The catalog
+// data is reviewable JSON, and the generated code is regenerated whenever it
+// changes.
 
 use std::env;
 use std::fmt::Write as _;

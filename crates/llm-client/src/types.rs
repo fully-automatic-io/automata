@@ -4,7 +4,7 @@
 // existing call sites continue to compile unchanged.
 
 pub use agent_core::types::{
-    AnthropicOptions, Api, CacheRetention, ContentBlock, ContentPart, LlmMessage, LlmRequest,
+    AnthropicOptions, Api, CacheRetention, ContentBlock, ContentPart, Cost, LlmMessage, LlmRequest,
     LlmResponse, MessageContent, Model, ModelCost, OpenaiOptions, ProviderOptions,
     SimpleStreamOptions, StopReason, ThinkingBudgets, ThinkingLevel, ToolDefinition, Transport,
     Usage, UsageCost,

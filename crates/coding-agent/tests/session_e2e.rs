@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agent_core::harness::session::{InMemorySessionStorage, Session};
-use agent_core::types::{Api, Model, ModelCost};
+use agent_core::harness::session::{InMemorySessionStorage, JsonlSessionRepo, Session};
+use agent_core::types::{AgentMessage, Api, ContentBlock, Model, ModelCost};
 use async_trait::async_trait;
 use coding_agent::{Auth, CodingAgentSession, SessionOptions};
 use llm_client::provider::{LlmError, LlmProvider, LlmStream};
@@ -81,17 +81,12 @@ impl LlmProvider for ScriptedProvider {
                 LlmEvent::MessageStop,
             ]))
         } else {
-            // Final answer.
+            // Final answer in OpenAI/DeepSeek-compatible delta-only form.
             Ok(sse(vec![
-                LlmEvent::ContentBlockStart {
-                    index: 0,
-                    content_block: agent_core::types::ContentPart::Text { text: String::new() },
-                },
                 LlmEvent::ContentBlockDelta {
                     index: 0,
                     delta: Delta::TextDelta { text: "done".into() },
                 },
-                LlmEvent::ContentBlockStop { index: 0 },
                 LlmEvent::MessageDelta {
                     delta: MessageDelta {
                         stop_reason: Some(LlmStopReason::EndTurn),
@@ -126,11 +121,24 @@ fn stub_model() -> Model {
     }
 }
 
+fn contains_assistant_text(messages: &[AgentMessage], needle: &str) -> bool {
+    messages.iter().any(|message| {
+        let AgentMessage::Assistant { content, .. } = message else {
+            return false;
+        };
+        content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains(needle)))
+    })
+}
+
 #[tokio::test]
 async fn prompt_drives_tool_call_then_answers() {
     let dir = tempfile::TempDir::new().unwrap();
     let cwd = dir.path().to_string_lossy().to_string();
     let marker = dir.path().join("marker.txt").to_string_lossy().to_string();
+    let repo = JsonlSessionRepo::new(dir.path().join("sessions"));
+    let persisted_session = repo.create(&cwd, None, None).await.unwrap();
 
     let provider = Arc::new(ScriptedProvider::new(marker.clone()));
     let mut options = SessionOptions::new(cwd, stub_model(), "unused");
@@ -139,13 +147,9 @@ async fn prompt_drives_tool_call_then_answers() {
     // Disable auto-compaction so the post-run check stays a no-op for this test.
     options.compaction = None;
 
-    let session = CodingAgentSession::with_provider(
-        Session::new(Box::new(InMemorySessionStorage::new(None))),
-        provider,
-        options,
-    )
-    .await
-    .unwrap();
+    let session = CodingAgentSession::with_provider(persisted_session, provider, options)
+        .await
+        .unwrap();
 
     let messages = session.prompt("create the marker file").await.unwrap();
 
@@ -156,15 +160,19 @@ async fn prompt_drives_tool_call_then_answers() {
     );
 
     // The final assistant message should carry the "done" answer.
-    let has_done = messages.iter().any(|m| {
-        match m {
-        agent_core::types::AgentMessage::Assistant { content, .. } => content.iter().any(|b| {
-            matches!(b, agent_core::types::ContentBlock::Text { text } if text.contains("done"))
-        }),
-        _ => false,
-    }
-    });
-    assert!(has_done, "final assistant message should contain 'done'");
+    assert!(
+        contains_assistant_text(&messages, "done"),
+        "final assistant message should contain 'done'"
+    );
+
+    let sessions = repo.list(None).await.unwrap();
+    assert_eq!(sessions.len(), 1, "JSONL session should be discoverable");
+    let reopened = repo.open_by_path(&sessions[0].path).await.unwrap();
+    let ctx = reopened.build_context().await.unwrap();
+    assert!(
+        contains_assistant_text(&ctx.messages, "done"),
+        "JSONL final assistant message should contain 'done'"
+    );
 
     // A tool result must be present in the transcript.
     let has_tool_result = messages

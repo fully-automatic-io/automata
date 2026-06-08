@@ -33,7 +33,7 @@ fn resolve_adaptive_thinking(model_id: &str, force: Option<bool>) -> bool {
 
 /// Substring fallback for `supports_temperature` when a model carries no
 /// `compat` flag: Claude Opus 4.7+ reject non-default temperature values
-/// (mirrors pi-mono's `model.compat?.supportsTemperature ?? true`).
+/// (`model.compat?.supportsTemperature ?? true`).
 fn substring_supports_temperature(model_id: &str) -> bool {
     let m = model_id;
     !(m.contains("opus-4-7")
@@ -320,7 +320,9 @@ fn parse_anthropic_sse(event_type: &str, data: &str) -> Option<LlmEvent> {
     if data == "[DONE]" {
         return Some(LlmEvent::MessageStop);
     }
-    let payload: serde_json::Value = serde_json::from_str(data).ok()?;
+    let payload: serde_json::Value = serde_json::from_str(data)
+        .or_else(|_| serde_json::from_str(&repair_json_string_literals(data)))
+        .ok()?;
     match event_type {
         "ping" => Some(LlmEvent::Ping),
         "message_start" => {
@@ -432,6 +434,59 @@ fn parse_anthropic_sse(event_type: &str, data: &str) -> Option<LlmEvent> {
         }
         _ => None,
     }
+}
+
+fn repair_json_string_literals(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut pending_escape = false;
+
+    for ch in input.chars() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            output.push(ch);
+            continue;
+        }
+
+        if pending_escape {
+            match ch {
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u' => {
+                    output.push('\\');
+                    output.push(ch);
+                }
+                _ => {
+                    output.push('\\');
+                    output.push('\\');
+                    output.push(ch);
+                }
+            }
+            pending_escape = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => pending_escape = true,
+            '"' => {
+                in_string = false;
+                output.push(ch);
+            }
+            '\t' => output.push_str("\\t"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            ch if ch.is_control() => {
+                output.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            _ => output.push(ch),
+        }
+    }
+
+    if pending_escape {
+        output.push_str("\\\\");
+    }
+
+    output
 }
 
 #[async_trait]
@@ -632,5 +687,33 @@ mod tests {
         r.thinking_budgets = Some(ThinkingBudgets { high: Some(8192), ..Default::default() });
         let body = provider().build_body(&r, false);
         assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn parse_sse_repairs_malformed_json_string_literals() {
+        let data = String::from(
+            "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"A\\H\\\",\\\"text\\\":\\\"col1\tcol2\\\"}\"}}",
+        );
+
+        let event = parse_anthropic_sse("content_block_delta", &data).unwrap();
+
+        assert!(matches!(
+            event,
+            LlmEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta::InputJsonDelta { ref partial_json },
+            } if partial_json == "{\"path\":\"A\\H\",\"text\":\"col1\tcol2\"}"
+        ));
+    }
+
+    #[test]
+    fn parse_sse_ignores_unknown_events_after_message_stop() {
+        let stop = parse_anthropic_sse("message_stop", r#"{"type":"message_stop"}"#);
+        let done = parse_anthropic_sse("done", "[DONE]");
+        let stats = parse_anthropic_sse("proxy.stats", "not json");
+
+        assert!(matches!(stop, Some(LlmEvent::MessageStop)));
+        assert!(matches!(done, Some(LlmEvent::MessageStop)));
+        assert!(stats.is_none());
     }
 }

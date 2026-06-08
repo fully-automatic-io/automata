@@ -313,6 +313,10 @@ pub enum SessionBuildError {
     ToolSelection(#[from] ToolSelectionError),
     #[error(transparent)]
     Harness(#[from] HarnessError),
+    #[error("no model selected")]
+    NoModelSelected,
+    #[error("no API key available for provider: {0}")]
+    NoApiKey(String),
 }
 
 #[derive(Clone)]

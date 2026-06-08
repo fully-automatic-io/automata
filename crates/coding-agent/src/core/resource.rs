@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agent_core::harness::prompt_templates::{PromptTemplate, load_prompt_templates_from_dir};
@@ -264,13 +264,15 @@ fn load_context_file_from_dir(
 }
 
 fn load_skill_paths(paths: &[PathBuf], diagnostics: &mut Vec<ResourceDiagnostic>) -> Vec<Skill> {
-    let mut skills = Vec::new();
+    let mut skills_by_name = BTreeMap::new();
     for path in paths {
         if !path.exists() {
             continue;
         }
         if path.is_dir() {
-            skills.extend(agent_core::harness::skills::load_skills_from_dir(path));
+            for skill in agent_core::harness::skills::load_skills_from_dir(path) {
+                skills_by_name.insert(skill.name.clone(), skill);
+            }
         } else {
             diagnostics.push(ResourceDiagnostic {
                 kind: ResourceDiagnosticKind::Warning,
@@ -279,22 +281,22 @@ fn load_skill_paths(paths: &[PathBuf], diagnostics: &mut Vec<ResourceDiagnostic>
             });
         }
     }
-    skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.file_path.cmp(&b.file_path)));
-    skills.dedup_by(|a, b| a.name == b.name);
-    skills
+    skills_by_name.into_values().collect()
 }
 
 fn load_prompt_paths(
     paths: &[PathBuf],
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) -> Vec<PromptTemplate> {
-    let mut prompts = Vec::new();
+    let mut prompts_by_name = BTreeMap::new();
     for path in paths {
         if !path.exists() {
             continue;
         }
         if path.is_dir() {
-            prompts.extend(load_prompt_templates_from_dir(path));
+            for prompt in load_prompt_templates_from_dir(path) {
+                prompts_by_name.insert(prompt.name.clone(), prompt);
+            }
         } else {
             diagnostics.push(ResourceDiagnostic {
                 kind: ResourceDiagnosticKind::Warning,
@@ -303,9 +305,7 @@ fn load_prompt_paths(
             });
         }
     }
-    prompts.sort_by(|a, b| a.name.cmp(&b.name));
-    prompts.dedup_by(|a, b| a.name == b.name);
-    prompts
+    prompts_by_name.into_values().collect()
 }
 
 fn resolve_prompt_source(
@@ -394,5 +394,128 @@ mod tests {
         loader.reload();
         assert_eq!(loader.resources().skills.len(), 1);
         assert_eq!(loader.resources().prompts.len(), 1);
+    }
+
+    #[test]
+    fn resource_loader_prefers_project_skill_on_name_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("repo");
+        let user_skills = agent_dir.join("skills");
+        let project_skills = project.join(".automata/skills");
+        std::fs::create_dir_all(&user_skills).unwrap();
+        std::fs::create_dir_all(&project_skills).unwrap();
+        std::fs::write(
+            user_skills.join("calendar.md"),
+            "---\nname: calendar\ndescription: user calendar\n---\nuser",
+        )
+        .unwrap();
+        std::fs::write(
+            project_skills.join("calendar.md"),
+            "---\nname: calendar\ndescription: project calendar\n---\nproject",
+        )
+        .unwrap();
+
+        let mut loader =
+            DefaultResourceLoader::new(ResourceLoaderOptions::new(&project, &agent_dir));
+        loader.reload();
+
+        assert_eq!(loader.resources().skills.len(), 1);
+        assert_eq!(loader.resources().skills[0].description, "project calendar");
+    }
+
+    #[test]
+    fn resource_loader_prefers_project_prompt_on_name_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("repo");
+        let user_prompts = agent_dir.join("prompts");
+        let project_prompts = project.join(".automata/prompts");
+        std::fs::create_dir_all(&user_prompts).unwrap();
+        std::fs::create_dir_all(&project_prompts).unwrap();
+        std::fs::write(user_prompts.join("review.md"), "user prompt").unwrap();
+        std::fs::write(project_prompts.join("review.md"), "project prompt").unwrap();
+
+        let mut loader =
+            DefaultResourceLoader::new(ResourceLoaderOptions::new(&project, &agent_dir));
+        loader.reload();
+
+        assert_eq!(loader.resources().prompts.len(), 1);
+        assert_eq!(loader.resources().prompts[0].content, "project prompt");
+    }
+
+    #[test]
+    fn resource_loader_honors_no_context_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("repo");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(agent_dir.join("AGENTS.md"), "global").unwrap();
+        std::fs::write(project.join("AGENTS.md"), "project").unwrap();
+
+        let mut options = ResourceLoaderOptions::new(&project, &agent_dir);
+        options.no_context_files = true;
+        let mut loader = DefaultResourceLoader::new(options);
+        loader.reload();
+
+        assert!(loader.resources().context_files.is_empty());
+    }
+
+    #[test]
+    fn resource_loader_resolves_prompt_overrides_from_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("repo");
+        let system = dir.path().join("SYSTEM.md");
+        let append = dir.path().join("APPEND_SYSTEM.md");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&system, "system from file").unwrap();
+        std::fs::write(&append, "append from file").unwrap();
+
+        let mut options = ResourceLoaderOptions::new(&project, &agent_dir);
+        options.system_prompt = Some(system.to_string_lossy().to_string());
+        options.append_system_prompt = vec![append.to_string_lossy().to_string()];
+        let mut loader = DefaultResourceLoader::new(options);
+        loader.reload();
+
+        assert_eq!(loader.resources().system_prompt.as_deref(), Some("system from file"));
+        assert_eq!(loader.resources().append_system_prompt, vec!["append from file"]);
+    }
+
+    #[test]
+    fn resource_loader_reports_non_directory_resource_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("repo");
+        let skill_file = dir.path().join("skill-file");
+        let prompt_file = dir.path().join("prompt-file");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&skill_file, "not a directory").unwrap();
+        std::fs::write(&prompt_file, "not a directory").unwrap();
+
+        let mut options = ResourceLoaderOptions::new(&project, &agent_dir);
+        options.skill_paths = vec![skill_file];
+        options.prompt_paths = vec![prompt_file];
+        let mut loader = DefaultResourceLoader::new(options);
+        loader.reload();
+
+        assert_eq!(loader.resources().diagnostics.len(), 2);
+        assert!(
+            loader
+                .resources()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "skill path is not a directory")
+        );
+        assert!(
+            loader
+                .resources()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "prompt path is not a directory")
+        );
     }
 }

@@ -1,8 +1,8 @@
 use crate::provider::{LlmError, LlmProvider, LlmStream, ProviderConfig};
-use crate::streaming::{Delta, LlmEvent};
+use crate::streaming::{Delta, LlmEvent, MessageDelta, StreamError};
 use crate::types::{
-    CacheRetention, ContentPart, LlmMessage, LlmRequest, LlmResponse, MessageContent, StopReason,
-    Usage,
+    CacheRetention, ContentPart, Cost, LlmMessage, LlmRequest, LlmResponse, MessageContent,
+    ModelCost, StopReason, Usage,
 };
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -10,6 +10,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -240,18 +241,16 @@ fn convert_message(msg: &LlmMessage) -> Option<serde_json::Value> {
             Some(json!({"role": "user", "content": text}))
         }
         LlmMessage::Assistant { content, .. } => {
-            // Reasoning replay normalization: Chat Completions has no first-class
-            // place for prior `thinking` blocks. We drop them on replay. If the
-            // remaining content is empty (model produced thinking-only), skip the
-            // message entirely so the endpoint doesn't reject it.
+            // Chat Completions has no first-class replay slot for prior
+            // thinking blocks. OpenAI-compatible providers that require replay
+            // still accept those blocks as plain assistant text parts.
             let text: String = content
                 .iter()
-                .filter_map(|p| {
-                    if let ContentPart::Text { text } = p {
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } | ContentPart::Thinking { thinking: text } => {
                         Some(text.as_str())
-                    } else {
-                        None
                     }
+                    _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join("");
@@ -314,6 +313,326 @@ fn extract_text(content: &MessageContent) -> String {
     }
 }
 
+#[derive(Default)]
+struct OpenAiStreamState {
+    next_content_index: usize,
+    text_index: Option<usize>,
+    thinking_index: Option<usize>,
+    tool_indices_by_stream_index: HashMap<usize, usize>,
+    tool_indices_by_id: HashMap<String, usize>,
+    active_content_indices: Vec<usize>,
+    stopped_content_indices: HashSet<usize>,
+    has_finish_reason: bool,
+    is_complete: bool,
+    model_cost: Option<ModelCost>,
+}
+
+impl OpenAiStreamState {
+    fn new(model_cost: Option<ModelCost>) -> Self {
+        Self { model_cost, ..Default::default() }
+    }
+
+    fn parse_sse_data(&mut self, data: &str) -> Vec<Result<LlmEvent, LlmError>> {
+        if self.is_complete {
+            return vec![];
+        }
+        if data == "[DONE]" {
+            self.is_complete = true;
+            if self.has_finish_reason {
+                return vec![Ok(LlmEvent::MessageStop)];
+            }
+            let mut events = self.stop_active_blocks();
+            events.push(Ok(LlmEvent::Error {
+                error: StreamError {
+                    error_type: "stream_error".into(),
+                    message: "Stream ended without finish_reason".into(),
+                },
+            }));
+            return events;
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(err) => {
+                return vec![Err(LlmError::SerializationError(err.to_string()))];
+            }
+        };
+
+        let mut events = Vec::new();
+        let mut usage = value
+            .get("usage")
+            .filter(|usage| !usage.is_null())
+            .map(|usage| parse_openai_usage(usage, self.model_cost.as_ref()));
+
+        let choice = value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first());
+
+        if let Some(choice) = choice {
+            if usage.is_none() {
+                usage = choice
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .map(|usage| parse_openai_usage(usage, self.model_cost.as_ref()));
+            }
+
+            if let Some(delta) = choice.get("delta") {
+                self.push_delta_events(delta, &mut events);
+            }
+
+            if let Some(reason) = choice.get("finish_reason").and_then(|value| value.as_str()) {
+                events.extend(self.finish_reason_events(reason, usage.take()));
+            }
+        }
+
+        if let Some(usage) = usage {
+            events.push(Ok(LlmEvent::MessageDelta {
+                delta: MessageDelta { stop_reason: None, stop_sequence: None },
+                usage: Some(usage),
+            }));
+        }
+
+        events
+    }
+
+    fn push_delta_events(
+        &mut self,
+        delta: &serde_json::Value,
+        events: &mut Vec<Result<LlmEvent, LlmError>>,
+    ) {
+        if let Some(text) = delta.get("content").and_then(|value| value.as_str())
+            && !text.is_empty()
+        {
+            let index = self.ensure_text_block(events);
+            events.push(Ok(LlmEvent::ContentBlockDelta {
+                index,
+                delta: Delta::TextDelta { text: text.to_string() },
+            }));
+        }
+
+        if let Some(thinking) = first_reasoning_delta(delta) {
+            let index = self.ensure_thinking_block(events);
+            events.push(Ok(LlmEvent::ContentBlockDelta {
+                index,
+                delta: Delta::ThinkingDelta { thinking },
+            }));
+        }
+
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(|value| value.as_array()) {
+            for tool_call in tool_calls {
+                let index = self.ensure_tool_call_block(tool_call, events);
+                if let Some(arguments) = tool_call
+                    .get("function")
+                    .and_then(|function| function.get("arguments"))
+                    .and_then(|value| value.as_str())
+                    && !arguments.is_empty()
+                {
+                    events.push(Ok(LlmEvent::ContentBlockDelta {
+                        index,
+                        delta: Delta::InputJsonDelta { partial_json: arguments.to_string() },
+                    }));
+                }
+            }
+        }
+    }
+
+    fn ensure_text_block(&mut self, events: &mut Vec<Result<LlmEvent, LlmError>>) -> usize {
+        if let Some(index) = self.text_index {
+            return index;
+        }
+        let index = self.allocate_content_index();
+        self.text_index = Some(index);
+        self.mark_active(index);
+        events.push(Ok(LlmEvent::ContentBlockStart {
+            index,
+            content_block: ContentPart::Text { text: String::new() },
+        }));
+        index
+    }
+
+    fn ensure_thinking_block(&mut self, events: &mut Vec<Result<LlmEvent, LlmError>>) -> usize {
+        if let Some(index) = self.thinking_index {
+            return index;
+        }
+        let index = self.allocate_content_index();
+        self.thinking_index = Some(index);
+        self.mark_active(index);
+        events.push(Ok(LlmEvent::ContentBlockStart {
+            index,
+            content_block: ContentPart::Thinking { thinking: String::new() },
+        }));
+        index
+    }
+
+    fn ensure_tool_call_block(
+        &mut self,
+        tool_call: &serde_json::Value,
+        events: &mut Vec<Result<LlmEvent, LlmError>>,
+    ) -> usize {
+        let stream_index = tool_call
+            .get("index")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize);
+        let id = tool_call.get("id").and_then(|value| value.as_str()).unwrap_or("");
+        let name = tool_call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+
+        if let Some(stream_index) = stream_index
+            && let Some(index) = self.tool_indices_by_stream_index.get(&stream_index).copied()
+        {
+            if !id.is_empty() {
+                self.tool_indices_by_id.insert(id.to_string(), index);
+            }
+            return index;
+        }
+        if !id.is_empty()
+            && let Some(index) = self.tool_indices_by_id.get(id).copied()
+        {
+            if let Some(stream_index) = stream_index {
+                self.tool_indices_by_stream_index.insert(stream_index, index);
+            }
+            return index;
+        }
+
+        let index = self.allocate_content_index();
+        if let Some(stream_index) = stream_index {
+            self.tool_indices_by_stream_index.insert(stream_index, index);
+        }
+        if !id.is_empty() {
+            self.tool_indices_by_id.insert(id.to_string(), index);
+        }
+        self.mark_active(index);
+        events.push(Ok(LlmEvent::ContentBlockStart {
+            index,
+            content_block: ContentPart::ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: serde_json::json!({}),
+            },
+        }));
+        index
+    }
+
+    fn finish_reason_events(
+        &mut self,
+        reason: &str,
+        usage: Option<Usage>,
+    ) -> Vec<Result<LlmEvent, LlmError>> {
+        self.has_finish_reason = true;
+        let mut events = self.stop_active_blocks();
+        match map_openai_finish_reason(reason) {
+            Ok(stop_reason) => {
+                events.push(Ok(LlmEvent::MessageDelta {
+                    delta: MessageDelta {
+                        stop_reason: Some(stop_reason),
+                        stop_sequence: None,
+                    },
+                    usage,
+                }));
+            }
+            Err(message) => {
+                self.is_complete = true;
+                if let Some(usage) = usage {
+                    events.push(Ok(LlmEvent::MessageDelta {
+                        delta: MessageDelta { stop_reason: None, stop_sequence: None },
+                        usage: Some(usage),
+                    }));
+                }
+                events.push(Ok(LlmEvent::Error {
+                    error: StreamError {
+                        error_type: "finish_reason".into(),
+                        message,
+                    },
+                }));
+            }
+        }
+        events
+    }
+
+    fn stop_active_blocks(&mut self) -> Vec<Result<LlmEvent, LlmError>> {
+        let mut events = Vec::new();
+        for index in self.active_content_indices.clone() {
+            if self.stopped_content_indices.insert(index) {
+                events.push(Ok(LlmEvent::ContentBlockStop { index }));
+            }
+        }
+        events
+    }
+
+    fn allocate_content_index(&mut self) -> usize {
+        let index = self.next_content_index;
+        self.next_content_index += 1;
+        index
+    }
+
+    fn mark_active(&mut self, index: usize) {
+        if !self.active_content_indices.contains(&index) {
+            self.active_content_indices.push(index);
+        }
+    }
+}
+
+fn first_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
+    ["reasoning_content", "reasoning", "reasoning_text"]
+        .into_iter()
+        .find_map(|field| {
+            delta
+                .get(field)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn map_openai_finish_reason(reason: &str) -> Result<StopReason, String> {
+    match reason {
+        "stop" | "end" => Ok(StopReason::EndTurn),
+        "length" => Ok(StopReason::MaxTokens),
+        "function_call" | "tool_calls" => Ok(StopReason::ToolUse),
+        "content_filter" => Err("Provider finish_reason: content_filter".into()),
+        "network_error" => Err("Provider finish_reason: network_error".into()),
+        other => Err(format!("Provider finish_reason: {}", other)),
+    }
+}
+
+fn parse_openai_usage(raw: &serde_json::Value, model_cost: Option<&ModelCost>) -> Usage {
+    let prompt_tokens = raw.get("prompt_tokens").and_then(|value| value.as_u64()).unwrap_or(0);
+    let completion_tokens =
+        raw.get("completion_tokens").and_then(|value| value.as_u64()).unwrap_or(0);
+    let prompt_details = raw.get("prompt_tokens_details");
+    let cache_read = prompt_details
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|value| value.as_u64())
+        .or_else(|| raw.get("prompt_cache_hit_tokens").and_then(|value| value.as_u64()))
+        .unwrap_or(0);
+    let cache_write = prompt_details
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let input = prompt_tokens.saturating_sub(cache_read.saturating_add(cache_write));
+    let mut usage = Usage {
+        input,
+        output: completion_tokens,
+        cache_read,
+        cache_write,
+        total_tokens: input + completion_tokens + cache_read + cache_write,
+        cost: Cost::default(),
+    };
+    if let Some(cost) = model_cost {
+        usage.cost.input = cost.input / 1_000_000.0 * usage.input as f64;
+        usage.cost.output = cost.output / 1_000_000.0 * usage.output as f64;
+        usage.cost.cache_read = cost.cache_read / 1_000_000.0 * usage.cache_read as f64;
+        usage.cost.cache_write = cost.cache_write / 1_000_000.0 * usage.cache_write as f64;
+        usage.cost.total =
+            usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+    }
+    usage
+}
+
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmError> {
@@ -325,7 +644,7 @@ impl LlmProvider for OpenAIProvider {
             id: String,
             model: String,
             choices: Vec<Choice>,
-            usage: ApiUsage,
+            usage: serde_json::Value,
         }
         #[derive(Deserialize)]
         struct Choice {
@@ -347,12 +666,6 @@ impl LlmProvider for OpenAIProvider {
             name: String,
             arguments: String,
         }
-        #[derive(Deserialize)]
-        struct ApiUsage {
-            prompt_tokens: u64,
-            completion_tokens: u64,
-        }
-
         let api_resp: ApiResponse =
             resp.json().await.map_err(|e| LlmError::SerializationError(e.to_string()))?;
 
@@ -381,24 +694,20 @@ impl LlmProvider for OpenAIProvider {
         }
 
         let stop_reason = match choice.finish_reason.as_str() {
-            "stop" => StopReason::EndTurn,
+            "stop" | "end" => StopReason::EndTurn,
             "length" => StopReason::MaxTokens,
-            "tool_calls" => StopReason::ToolUse,
+            "tool_calls" | "function_call" => StopReason::ToolUse,
             "content_filter" => StopReason::ContentFilter,
-            _ => StopReason::EndTurn,
+            _ => StopReason::Error,
         };
+        let usage = parse_openai_usage(&api_resp.usage, request.model_cost.as_ref());
 
         Ok(LlmResponse {
             id: api_resp.id,
             model: api_resp.model,
             content,
             stop_reason,
-            usage: Usage {
-                input: api_resp.usage.prompt_tokens,
-                output: api_resp.usage.completion_tokens,
-                total_tokens: api_resp.usage.prompt_tokens + api_resp.usage.completion_tokens,
-                ..Default::default()
-            },
+            usage,
         })
     }
 
@@ -407,23 +716,13 @@ impl LlmProvider for OpenAIProvider {
         let resp = self.send_with_retry(body).await?;
 
         let byte_stream = resp.bytes_stream();
-        let stream = byte_stream.eventsource().filter_map(|result| async move {
-            match result {
-                Ok(event) => {
-                    if event.data == "[DONE]" {
-                        return Some(Ok(LlmEvent::MessageStop));
-                    }
-                    let v: serde_json::Value = serde_json::from_str(&event.data).ok()?;
-                    let delta = v.get("choices")?.get(0)?.get("delta")?;
-                    delta.get("content").and_then(|c| c.as_str()).map(|text| {
-                        Ok(LlmEvent::ContentBlockDelta {
-                            index: 0,
-                            delta: Delta::TextDelta { text: text.to_string() },
-                        })
-                    })
-                }
-                Err(e) => Some(Err(LlmError::StreamError(e.to_string()))),
-            }
+        let mut state = OpenAiStreamState::new(request.model_cost.clone());
+        let stream = byte_stream.eventsource().flat_map(move |result| {
+            let events = match result {
+                Ok(event) => state.parse_sse_data(&event.data),
+                Err(e) => vec![Err(LlmError::StreamError(e.to_string()))],
+            };
+            futures::stream::iter(events)
         });
 
         Ok(Box::pin(stream))
@@ -547,5 +846,219 @@ mod tests {
         let body = provider().build_body(&r, false);
         // Falls back to native cache (anthropic_cache_control is None).
         assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn empty_tools_are_omitted_from_payload() {
+        let mut r = req("gpt-4o-mini");
+        r.tools = Vec::new();
+
+        let body = provider().build_body(&r, true);
+
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn non_empty_tools_are_forwarded() {
+        let mut r = req("gpt-4o-mini");
+        r.tools = vec![crate::types::ToolDefinition {
+            name: "ping".into(),
+            description: "Ping tool".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"]
+            }),
+        }];
+
+        let body = provider().build_body(&r, true);
+        let tool = &body["tools"][0]["function"];
+
+        assert_eq!(tool["name"], "ping");
+        assert_eq!(tool["description"], "Ping tool");
+        assert_eq!(tool["parameters"]["properties"]["ok"]["type"], "boolean");
+    }
+
+    #[test]
+    fn forwards_reasoning_effort() {
+        let mut r = req("deepseek-reasoner");
+        r.reasoning_effort = Some(crate::types::ThinkingLevel::Medium);
+
+        let body = provider().build_body(&r, true);
+
+        assert_eq!(body["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn assistant_thinking_replays_as_text_for_chat_completions() {
+        let mut r = req("deepseek-reasoner");
+        r.messages = vec![
+            LlmMessage::user_text("hello"),
+            LlmMessage::Assistant {
+                content: vec![
+                    ContentPart::Thinking { thinking: "internal reasoning".into() },
+                    ContentPart::Text { text: "visible answer".into() },
+                ],
+                api: crate::types::Api::Openai,
+                provider: "deepseek".into(),
+                model: "deepseek-reasoner".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                error_message: None,
+                timestamp: 2,
+            },
+            LlmMessage::user_text("continue"),
+        ];
+
+        let body = provider().build_body(&r, false);
+
+        assert_eq!(body["messages"][1]["role"], "assistant");
+        assert_eq!(body["messages"][1]["content"], "internal reasoningvisible answer");
+    }
+
+    #[test]
+    fn assistant_thinking_only_replay_is_not_dropped() {
+        let mut r = req("deepseek-reasoner");
+        r.messages = vec![
+            LlmMessage::user_text("hello"),
+            LlmMessage::Assistant {
+                content: vec![ContentPart::Thinking { thinking: "internal reasoning".into() }],
+                api: crate::types::Api::Openai,
+                provider: "deepseek".into(),
+                model: "deepseek-reasoner".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+                error_message: None,
+                timestamp: 2,
+            },
+            LlmMessage::user_text("continue"),
+        ];
+
+        let body = provider().build_body(&r, false);
+
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(body["messages"][1]["content"], "internal reasoning");
+    }
+
+    fn unwrap_events(events: Vec<Result<LlmEvent, LlmError>>) -> Vec<LlmEvent> {
+        events.into_iter().map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn stream_parser_emits_text_reasoning_tool_usage_and_finish_reason() {
+        let mut state = OpenAiStreamState::new(Some(ModelCost {
+            input: 2.0,
+            output: 4.0,
+            cache_read: 1.0,
+            cache_write: 3.0,
+        }));
+
+        let first = unwrap_events(state.parse_sse_data(
+            r#"{"id":"chatcmpl-test","choices":[{"index":0,"delta":{"content":"hello","reasoning_content":"think","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"bash","arguments":"{\"cmd\""}}]},"finish_reason":null}]}"#,
+        ));
+        assert!(matches!(
+            first[0],
+            LlmEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentPart::Text { .. }
+            }
+        ));
+        assert!(matches!(
+            first[1],
+            LlmEvent::ContentBlockDelta {
+                index: 0,
+                delta: Delta::TextDelta { ref text }
+            } if text == "hello"
+        ));
+        assert!(matches!(
+            first[2],
+            LlmEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentPart::Thinking { .. }
+            }
+        ));
+        assert!(matches!(
+            first[3],
+            LlmEvent::ContentBlockDelta {
+                index: 1,
+                delta: Delta::ThinkingDelta { ref thinking }
+            } if thinking == "think"
+        ));
+        assert!(matches!(
+            first[4],
+            LlmEvent::ContentBlockStart {
+                index: 2,
+                content_block: ContentPart::ToolCall { ref id, ref name, .. }
+            } if id == "call-1" && name == "bash"
+        ));
+        assert!(matches!(
+            first[5],
+            LlmEvent::ContentBlockDelta {
+                index: 2,
+                delta: Delta::InputJsonDelta { ref partial_json }
+            } if partial_json == "{\"cmd\""
+        ));
+
+        let second = unwrap_events(state.parse_sse_data(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"ls\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":30,"cache_write_tokens":10}}}"#,
+        ));
+        assert!(matches!(
+            second[0],
+            LlmEvent::ContentBlockDelta {
+                index: 2,
+                delta: Delta::InputJsonDelta { ref partial_json }
+            } if partial_json == ":\"ls\"}"
+        ));
+        assert!(matches!(second[1], LlmEvent::ContentBlockStop { index: 0 }));
+        assert!(matches!(second[2], LlmEvent::ContentBlockStop { index: 1 }));
+        assert!(matches!(second[3], LlmEvent::ContentBlockStop { index: 2 }));
+        match &second[4] {
+            LlmEvent::MessageDelta {
+                delta:
+                    MessageDelta {
+                        stop_reason: Some(StopReason::ToolUse), ..
+                    },
+                usage: Some(usage),
+            } => {
+                assert_eq!(usage.input, 60);
+                assert_eq!(usage.output, 20);
+                assert_eq!(usage.cache_read, 30);
+                assert_eq!(usage.cache_write, 10);
+                assert_eq!(usage.total_tokens, 120);
+                assert!((usage.cost.input - 0.00012).abs() < f64::EPSILON);
+                assert!((usage.cost.output - 0.00008).abs() < f64::EPSILON);
+                assert!((usage.cost.cache_read - 0.00003).abs() < f64::EPSILON);
+                assert!((usage.cost.cache_write - 0.00003).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let done = unwrap_events(state.parse_sse_data("[DONE]"));
+        assert!(matches!(done.as_slice(), [LlmEvent::MessageStop]));
+    }
+
+    #[test]
+    fn stream_parser_errors_when_done_arrives_without_finish_reason() {
+        let mut state = OpenAiStreamState::new(None);
+        let events = unwrap_events(state.parse_sse_data(
+            r#"{"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#,
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LlmEvent::ContentBlockDelta {
+                delta: Delta::TextDelta { text },
+                ..
+            } if text == "partial"
+        )));
+
+        let done = unwrap_events(state.parse_sse_data("[DONE]"));
+        assert!(matches!(done[0], LlmEvent::ContentBlockStop { index: 0 }));
+        assert!(matches!(
+            done[1],
+            LlmEvent::Error {
+                error: StreamError { ref message, .. }
+            } if message == "Stream ended without finish_reason"
+        ));
     }
 }

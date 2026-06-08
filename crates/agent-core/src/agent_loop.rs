@@ -249,7 +249,7 @@ impl AgentLoop<'_> {
 
                 // prepare_next_turn runs after turn_end and may swap the
                 // context / model / reasoning for the next turn and inject
-                // extra messages (pi-mono agent-loop.ts:220-239).
+                // extra messages.
                 if let Some(ref hook) = self.config.prepare_next_turn {
                     let ctx = PrepareNextTurnContext {
                         last_assistant_message: assistant.clone(),
@@ -275,8 +275,7 @@ impl AgentLoop<'_> {
                 }
 
                 // should_stop_after_turn runs after prepare_next_turn; a true
-                // result exits immediately without draining steering
-                // (pi-mono agent-loop.ts:241-251).
+                // result exits immediately without draining steering.
                 if let Some(ref hook) = self.config.should_stop_after_turn {
                     let ctx = ShouldStopAfterTurnContext {
                         assistant_message: assistant.clone(),

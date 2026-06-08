@@ -1,7 +1,7 @@
 // Multi-turn chat example — uses agent-core Session + AgentHarness directly.
 //
-// This mirrors pi-mono's layering: agent-core owns the session tree and harness;
-// coding-agent only supplies coding tools and the llm-client stream bridge.
+// agent-core owns the session tree and harness; coding-agent only supplies
+// coding tools and the llm-client stream bridge.
 //
 // Run with:
 //   ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic \

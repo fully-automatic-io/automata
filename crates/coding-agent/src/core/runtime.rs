@@ -4,7 +4,7 @@ use agent_core::harness::session::{Session, SessionError};
 
 use super::sdk::{AgentSessionHandle, CreateAgentSessionOptions, create_agent_session};
 use super::services::SessionDiagnostic;
-use super::session::ToolSelection;
+use super::session::{CodingAgentSession, SessionBuildError, ToolSelection};
 use super::session_manager::{ForkPosition, SessionManager};
 
 pub struct AgentSessionRuntimeOptions {
@@ -91,6 +91,10 @@ impl AgentSessionRuntime {
         &self.handle.diagnostics
     }
 
+    pub async fn into_coding_session(self) -> Result<CodingAgentSession, SessionBuildError> {
+        self.handle.into_coding_session().await
+    }
+
     pub async fn new_session(&mut self) -> Result<(), SessionError> {
         let cwd = self.handle.cwd.clone();
         self.replace(cwd, self.session_manager_for_create()).await
@@ -174,7 +178,7 @@ mod tests {
             agent_dir: Some(agent_dir.clone()),
             session: SessionManager::create_in(&sessions_root),
             model: None,
-            api_key: None,
+            api_key: Some("sk-test".into()),
             thinking_level: None,
             tools: ToolSelection::default(),
         })
@@ -187,7 +191,7 @@ mod tests {
             agent_dir: Some(agent_dir),
             session: SessionManager::create_in(&sessions_root),
             model: None,
-            api_key: None,
+            api_key: Some("sk-test".into()),
             thinking_level: None,
             tools: ToolSelection::default(),
         })
@@ -199,5 +203,9 @@ mod tests {
         runtime.switch_session(other_path).await.unwrap();
         assert_eq!(runtime.cwd(), cwd_b.as_path());
         assert_eq!(runtime.session().build_context().await.unwrap().messages.len(), 1);
+
+        let coding_session = runtime.into_coding_session().await.unwrap();
+        let context = coding_session.harness().build_context().await.unwrap();
+        assert_eq!(context.messages.len(), 1);
     }
 }

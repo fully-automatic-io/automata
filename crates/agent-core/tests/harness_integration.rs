@@ -2,7 +2,22 @@ use agent_core::harness::{
     InMemorySessionRepo, Skill, convert_to_llm, format_skills_for_system_prompt,
     parse_command_args, substitute_args, truncate_head, truncate_tail,
 };
-use agent_core::types::{AgentMessage, ContentBlock, MessageContent, StopReason, Usage};
+use agent_core::types::{
+    AgentMessage, Api, ContentBlock, MessageContent, StopReason, ThinkingLevel, Usage,
+};
+
+fn assistant_with_model(text: &str, provider: &str, model: &str) -> AgentMessage {
+    AgentMessage::Assistant {
+        content: vec![ContentBlock::Text { text: text.into() }],
+        api: Api::Anthropic,
+        provider: provider.into(),
+        model: model.into(),
+        usage: Usage::default(),
+        stop_reason: StopReason::EndTurn,
+        error_message: None,
+        timestamp: 0,
+    }
+}
 
 #[test]
 fn test_session_append_and_context() {
@@ -57,6 +72,105 @@ fn test_session_compaction_context() {
         assert!(ctx.messages.iter().any(|m| matches!(m,
             AgentMessage::User { content: MessageContent::Blocks(b), .. }
             if matches!(b.first(), Some(ContentBlock::Text { text }) if text == "msg2"))));
+    });
+}
+
+#[test]
+fn test_session_context_tracks_thinking_level_and_model() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut repo = InMemorySessionRepo::new();
+        let mut session = repo.create_session(None);
+
+        session.append_message(AgentMessage::user_text("hello")).await.unwrap();
+        session.append_thinking_level_change(ThinkingLevel::High).await.unwrap();
+        session.append_model_change("openai", "gpt-4").await.unwrap();
+        session
+            .append_message(assistant_with_model("hi", "anthropic", "claude-test"))
+            .await
+            .unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.thinking_level, ThinkingLevel::High);
+        assert_eq!(
+            ctx.model
+                .as_ref()
+                .map(|model| (model.provider.as_str(), model.model_id.as_str())),
+            Some(("anthropic", "claude-test"))
+        );
+        assert_eq!(ctx.messages.len(), 2);
+    });
+}
+
+#[test]
+fn test_session_context_uses_latest_compaction() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut repo = InMemorySessionRepo::new();
+        let mut session = repo.create_session(None);
+
+        let u1 = session.append_message(AgentMessage::user_text("a")).await.unwrap();
+        session.append_message(assistant_with_model("b", "p", "m")).await.unwrap();
+        session.append_compaction("First summary", &u1, 100, None, None).await.unwrap();
+        let u2 = session.append_message(AgentMessage::user_text("c")).await.unwrap();
+        session.append_message(assistant_with_model("d", "p", "m")).await.unwrap();
+        session.append_compaction("Second summary", &u2, 200, None, None).await.unwrap();
+        session.append_message(AgentMessage::user_text("e")).await.unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 4);
+        assert!(matches!(
+            ctx.messages.first(),
+            Some(AgentMessage::CompactionSummary { summary, tokens_before: 200, .. })
+                if summary == "Second summary"
+        ));
+        assert!(matches!(
+            ctx.messages.get(1),
+            Some(AgentMessage::User { content: MessageContent::Blocks(blocks), .. })
+                if matches!(blocks.first(), Some(ContentBlock::Text { text }) if text == "c")
+        ));
+    });
+}
+
+#[test]
+fn test_session_context_includes_branch_summary_and_custom_message() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut repo = InMemorySessionRepo::new();
+        let mut session = repo.create_session(None);
+
+        let root = session.append_message(AgentMessage::user_text("root")).await.unwrap();
+        session
+            .append_message(assistant_with_model("first branch", "p", "m"))
+            .await
+            .unwrap();
+        session
+            .move_to(
+                Some(&root),
+                Some(agent_core::harness::session::BranchSummaryOptions {
+                    summary: "summary for abandoned branch".into(),
+                    details: None,
+                    from_hook: None,
+                }),
+            )
+            .await
+            .unwrap();
+        session
+            .append_custom_message("artifact", serde_json::json!({"ok": true}), true, None)
+            .await
+            .unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        assert!(ctx.messages.iter().any(|message| matches!(
+            message,
+            AgentMessage::BranchSummary { summary, from_id, .. }
+                if summary == "summary for abandoned branch" && from_id == &root
+        )));
+        assert!(ctx.messages.iter().any(|message| matches!(
+            message,
+            AgentMessage::Custom { custom_type, content, display: true, .. }
+                if custom_type == "artifact" && content == &serde_json::json!({"ok": true})
+        )));
     });
 }
 

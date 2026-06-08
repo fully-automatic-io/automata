@@ -73,6 +73,29 @@ async fn test_jsonl_session_create_and_reopen() {
 }
 
 #[tokio::test]
+async fn test_jsonl_session_preserves_custom_id_and_parent_metadata() {
+    let dir = TempDir::new().unwrap();
+    let repo = JsonlSessionRepo::new(dir.path());
+    let parent = dir.path().join("parent.jsonl");
+    let parent = parent.to_string_lossy().to_string();
+
+    let mut session = repo
+        .create("/tmp/cwd", Some("session-custom".into()), Some(&parent))
+        .await
+        .unwrap();
+    session.append_message(AgentMessage::user_text("hello")).await.unwrap();
+
+    let sessions = repo.list(Some("/tmp/cwd")).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "session-custom");
+    assert_eq!(sessions[0].parent_session_path.as_deref(), Some(parent.as_str()));
+
+    let reopened = repo.open_by_path(&sessions[0].path).await.unwrap();
+    assert_eq!(reopened.get_metadata().await.id, "session-custom");
+    assert_eq!(reopened.build_context().await.unwrap().messages.len(), 1);
+}
+
+#[tokio::test]
 async fn test_harness_append_and_context() {
     let storage = InMemorySessionStorage::new(None);
     let session = Session::new(Box::new(storage));
